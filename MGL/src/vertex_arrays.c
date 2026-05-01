@@ -111,6 +111,7 @@ VertexArray *newVAO(GLMContext ctx, GLuint vao)
         ptr->attrib[i].stride = 0;
         ptr->attrib[i].divisor = 0;
         ptr->attrib[i].relativeoffset = 0;
+        ptr->attrib[i].binding_offset = 0;
         ptr->attrib[i].buffer_bindingindex = 0;
     }
 
@@ -360,6 +361,7 @@ void setVertexAttrib(GLMContext ctx, GLuint index, GLint size, GLenum type, GLbo
     vao->attrib[index].normalized = normalized;
     vao->attrib[index].stride = stride;
     vao->attrib[index].relativeoffset = (GLubyte *)pointer - (GLubyte *)NULL;
+    vao->attrib[index].binding_offset = 0;
 
     // bind current array buffer to attrib
     array_buffer = STATE(buffers[_ARRAY_BUFFER]);

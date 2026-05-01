@@ -192,6 +192,7 @@ static void mglBufferMarkAllocatedUninitialized(Buffer *ptr, MGLBufferInitSource
     ptr->last_write_size = ptr->size;
     ptr->last_write_src_ptr = NULL;
     ptr->last_write_src_hash = 0ull;
+    ptr->mapped_ptr = NULL;
 }
 
 static inline bool mglBufferMapAllowsWrite(const Buffer *ptr)
@@ -218,7 +219,10 @@ static void mglBufferMarkMapWrite(Buffer *ptr)
     const uint8_t *src = NULL;
     uint64_t hash = 0ull;
 
-    if (ptr->data.buffer_data && write_size > 0) {
+    if (ptr->mapped_ptr && write_size > 0) {
+        src = (const uint8_t *)ptr->mapped_ptr;
+        hash = mglTraceHashBytes(src, (size_t)write_size);
+    } else if (ptr->data.buffer_data && write_size > 0) {
         size_t safe_offset = (write_offset > 0) ? (size_t)write_offset : 0u;
         src = ((const uint8_t *)(uintptr_t)ptr->data.buffer_data) + safe_offset;
         hash = mglTraceHashBytes(src, (size_t)write_size);
@@ -237,12 +241,14 @@ static void mglBufferMarkMapWrite(Buffer *ptr)
     if (MGL_VERBOSE_BUFFER_MAP_LOGS ||
         mglShouldTraceBufferMutation(trace_call, ptr->target, write_size)) {
         fprintf(stderr,
-                "MGL TRACE BufferMap.write buffer=%u target=0x%x off=%lld size=%lld src=%p hash=0x%016" PRIx64 " head=%s probe256AllZero=%d access=0x%x accessFlags=0x%x mapped=%u\n",
+                "MGL TRACE BufferMap.write buffer=%u target=0x%x off=%lld size=%lld src=%p mappedPtr=%p backing=%p hash=0x%016" PRIx64 " head=%s probe256AllZero=%d access=0x%x accessFlags=0x%x mapped=%u\n",
                 ptr->name,
                 ptr->target,
                 (long long)write_offset,
                 (long long)write_size,
                 src,
+                ptr->mapped_ptr,
+                (void *)(uintptr_t)ptr->data.buffer_data,
                 hash,
                 head,
                 probe_all_zero ? 1 : 0,
@@ -488,6 +494,25 @@ static inline bool mgl_range_ok_size_t(GLintptr offset, GLsizeiptr size, size_t 
 
 static inline GLMContext mgl_sanitize_ctx(GLMContext ctx, const char *func)
 {
+    // Public GL entrypoints are backed by the process-global current context.
+    // If a stale/corrupt dispatch passes some other non-small pointer, touching
+    // ctx->state can still fault; prefer the known current context.
+    if (_ctx != NULL && (uintptr_t)_ctx >= 0x10000u)
+    {
+        if (ctx == _ctx)
+            return ctx;
+
+        if (ctx != NULL)
+        {
+            fprintf(stderr,
+                    "MGL WARNING: %s received non-current ctx=%p; using current ctx=%p\n",
+                    func,
+                    (void *)ctx,
+                    (void *)_ctx);
+        }
+        return _ctx;
+    }
+
     // A valid heap pointer will never be a tiny value like 0x2f.
     if (ctx != NULL && (uintptr_t)ctx >= 0x10000u)
         return ctx;
@@ -501,6 +526,77 @@ static inline GLMContext mgl_sanitize_ctx(GLMContext ctx, const char *func)
 
     fprintf(stderr, "MGL ERROR: %s recovery failed; dropping call\n", func);
     return NULL;
+}
+
+static inline void mglClearBufferMapReferences(BufferMapList *list, Buffer *ptr, GLuint name)
+{
+    (void)name;
+
+    if (!list)
+        return;
+
+    GLuint count = list->count;
+    if (count > MAX_MAPPED_BUFFERS)
+        count = MAX_MAPPED_BUFFERS;
+
+    for (GLuint i = 0; i < count; i++)
+    {
+        Buffer *candidate = list->buffers[i].buf;
+        if (candidate == ptr)
+        {
+            bzero(&list->buffers[i], sizeof(BufferMap));
+            continue;
+        }
+
+        /*
+         * Buffer deletion can encounter stale VAO/map pointers left over from
+         * earlier incorrect eager frees. Do not dereference an arbitrary
+         * candidate here; pointer equality is the only safe test.
+         */
+        if (candidate && (uintptr_t)candidate < 0x10000u)
+        {
+            bzero(&list->buffers[i], sizeof(BufferMap));
+        }
+    }
+}
+
+static inline void mglClearVAOBufferReferences(GLMContext ctx, Buffer *ptr, GLuint name)
+{
+    HashTable *table;
+
+    (void)name;
+
+    if (!ctx)
+        return;
+
+    table = &STATE(vao_table);
+    if (!table->keys || !table->states || table->size == 0)
+        return;
+
+    for (size_t slot = 0; slot < table->size; slot++)
+    {
+        if (table->states[slot] != 1u || !table->keys[slot].data)
+            continue;
+
+        VertexArray *vao = (VertexArray *)table->keys[slot].data;
+        if ((uintptr_t)vao < 0x10000u || vao->magic != MGL_VAO_MAGIC)
+            continue;
+
+        if (vao->element_array.buffer == ptr ||
+            (vao->element_array.buffer && (uintptr_t)vao->element_array.buffer < 0x10000u))
+        {
+            vao->element_array.buffer = NULL;
+        }
+
+        for (GLuint i = 0; i < MAX_ATTRIBS; i++)
+        {
+            if (vao->attrib[i].buffer == ptr ||
+                (vao->attrib[i].buffer && (uintptr_t)vao->attrib[i].buffer < 0x10000u))
+            {
+                vao->attrib[i].buffer = NULL;
+            }
+        }
+    }
 }
 
 static VertexArray *mglGetSafeCurrentVAO(GLMContext ctx)
@@ -808,6 +904,8 @@ void mglCreateBuffers(GLMContext ctx, GLsizei n, GLuint *buffers)
 
 void mglDeleteBuffers(GLMContext ctx, GLsizei n, const GLuint *buffers)
 {
+    static uint64_t s_delete_buffers_calls = 0u;
+    uint64_t call_id = ++s_delete_buffers_calls;
     GLuint buffer;
 
     ctx = mgl_sanitize_ctx(ctx, __FUNCTION__);
@@ -834,71 +932,47 @@ void mglDeleteBuffers(GLMContext ctx, GLsizei n, const GLuint *buffers)
         if (buffer == 0)
             continue;
 
-        if (isBuffer(ctx, buffer))
+        Buffer *ptr = findBuffer(ctx, buffer);
+        if (!ptr)
+            continue;
+
+        if (call_id <= 32u || (call_id % 128u) == 0u)
         {
-            Buffer *ptr;
+            fprintf(stderr,
+                    "MGL TRACE DeleteBuffers call=%llu name=%u ptr=%p tableCount=%zu tableCap=%zu\n",
+                    (unsigned long long)call_id,
+                    buffer,
+                    (void *)ptr,
+                    STATE(buffer_table).count,
+                    STATE(buffer_table).size);
+        }
 
-            ptr = findBuffer(ctx, buffer);
-            if (!ptr)
-                continue;
-
-            if (ptr->data.buffer_data)
-            {
-                if (ptr->storage_flags & GL_CLIENT_STORAGE_BIT)
-                {
-                    if (ptr->data.mtl_data)
-                    {
-                        // the mtl buffer has a deallocator for the vm allocate
-                        ctx->mtl_funcs.mtlDeleteMTLObj(ctx, ptr->data.mtl_data);
-                        ptr->data.mtl_data = NULL;
-                    }
-                    else
-                    {
-                        vm_deallocate(mach_host_self(), ptr->data.buffer_data, ptr->data.buffer_size);
-                    }
-                }
-                else
-                {
-                    if (ptr->data.mtl_data)
-                    {
-                        ctx->mtl_funcs.mtlDeleteMTLObj(ctx, ptr->data.mtl_data);
-                        ptr->data.mtl_data = NULL;
-                    }
-                }
-
-                ptr->data.buffer_data = 0;
-            }
+        if ((uintptr_t)ptr < 0x10000u || ptr->name != buffer)
+        {
+            fprintf(stderr,
+                    "MGL WARNING: mglDeleteBuffers dropping suspicious buffer name=%u ptr=%p ptrName=%u\n",
+                    buffer,
+                    (void *)ptr,
+                    ((uintptr_t)ptr >= 0x10000u) ? ptr->name : 0u);
+            deleteHashElement(&STATE(buffer_table), buffer);
+            continue;
+        }
 
             // remove any dangling references from generic buffer bindings
-            for (GLuint i = 0; i < MAX_BINDABLE_BUFFERS; i++)
+            for (GLuint i = 0; i < _MAX_BUFFER_TYPES; i++)
             {
                 if (STATE(buffers[i]) == ptr ||
-                    (STATE(buffers[i]) && STATE(buffers[i])->name == buffer))
+                    (STATE(buffers[i]) && (uintptr_t)STATE(buffers[i]) < 0x10000u))
                 {
                     STATE(buffers[i]) = NULL;
                 }
             }
 
             // remove dangling VAO references (attribute buffers + element buffer)
-            if (VAO())
-            {
-                if (VAO_STATE(element_array.buffer) == ptr ||
-                    (VAO_STATE(element_array.buffer) && VAO_STATE(element_array.buffer)->name == buffer))
-                {
-                    VAO_STATE(element_array.buffer) = NULL;
-                }
-
-                for (GLuint i = 0; i < MAX_ATTRIBS; i++)
-                {
-                    if (VAO_ATTRIB_STATE(i).buffer == ptr ||
-                        (VAO_ATTRIB_STATE(i).buffer && VAO_ATTRIB_STATE(i).buffer->name == buffer))
-                    {
-                        VAO_ATTRIB_STATE(i).buffer = NULL;
-                    }
-                }
-            }
+            mglClearVAOBufferReferences(ctx, ptr, buffer);
             if (STATE(default_vao_element_array_buffer) == ptr ||
-                (STATE(default_vao_element_array_buffer) && STATE(default_vao_element_array_buffer)->name == buffer))
+                (STATE(default_vao_element_array_buffer) &&
+                 (uintptr_t)STATE(default_vao_element_array_buffer) < 0x10000u))
             {
                 STATE(default_vao_element_array_buffer) = NULL;
             }
@@ -916,9 +990,35 @@ void mglDeleteBuffers(GLMContext ctx, GLsizei n, const GLuint *buffers)
                 }
             }
 
+            mglClearBufferMapReferences(&ctx->state.vertex_buffer_map_list, ptr, buffer);
+            mglClearBufferMapReferences(&ctx->state.fragment_buffer_map_list, ptr, buffer);
+            mglClearBufferMapReferences(&ctx->state.compute_buffer_map_list, ptr, buffer);
+
+            /*
+             * GL buffer deletion is name deletion, not necessarily immediate
+             * object destruction: VAOs, indexed bindings, or an in-flight Metal
+             * command buffer may still hold references. Earlier eager release
+             * paths made those references use-after-free. Remove the name from
+             * the hash table now, but keep the shell/backing storage as a
+             * tombstone until we have real refcount/deferred-free machinery.
+             */
+            void *saved_mtl_data = ptr->data.mtl_data;
             deleteHashElement(&STATE(buffer_table), buffer);
-            free(ptr);
-        } // if (isBuffer(ctx, buffer))
+            ptr->data.mtl_data = saved_mtl_data;
+
+            // Do not free the Buffer shell immediately. Some VAOs/map lists can
+            // legally be rebuilt later in the same frame, and stale references
+            // should become harmless tombstones instead of unmapped pointers.
+            ptr->name = 0;
+            ptr->target = 0;
+            ptr->index = 0;
+            ptr->ever_written = GL_FALSE;
+            ptr->has_initialized_data = GL_FALSE;
+            ptr->written_min = -1;
+            ptr->written_max = -1;
+            ptr->mapped = GL_FALSE;
+            ptr->mapped_ptr = NULL;
+            STATE(dirty_bits) |= (DIRTY_BUFFER | DIRTY_BUFFER_BASE_STATE | DIRTY_VAO);
     } // while(--n)
 }
 
@@ -1988,6 +2088,7 @@ void *mglMapBuffer(GLMContext ctx, GLenum target, GLenum access)
             (void *)(uintptr_t)ptr->data.buffer_data,
             head);
 
+    ptr->mapped_ptr = mapped_ptr;
     return mapped_ptr;
 }
 
@@ -2048,8 +2149,14 @@ GLboolean mglUnmapBuffer(GLMContext ctx, GLenum target)
             (long long)ptr->mapped_offset,
             (long long)ptr->mapped_length);
 
-    if ((ptr->storage_flags & GL_MAP_PERSISTENT_BIT) &&
-        (ptr->access_flags & GL_MAP_PERSISTENT_BIT))
+    GLintptr unmap_offset = ptr->mapped_offset;
+    GLsizeiptr unmap_length = ptr->mapped_length > 0 ? ptr->mapped_length : ptr->size;
+    GLenum unmap_access = ptr->access_flags ? ptr->access_flags : ptr->access;
+    GLboolean persistent_map =
+        (ptr->storage_flags & GL_MAP_PERSISTENT_BIT) &&
+        (ptr->access_flags & GL_MAP_PERSISTENT_BIT);
+
+    if (persistent_map)
     {
         mglBufferMarkMapWrite(ptr);
 
@@ -2061,6 +2168,7 @@ GLboolean mglUnmapBuffer(GLMContext ctx, GLenum target)
         ptr->access_flags = 0;
         ptr->mapped_offset = 0;
         ptr->mapped_length = 0;
+        ptr->mapped_ptr = NULL;
 
         fprintf(stderr,
                 "MGL TRACE UnmapBuffer.end persistent target=0x%x buffer=%u dirty=0x%x\n",
@@ -2071,6 +2179,11 @@ GLboolean mglUnmapBuffer(GLMContext ctx, GLenum target)
         return GL_TRUE;
     }
 
+    if (ctx->mtl_funcs.mtlMapUnmapBuffer)
+    {
+        ctx->mtl_funcs.mtlMapUnmapBuffer(ctx, ptr, unmap_offset, unmap_length, unmap_access, false);
+    }
+
     mglBufferMarkMapWrite(ptr);
 
     ptr->mapped = GL_FALSE;
@@ -2078,11 +2191,7 @@ GLboolean mglUnmapBuffer(GLMContext ctx, GLenum target)
     ptr->access_flags = 0;
     ptr->mapped_offset = 0;
     ptr->mapped_length = 0;
-
-    if (ctx->mtl_funcs.mtlMapUnmapBuffer)
-    {
-        ctx->mtl_funcs.mtlMapUnmapBuffer(ctx, ptr, 0, ptr->size, 0, false);
-    }
+    ptr->mapped_ptr = NULL;
 
     fprintf(stderr,
             "MGL TRACE UnmapBuffer.end target=0x%x buffer=%u dirty=0x%x mapped=%u\n",
@@ -2114,8 +2223,6 @@ GLboolean mglUnmapNamedBuffer(GLMContext ctx, GLuint buffer)
         ERROR_RETURN_VALUE(GL_INVALID_OPERATION, GL_FALSE);
     }
 
-    mglBufferMarkMapWrite(ptr);
-
     if (!(ptr->storage_flags & GL_MAP_PERSISTENT_BIT) && ctx->mtl_funcs.mtlMapUnmapBuffer)
     {
         ctx->mtl_funcs.mtlMapUnmapBuffer(ctx,
@@ -2126,11 +2233,14 @@ GLboolean mglUnmapNamedBuffer(GLMContext ctx, GLuint buffer)
                                          false);
     }
 
+    mglBufferMarkMapWrite(ptr);
+
     ptr->mapped = GL_FALSE;
     ptr->access = 0;
     ptr->access_flags = 0;
     ptr->mapped_offset = 0;
     ptr->mapped_length = 0;
+    ptr->mapped_ptr = NULL;
 
     return GL_TRUE;
 }
@@ -2240,6 +2350,7 @@ void *mglMapBufferRange(GLMContext ctx, GLenum target, GLintptr offset, GLsizeip
                         ptr->name,
                         mapped_ptr);
             }
+            ptr->mapped_ptr = mapped_ptr;
             return mapped_ptr;
         }
 
@@ -2267,6 +2378,7 @@ void *mglMapBufferRange(GLMContext ctx, GLenum target, GLintptr offset, GLsizeip
                     ptr->name,
                     mapped_ptr);
         }
+        ptr->mapped_ptr = mapped_ptr;
         return mapped_ptr;
     }
 
@@ -2278,6 +2390,7 @@ void *mglMapBufferRange(GLMContext ctx, GLenum target, GLintptr offset, GLsizeip
                 ptr->name,
                 mapped_ptr);
     }
+    ptr->mapped_ptr = mapped_ptr;
     return mapped_ptr;
 }
 
@@ -2358,6 +2471,7 @@ void *mglMapNamedBufferRange(GLMContext ctx, GLuint buffer, GLintptr offset, GLs
                     "MGL TRACE MapNamedBufferRange.return persistent buffer=%u mappedPtr=%p\n",
                     ptr->name,
                     mapped_ptr);
+            ptr->mapped_ptr = mapped_ptr;
             return mapped_ptr;
         }
         ERROR_RETURN_VALUE(GL_INVALID_OPERATION, NULL);
@@ -2377,6 +2491,7 @@ void *mglMapNamedBufferRange(GLMContext ctx, GLuint buffer, GLintptr offset, GLs
                 "MGL TRACE MapNamedBufferRange.return fallback buffer=%u mappedPtr=%p\n",
                 ptr->name,
                 mapped_ptr);
+        ptr->mapped_ptr = mapped_ptr;
         return mapped_ptr;
     }
 
@@ -2385,6 +2500,7 @@ void *mglMapNamedBufferRange(GLMContext ctx, GLuint buffer, GLintptr offset, GLs
             "MGL TRACE MapNamedBufferRange.return mtl buffer=%u mappedPtr=%p\n",
             ptr->name,
             mapped_ptr);
+    ptr->mapped_ptr = mapped_ptr;
     return mapped_ptr;
 }
 
@@ -2705,8 +2821,10 @@ void mglGetBufferPointerv(GLMContext ctx, GLenum target, GLenum pname, void **pa
 
     ERROR_CHECK_RETURN((ptr != NULL), GL_INVALID_OPERATION);
 
-    if (ptr->mapped) {
-        *params = (void *)ptr->data.buffer_data;
+    if (ptr->mapped && ptr->mapped_ptr) {
+        *params = ptr->mapped_ptr;
+    } else if (ptr->mapped && ptr->data.buffer_data) {
+        *params = (void *)((uint8_t *)(uintptr_t)ptr->data.buffer_data + (size_t)ptr->mapped_offset);
     } else {
         *params = NULL;
     }
@@ -2890,7 +3008,11 @@ void mglGetNamedBufferPointerv(GLMContext ctx, GLuint buffer, GLenum pname, void
         return;
     }
 
-    if (ptr->mapped && ptr->data.buffer_data)
+    if (ptr->mapped && ptr->mapped_ptr)
+    {
+        *params = ptr->mapped_ptr;
+    }
+    else if (ptr->mapped && ptr->data.buffer_data)
     {
         *params = (void *)((uint8_t *)(uintptr_t)ptr->data.buffer_data + (size_t)ptr->mapped_offset);
     }

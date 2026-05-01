@@ -70,6 +70,193 @@ enum {
     _MAX_DRAW_BUFFERS
 };
 
+typedef struct MGLScaledBlitParams_t {
+    vector_float4 uvRect; // xy=min, zw=max in normalized Metal texture coordinates.
+} MGLScaledBlitParams;
+
+static MTLCompareFunction mglMTLCompareFunctionForGL(GLenum func,
+                                                     MTLCompareFunction fallback,
+                                                     const char *label)
+{
+    switch (func) {
+        case GL_NEVER: return MTLCompareFunctionNever;
+        case GL_LESS: return MTLCompareFunctionLess;
+        case GL_EQUAL: return MTLCompareFunctionEqual;
+        case GL_LEQUAL: return MTLCompareFunctionLessEqual;
+        case GL_GREATER: return MTLCompareFunctionGreater;
+        case GL_NOTEQUAL: return MTLCompareFunctionNotEqual;
+        case GL_GEQUAL: return MTLCompareFunctionGreaterEqual;
+        case GL_ALWAYS: return MTLCompareFunctionAlways;
+        default: {
+            static uint64_t s_badCompareFunctionCount = 0;
+            uint64_t hit = ++s_badCompareFunctionCount;
+
+            if (hit <= 32 || (hit % 256) == 0) {
+                NSLog(@"MGL WARNING: invalid %s compare func=0x%x, fallback=%lu hit=%llu",
+                      label ? label : "unknown",
+                      func,
+                      (unsigned long)fallback,
+                      (unsigned long long)hit);
+            }
+
+            return fallback;
+        }
+    }
+}
+
+static MTLWinding mglMTLWindingForGL(GLenum frontFace)
+{
+    switch (frontFace) {
+        case GL_CW:
+            return MTLWindingClockwise;
+        case GL_CCW:
+            return MTLWindingCounterClockwise;
+        default: {
+            static uint64_t s_badFrontFaceCount = 0;
+            uint64_t hit = ++s_badFrontFaceCount;
+
+            if (hit <= 32 || (hit % 256) == 0) {
+                NSLog(@"MGL WARNING: invalid front face enum=0x%x, fallback=GL_CCW hit=%llu",
+                      frontFace,
+                      (unsigned long long)hit);
+            }
+
+            return MTLWindingCounterClockwise;
+        }
+    }
+}
+
+static BOOL mglIsValidGLCompareFunction(GLenum func)
+{
+    switch (func) {
+        case GL_NEVER:
+        case GL_LESS:
+        case GL_EQUAL:
+        case GL_LEQUAL:
+        case GL_GREATER:
+        case GL_NOTEQUAL:
+        case GL_GEQUAL:
+        case GL_ALWAYS:
+            return YES;
+        default:
+            return NO;
+    }
+}
+
+static BOOL mglIsValidGLBlendEquation(GLenum op)
+{
+    switch (op) {
+        case GL_FUNC_ADD:
+        case GL_FUNC_SUBTRACT:
+        case GL_FUNC_REVERSE_SUBTRACT:
+        case GL_MIN:
+        case GL_MAX:
+            return YES;
+        default:
+            return NO;
+    }
+}
+
+static BOOL mglIsValidGLBlendFactor(GLenum factor)
+{
+    switch (factor) {
+        case GL_ZERO:
+        case GL_ONE:
+        case GL_SRC_COLOR:
+        case GL_ONE_MINUS_SRC_COLOR:
+        case GL_DST_COLOR:
+        case GL_ONE_MINUS_DST_COLOR:
+        case GL_SRC_ALPHA:
+        case GL_ONE_MINUS_SRC_ALPHA:
+        case GL_DST_ALPHA:
+        case GL_ONE_MINUS_DST_ALPHA:
+        case GL_CONSTANT_COLOR:
+        case GL_ONE_MINUS_CONSTANT_COLOR:
+        case GL_CONSTANT_ALPHA:
+        case GL_ONE_MINUS_CONSTANT_ALPHA:
+        case GL_SRC_ALPHA_SATURATE:
+            return YES;
+        default:
+            return NO;
+    }
+}
+
+static void mglLogRenderStateRepair(const char *field, GLenum value, GLenum fallback)
+{
+    static uint64_t s_stateRepairCount = 0;
+    uint64_t hit = ++s_stateRepairCount;
+
+    if (hit <= 64 || (hit % 512) == 0) {
+        NSLog(@"MGL WARNING: repairing invalid render state %s=0x%x -> 0x%x hit=%llu",
+              field ? field : "unknown",
+              value,
+              fallback,
+              (unsigned long long)hit);
+    }
+}
+
+static BOOL mglShouldLogSmallBaseBinding(GLuint programName,
+                                         int stage,
+                                         int resourceType,
+                                         GLuint binding,
+                                         GLuint glName,
+                                         GLsizeiptr rangeSize,
+                                         NSUInteger reflectedSize)
+{
+    typedef struct MGLSmallBaseBindingLogKey_t {
+        GLuint programName;
+        int stage;
+        int resourceType;
+        GLuint binding;
+        GLuint glName;
+        GLsizeiptr rangeSize;
+        NSUInteger reflectedSize;
+        uint64_t hits;
+    } MGLSmallBaseBindingLogKey;
+
+    static MGLSmallBaseBindingLogKey s_keys[128];
+    static uint32_t s_keyCount = 0;
+    static uint64_t s_overflowHits = 0;
+
+    for (uint32_t i = 0; i < s_keyCount; i++) {
+        MGLSmallBaseBindingLogKey *key = &s_keys[i];
+        if (key->programName == programName &&
+            key->stage == stage &&
+            key->resourceType == resourceType &&
+            key->binding == binding &&
+            key->glName == glName &&
+            key->rangeSize == rangeSize &&
+            key->reflectedSize == reflectedSize) {
+            key->hits++;
+            return key->hits <= 4 || (key->hits % 1024) == 0;
+        }
+    }
+
+    if (s_keyCount < (uint32_t)(sizeof(s_keys) / sizeof(s_keys[0]))) {
+        s_keys[s_keyCount++] = (MGLSmallBaseBindingLogKey){
+            .programName = programName,
+            .stage = stage,
+            .resourceType = resourceType,
+            .binding = binding,
+            .glName = glName,
+            .rangeSize = rangeSize,
+            .reflectedSize = reflectedSize,
+            .hits = 1
+        };
+        return YES;
+    }
+
+    s_overflowHits++;
+    return s_overflowHits <= 8 || (s_overflowHits % 2048) == 0;
+}
+
+
+__attribute__((constructor))
+static void mglRendererDiagnosticBuildMarker(void)
+{
+    NSLog(@"MGL DIAG BUILD marker=no-swap-watchdog-20260429 renderer-loaded");
+}
+
 // CRITICAL SECURITY: Safe Metal object validation helper
 static inline id<NSObject> SafeMetalBridge(void *ptr, Class expectedClass, const char *objectName) {
     if (!ptr) {
@@ -101,6 +288,10 @@ static const BOOL kMGLVerbosePipelineLogs = NO;
 // reaches the actual crash site instead of Prism's 100k-line cap.
 static const BOOL kMGLVerboseFrameLoopLogs = NO;
 static const BOOL kMGLDiagnosticStateLogs = NO;
+// Keep swap/present sampling available even when broad state tracing is disabled.
+// This is intentionally low-frequency so Prism's 100k-line cap does not hide the
+// final compositing evidence.
+static const BOOL kMGLSwapPresentDiagnostics = YES;
 // Narrow draw-submit breadcrumbs stay enabled because Metal validation aborts
 // the process before Objective-C exceptions can catch anything useful.
 static const BOOL kMGLDrawSubmitDiagnostics = YES;
@@ -148,6 +339,8 @@ static volatile uint64_t g_mglDrawElementIndicesSinceSwap = 0;
 static volatile uint64_t g_mglDrawArraysSkippedSinceSwap = 0;
 static volatile uint64_t g_mglDrawElementsSkippedSinceSwap = 0;
 static volatile uint64_t g_mglProcessDrawCallsSinceSwap = 0;
+static volatile uint64_t g_mglSwapCallCount = 0;
+static volatile double g_mglLastSwapSeconds = 0.0;
 
 typedef struct MGLSwapDrawCounters {
     uint64_t draw_arrays;
@@ -244,6 +437,23 @@ static Program *mglResolveProgramFromState(GLMContext ctx)
     return resolved;
 }
 
+static Program *mglPeekProgramByName(GLMContext ctx, GLuint programName)
+{
+    if (!mglRendererContextLikelyValid(ctx) || programName == 0) {
+        return NULL;
+    }
+
+    Program *program = ctx->state.program;
+    if (program &&
+        program->name == programName &&
+        (uintptr_t)program >= 0x100000000ULL &&
+        mglRendererPointerInHashTable(&ctx->state.program_table, program)) {
+        return program;
+    }
+
+    return (Program *)searchHashTable(&ctx->state.program_table, programName);
+}
+
 static const char *mglShaderStageName(int stage)
 {
     switch (stage) {
@@ -308,12 +518,20 @@ static void mglWriteProgramMSLDump(Program *program, NSString *reason)
         return;
     }
 
-    static GLuint s_lastDumpProgram = 0;
+    static GLuint s_dumpedPrograms[64] = {0};
+    static uint32_t s_dumpedProgramCount = 0;
     static uint32_t s_dumpGeneration = 0;
-    if (s_lastDumpProgram == program->name) {
+    for (uint32_t i = 0; i < s_dumpedProgramCount; i++) {
+        if (s_dumpedPrograms[i] == program->name) {
+            return;
+        }
+    }
+
+    if (s_dumpedProgramCount < (uint32_t)(sizeof(s_dumpedPrograms) / sizeof(s_dumpedPrograms[0]))) {
+        s_dumpedPrograms[s_dumpedProgramCount++] = program->name;
+    } else {
         return;
     }
-    s_lastDumpProgram = program->name;
     s_dumpGeneration++;
 
     NSLog(@"MGL IFACE DUMP begin program=%u reason=%@ generation=%u",
@@ -325,6 +543,14 @@ static void mglWriteProgramMSLDump(Program *program, NSString *reason)
     mglLogProgramResourceInterface(program, _FRAGMENT_SHADER, SPVC_RESOURCE_TYPE_STAGE_INPUT);
     mglLogProgramResourceInterface(program, _VERTEX_SHADER, SPVC_RESOURCE_TYPE_STAGE_INPUT);
     mglLogProgramResourceInterface(program, _FRAGMENT_SHADER, SPVC_RESOURCE_TYPE_STAGE_OUTPUT);
+    mglLogProgramResourceInterface(program, _VERTEX_SHADER, SPVC_RESOURCE_TYPE_UNIFORM_BUFFER);
+    mglLogProgramResourceInterface(program, _FRAGMENT_SHADER, SPVC_RESOURCE_TYPE_UNIFORM_BUFFER);
+    mglLogProgramResourceInterface(program, _VERTEX_SHADER, SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT);
+    mglLogProgramResourceInterface(program, _FRAGMENT_SHADER, SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT);
+    mglLogProgramResourceInterface(program, _VERTEX_SHADER, SPVC_RESOURCE_TYPE_SAMPLED_IMAGE);
+    mglLogProgramResourceInterface(program, _FRAGMENT_SHADER, SPVC_RESOURCE_TYPE_SAMPLED_IMAGE);
+    mglLogProgramResourceInterface(program, _VERTEX_SHADER, SPVC_RESOURCE_TYPE_SEPARATE_IMAGE);
+    mglLogProgramResourceInterface(program, _FRAGMENT_SHADER, SPVC_RESOURCE_TYPE_SEPARATE_IMAGE);
 
     for (int stage = 0; stage < _MAX_SHADER_TYPES; stage++) {
         const char *msl = program->spirv[stage].msl_str;
@@ -352,12 +578,299 @@ static void mglWriteProgramMSLDump(Program *program, NSString *reason)
     }
 }
 
+static GLuint g_mglFocusedLoadingPrograms[32] = {0};
+static uint32_t g_mglFocusedLoadingProgramCount = 0;
+
+static bool mglProgramHasImageDim(Program *program, GLuint imageDim)
+{
+    if (!program) {
+        return false;
+    }
+
+    const int resourceTypes[] = {
+        SPVC_RESOURCE_TYPE_SAMPLED_IMAGE,
+        SPVC_RESOURCE_TYPE_SEPARATE_IMAGE,
+        SPVC_RESOURCE_TYPE_STORAGE_IMAGE
+    };
+
+    for (int stage = 0; stage < _MAX_SHADER_TYPES; stage++) {
+        for (size_t t = 0; t < sizeof(resourceTypes) / sizeof(resourceTypes[0]); t++) {
+            int type = resourceTypes[t];
+            if (type < 0 || type >= _MAX_SPIRV_RES) {
+                continue;
+            }
+            SpirvResourceList *resources = &program->spirv_resources_list[stage][type];
+            for (GLuint i = 0; i < resources->count; i++) {
+                if (resources->list[i].image_dim == imageDim) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+static void mglFocusLoadingProgram(GLuint programName, const char *reason, uint64_t detail)
+{
+    if (programName == 0) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < g_mglFocusedLoadingProgramCount; i++) {
+        if (g_mglFocusedLoadingPrograms[i] == programName) {
+            return;
+        }
+    }
+
+    if (g_mglFocusedLoadingProgramCount >= (uint32_t)(sizeof(g_mglFocusedLoadingPrograms) / sizeof(g_mglFocusedLoadingPrograms[0]))) {
+        return;
+    }
+
+    g_mglFocusedLoadingPrograms[g_mglFocusedLoadingProgramCount++] = programName;
+    NSLog(@"MGL TRACE focus.program program=%u reason=%s detail=%llu",
+          (unsigned)programName,
+          reason ? reason : "(none)",
+          (unsigned long long)detail);
+}
+
+static void mglObserveProgramDrawForFocus(GLuint programName,
+                                          GLsizei count,
+                                          GLuint enabledAttribs)
+{
+    typedef struct MGLProgramDrawObservation {
+        GLuint program;
+        GLsizei count;
+        GLuint enabledAttribs;
+        uint64_t hits;
+    } MGLProgramDrawObservation;
+
+    static MGLProgramDrawObservation s_observations[64] = {{0, 0, 0, 0}};
+
+    if (programName == 0) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < (uint32_t)(sizeof(s_observations) / sizeof(s_observations[0])); i++) {
+        if (s_observations[i].program == programName ||
+            s_observations[i].program == 0) {
+            if (s_observations[i].program == 0) {
+                s_observations[i].program = programName;
+                s_observations[i].count = count;
+                s_observations[i].enabledAttribs = enabledAttribs;
+            }
+
+            if (s_observations[i].count == count &&
+                s_observations[i].enabledAttribs == enabledAttribs) {
+                s_observations[i].hits++;
+            } else {
+                s_observations[i].count = count;
+                s_observations[i].enabledAttribs = enabledAttribs;
+                s_observations[i].hits = 1;
+            }
+
+            if (s_observations[i].hits == 16ull) {
+                mglFocusLoadingProgram(programName, "repeated-draw-pattern", s_observations[i].hits);
+            }
+            return;
+        }
+    }
+}
+
+static inline bool mglIsFocusedLoadingProgram(GLuint programName)
+{
+    for (uint32_t i = 0; i < g_mglFocusedLoadingProgramCount; i++) {
+        if (g_mglFocusedLoadingPrograms[i] == programName) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static inline bool mglShouldTraceCall(uint64_t count)
 {
     if (!kMGLDiagnosticStateLogs) {
         return false;
     }
     return (count <= 80ull) || ((count % 500ull) == 0ull);
+}
+
+static inline TextureLevel *mglTraceTextureBaseLevel(Texture *tex)
+{
+    if (!tex || tex->num_levels == 0 || !tex->faces[0].levels) {
+        return NULL;
+    }
+
+    return &tex->faces[0].levels[0];
+}
+
+static inline GLuint mglTraceTextureName(Texture *tex)
+{
+    return tex ? tex->name : 0u;
+}
+
+typedef NS_ENUM(NSUInteger, MGLTextureDataKind) {
+    MGLTextureDataKindUnknown = 0,
+    MGLTextureDataKindFloat = 1,
+    MGLTextureDataKindSint = 2,
+    MGLTextureDataKindUint = 3,
+};
+
+static MTLTextureType mglExpectedTextureTypeFromMSL(const char *msl, GLuint binding)
+{
+    if (!msl) {
+        return 0;
+    }
+
+    char needle[32];
+    snprintf(needle, sizeof(needle), "[[texture(%u)]]", (unsigned)binding);
+
+    const char *cursor = msl;
+    while ((cursor = strstr(cursor, needle)) != NULL) {
+        const char *lineStart = cursor;
+        while (lineStart > msl && lineStart[-1] != '\n' && lineStart[-1] != '\r') {
+            lineStart--;
+        }
+
+        size_t lineLen = (size_t)(cursor - lineStart);
+        if (lineLen > 1024u) {
+            lineLen = 1024u;
+        }
+
+        char line[1025];
+        memcpy(line, lineStart, lineLen);
+        line[lineLen] = '\0';
+
+        if (strstr(line, "texture_buffer")) {
+            return MTLTextureTypeTextureBuffer;
+        }
+        if (strstr(line, "texturecube_array")) {
+            return MTLTextureTypeCubeArray;
+        }
+        if (strstr(line, "texturecube")) {
+            return MTLTextureTypeCube;
+        }
+        if (strstr(line, "texture3d")) {
+            return MTLTextureType3D;
+        }
+        if (strstr(line, "texture2d_ms_array")) {
+            return MTLTextureType2DMultisampleArray;
+        }
+        if (strstr(line, "texture2d_ms")) {
+            return MTLTextureType2DMultisample;
+        }
+        if (strstr(line, "texture2d_array")) {
+            return MTLTextureType2DArray;
+        }
+        if (strstr(line, "texture2d")) {
+            return MTLTextureType2D;
+        }
+        if (strstr(line, "texture1d_array")) {
+            return MTLTextureType1DArray;
+        }
+        if (strstr(line, "texture1d")) {
+            return MTLTextureType1D;
+        }
+
+        cursor += strlen(needle);
+    }
+
+    return 0;
+}
+
+static MGLTextureDataKind mglExpectedTextureDataKindFromMSL(const char *msl, GLuint binding)
+{
+    if (!msl) {
+        return MGLTextureDataKindUnknown;
+    }
+
+    char needle[32];
+    snprintf(needle, sizeof(needle), "[[texture(%u)]]", (unsigned)binding);
+
+    const char *cursor = msl;
+    while ((cursor = strstr(cursor, needle)) != NULL) {
+        const char *lineStart = cursor;
+        while (lineStart > msl && lineStart[-1] != '\n' && lineStart[-1] != '\r') {
+            lineStart--;
+        }
+
+        size_t lineLen = (size_t)(cursor - lineStart);
+        if (lineLen > 1024u) {
+            lineLen = 1024u;
+        }
+
+        char line[1025];
+        memcpy(line, lineStart, lineLen);
+        line[lineLen] = '\0';
+
+        if (strstr(line, "<int") || strstr(line, "<short") || strstr(line, "<char")) {
+            return MGLTextureDataKindSint;
+        }
+        if (strstr(line, "<uint") || strstr(line, "<ushort") || strstr(line, "<uchar")) {
+            return MGLTextureDataKindUint;
+        }
+        if (strstr(line, "<float") || strstr(line, "<half")) {
+            return MGLTextureDataKindFloat;
+        }
+
+        cursor += strlen(needle);
+    }
+
+    return MGLTextureDataKindUnknown;
+}
+
+static MGLTextureDataKind mglTextureDataKindForPixelFormat(MTLPixelFormat pixelFormat)
+{
+    switch (pixelFormat) {
+        case MTLPixelFormatR8Sint:
+        case MTLPixelFormatRG8Sint:
+        case MTLPixelFormatRGBA8Sint:
+        case MTLPixelFormatR16Sint:
+        case MTLPixelFormatRG16Sint:
+        case MTLPixelFormatRGBA16Sint:
+        case MTLPixelFormatR32Sint:
+        case MTLPixelFormatRG32Sint:
+        case MTLPixelFormatRGBA32Sint:
+            return MGLTextureDataKindSint;
+
+        case MTLPixelFormatR8Uint:
+        case MTLPixelFormatRG8Uint:
+        case MTLPixelFormatRGBA8Uint:
+        case MTLPixelFormatR16Uint:
+        case MTLPixelFormatRG16Uint:
+        case MTLPixelFormatRGBA16Uint:
+        case MTLPixelFormatR32Uint:
+        case MTLPixelFormatRG32Uint:
+        case MTLPixelFormatRGBA32Uint:
+            return MGLTextureDataKindUint;
+
+        case MTLPixelFormatInvalid:
+            return MGLTextureDataKindUnknown;
+
+        default:
+            return MGLTextureDataKindFloat;
+    }
+}
+
+static inline BOOL mglTexturePixelFormatCompatibleWithExpectedDataKind(MTLPixelFormat pixelFormat,
+                                                                       MGLTextureDataKind expectedKind)
+{
+    if (expectedKind == MGLTextureDataKindUnknown) {
+        return YES;
+    }
+
+    return mglTextureDataKindForPixelFormat(pixelFormat) == expectedKind;
+}
+
+static inline const char *mglTextureDataKindName(MGLTextureDataKind kind)
+{
+    switch (kind) {
+        case MGLTextureDataKindFloat: return "float";
+        case MGLTextureDataKindSint: return "sint";
+        case MGLTextureDataKindUint: return "uint";
+        default: return "unknown";
+    }
 }
 
 static inline double mglNowSeconds(void)
@@ -613,6 +1126,60 @@ static void mglLogStateSnapshot(const char *tag,
           (unsigned)ctx->state.var.stencil_writemask);
 }
 
+static void mglLogDrawWithoutSwapWatchdog(const char *kind,
+                                          uint64_t drawCall,
+                                          GLMContext ctx,
+                                          id<MTLCommandBuffer> commandBuffer,
+                                          id<MTLRenderCommandEncoder> renderEncoder,
+                                          MTLRenderPassDescriptor *renderPassDescriptor)
+{
+    uint64_t drawArrays = g_mglDrawArraysSinceSwap;
+    uint64_t drawElements = g_mglDrawElementsSinceSwap;
+    uint64_t totalDraws = drawArrays + drawElements;
+    if (totalDraws < 16384ull || (totalDraws % 16384ull) != 0ull) {
+        return;
+    }
+
+    double now = mglNowSeconds();
+    double lastSwap = g_mglLastSwapSeconds;
+    double lastSwapAgeMs = (lastSwap > 0.0) ? ((now - lastSwap) * 1000.0) : -1.0;
+    if (lastSwapAgeMs >= 0.0 && lastSwapAgeMs < 250.0) {
+        return;
+    }
+    MTLCommandBufferStatus cbStatus = commandBuffer ? commandBuffer.status : MTLCommandBufferStatusNotEnqueued;
+    id<MTLTexture> rpColor0 = renderPassDescriptor ? renderPassDescriptor.colorAttachments[0].texture : nil;
+    MTLLoadAction colorLoadAction = renderPassDescriptor ? renderPassDescriptor.colorAttachments[0].loadAction : MTLLoadActionDontCare;
+    MTLStoreAction colorStoreAction = renderPassDescriptor ? renderPassDescriptor.colorAttachments[0].storeAction : MTLStoreActionDontCare;
+    MTLClearColor clear = renderPassDescriptor ? renderPassDescriptor.colorAttachments[0].clearColor : MTLClearColorMake(0.0, 0.0, 0.0, 0.0);
+
+    NSLog(@"MGL WATCHDOG: draws-without-swap kind=%s drawCall=%llu total=%llu arrays=%llu elements=%llu "
+          "swapCalls=%llu lastSwapAgeMs=%.2f program=%u drawBuf=0x%x fbo=%p vao=%p cb=%p[%s] enc=%p "
+          "rpd=%p c0=%p fmt=%lu la/sa=%s/%s clear=(%.3f,%.3f,%.3f,%.3f)",
+          kind ? kind : "draw",
+          (unsigned long long)drawCall,
+          (unsigned long long)totalDraws,
+          (unsigned long long)drawArrays,
+          (unsigned long long)drawElements,
+          (unsigned long long)g_mglSwapCallCount,
+          lastSwapAgeMs,
+          (unsigned)(ctx ? ctx->state.program_name : 0u),
+          (unsigned)(ctx ? ctx->state.draw_buffer : 0u),
+          ctx ? ctx->state.framebuffer : NULL,
+          ctx ? ctx->state.vao : NULL,
+          commandBuffer,
+          mglCommandBufferStatusName(cbStatus),
+          renderEncoder,
+          renderPassDescriptor,
+          rpColor0,
+          (unsigned long)(rpColor0 ? rpColor0.pixelFormat : MTLPixelFormatInvalid),
+          mglLoadActionName(colorLoadAction),
+          mglStoreActionName(colorStoreAction),
+          clear.red,
+          clear.green,
+          clear.blue,
+          clear.alpha);
+}
+
 static BOOL mglRendererPointerInHashTable(const HashTable *table, const void *ptr)
 {
     if (!table || !ptr || !table->keys || table->size == 0) {
@@ -685,6 +1252,19 @@ static Buffer *mglRendererGetValidatedBuffer(GLMContext ctx, Buffer *candidate, 
     return candidate;
 }
 
+static BOOL mglRendererSameVertexStream(Buffer *lhsBuffer,
+                                        GLintptr lhsOffset,
+                                        Buffer *rhsBuffer,
+                                        GLintptr rhsOffset)
+{
+    if (!lhsBuffer || !rhsBuffer || lhsOffset != rhsOffset) {
+        return NO;
+    }
+
+    return lhsBuffer == rhsBuffer ||
+           (lhsBuffer->name == rhsBuffer->name && lhsBuffer->target == rhsBuffer->target);
+}
+
 static int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
                                                         VertexArray *vao,
                                                         GLuint attribute,
@@ -702,8 +1282,15 @@ static int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
     if (!target) {
         return -1;
     }
+    GLintptr targetBindingOffset = vao->attrib[attribute].binding_offset;
+    if (targetBindingOffset < 0) {
+        NSLog(@"MGL ERROR: attribute %u has negative vertex binding offset=%lld in %s",
+              attribute, (long long)targetBindingOffset, where);
+        return -1;
+    }
 
     Buffer *seenBuffers[MAX_ATTRIBS] = {0};
+    GLintptr seenOffsets[MAX_ATTRIBS] = {0};
     GLuint seenCount = 0;
     GLuint maxAttribs = ctx->state.max_vertex_attribs;
     if (maxAttribs > MAX_ATTRIBS) {
@@ -723,8 +1310,10 @@ static int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
         int slot = -1;
         for (GLuint s = 0; s < seenCount; s++) {
             Buffer *known = seenBuffers[s];
-            if (known == attribBuffer ||
-                (known && known->name == attribBuffer->name && known->target == attribBuffer->target)) {
+            if (mglRendererSameVertexStream(known,
+                                            seenOffsets[s],
+                                            attribBuffer,
+                                            vao->attrib[i].binding_offset)) {
                 slot = (int)s;
                 break;
             }
@@ -738,6 +1327,7 @@ static int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
             }
 
             seenBuffers[seenCount] = attribBuffer;
+            seenOffsets[seenCount] = vao->attrib[i].binding_offset;
             slot = (int)seenCount;
             seenCount++;
         }
@@ -820,9 +1410,18 @@ static int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
 
     id<MTLRenderCommandEncoder> _currentRenderEncoder;
     id<MTLTexture> _fallbackRenderTargetTexture;
+    id<MTLTexture> _transientDepthTexture;
+    NSUInteger _transientDepthTextureWidth;
+    NSUInteger _transientDepthTextureHeight;
     id<MTLTexture> _fallbackSampledTexture;
     id<MTLTexture> _fallbackCubeSampledTexture;
+    id<MTLBuffer> _fallbackTextureBufferStorage;
+    id<MTLTexture> _fallbackSintTextureBuffer;
+    NSMutableDictionary<NSNumber *, id<MTLTexture>> *_fallbackSampledTextureCache;
     id<MTLSamplerState> _fallbackSamplerState;
+    NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *_scaledBlitPipelineCache;
+    id<MTLSamplerState> _scaledBlitNearestSampler;
+    id<MTLSamplerState> _scaledBlitLinearSampler;
 
     GLuint _blitOperationComplete;
 
@@ -1035,6 +1634,10 @@ static inline bool mglShouldInspectDrawCall(uint64_t drawCall, GLuint programNam
         return true;
     }
 
+    if (mglIsFocusedLoadingProgram(programName)) {
+        return (drawCall <= 512ull) || ((drawCall % 64ull) == 0ull);
+    }
+
     // Keep a denser trail for active Minecraft pipeline churn without flooding.
     if ((programName == 3u || programName == 74u) && ((drawCall % 40ull) == 0ull)) {
         return true;
@@ -1091,6 +1694,91 @@ static inline bool mglScanIndexRange(const uint8_t *indexBytes,
     *outMin = minIndex;
     *outMax = maxIndex;
     return true;
+}
+
+static id<MTLBuffer> mglNewTriangleFanArrayIndexBuffer(id<MTLDevice> device,
+                                                       NSUInteger vertexCount,
+                                                       NSUInteger *outIndexCount)
+{
+    if (outIndexCount) {
+        *outIndexCount = 0u;
+    }
+
+    if (!device || vertexCount < 3u) {
+        return nil;
+    }
+
+    NSUInteger triangleCount = vertexCount - 2u;
+    if (triangleCount > (NSUIntegerMax / (3u * sizeof(uint32_t)))) {
+        return nil;
+    }
+
+    NSUInteger indexCount = triangleCount * 3u;
+    uint32_t *indices = (uint32_t *)calloc(indexCount, sizeof(uint32_t));
+    if (!indices) {
+        return nil;
+    }
+
+    for (NSUInteger tri = 0; tri < triangleCount; tri++) {
+        indices[(tri * 3u) + 0u] = 0u;
+        indices[(tri * 3u) + 1u] = (uint32_t)(tri + 1u);
+        indices[(tri * 3u) + 2u] = (uint32_t)(tri + 2u);
+    }
+
+    id<MTLBuffer> buffer = [device newBufferWithBytes:indices
+                                               length:(indexCount * sizeof(uint32_t))
+                                              options:MTLResourceStorageModeShared];
+    free(indices);
+
+    if (outIndexCount && buffer) {
+        *outIndexCount = indexCount;
+    }
+
+    return buffer;
+}
+
+static id<MTLBuffer> mglNewTriangleFanElementIndexBuffer(id<MTLDevice> device,
+                                                         const uint8_t *sourceIndexBytes,
+                                                         MTLIndexType sourceIndexType,
+                                                         NSUInteger sourceIndexCount,
+                                                         NSUInteger *outIndexCount)
+{
+    if (outIndexCount) {
+        *outIndexCount = 0u;
+    }
+
+    if (!device || !sourceIndexBytes || sourceIndexCount < 3u) {
+        return nil;
+    }
+
+    NSUInteger triangleCount = sourceIndexCount - 2u;
+    if (triangleCount > (NSUIntegerMax / (3u * sizeof(uint32_t)))) {
+        return nil;
+    }
+
+    NSUInteger indexCount = triangleCount * 3u;
+    uint32_t *indices = (uint32_t *)calloc(indexCount, sizeof(uint32_t));
+    if (!indices) {
+        return nil;
+    }
+
+    uint32_t center = mglReadIndexValue(sourceIndexBytes, sourceIndexType, 0u);
+    for (NSUInteger tri = 0; tri < triangleCount; tri++) {
+        indices[(tri * 3u) + 0u] = center;
+        indices[(tri * 3u) + 1u] = mglReadIndexValue(sourceIndexBytes, sourceIndexType, tri + 1u);
+        indices[(tri * 3u) + 2u] = mglReadIndexValue(sourceIndexBytes, sourceIndexType, tri + 2u);
+    }
+
+    id<MTLBuffer> buffer = [device newBufferWithBytes:indices
+                                               length:(indexCount * sizeof(uint32_t))
+                                              options:MTLResourceStorageModeShared];
+    free(indices);
+
+    if (outIndexCount && buffer) {
+        *outIndexCount = indexCount;
+    }
+
+    return buffer;
 }
 
 static inline uint64_t mglHashStepU64(uint64_t hash, uint64_t value)
@@ -1532,15 +2220,29 @@ void logDirtyBits(GLMContext ctx)
                     buffer_map->buffers[buffer_map->count].buffer_base_index = spirv_binding;
                     buffer_map->buffers[buffer_map->count].buf = buf;
                     buffer_map->buffers[buffer_map->count].offset = baseBinding->offset;
+                    buffer_map->buffers[buffer_map->count].size = baseBinding->size;
                     baseBinding->buffer = buf->name;
                     buffer_map->count++;
 
                     if (reflectedRequiredSize > 0 && baseBinding->size > 0 &&
                         (NSUInteger)baseBinding->size < reflectedRequiredSize) {
-                        NSLog(@"MGL WARNING: base binding too small stage=%d type=%d binding=%u glName=%u range=%lld reflected=%lu (will pad/fallback at bind)",
-                              stage, spvc_type, spirv_binding, buf->name,
-                              (long long)baseBinding->size,
-                              (unsigned long)reflectedRequiredSize);
+                        GLuint programName = (ctx && ctx->state.program) ? ctx->state.program->name : 0u;
+                        if (mglShouldLogSmallBaseBinding(programName,
+                                                         stage,
+                                                         spvc_type,
+                                                         spirv_binding,
+                                                         buf->name,
+                                                         baseBinding->size,
+                                                         reflectedRequiredSize)) {
+                            NSLog(@"MGL WARNING: base binding too small program=%u stage=%d type=%d binding=%u glName=%u range=%lld reflected=%lu (padding at bind)",
+                                  programName,
+                                  stage,
+                                  spvc_type,
+                                  spirv_binding,
+                                  buf->name,
+                                  (long long)baseBinding->size,
+                                  (unsigned long)reflectedRequiredSize);
+                        }
                     }
                     
                     //DEBUG_PRINT("Found buffer type: %s buffer_base_index: %d\n", mapped_types[type].name, spirv_binding);
@@ -1601,6 +2303,7 @@ void logDirtyBits(GLMContext ctx)
         buffer_map->buffers[vao_buffer_start].buffer_base_index = (GLuint)kMGLVertexAttribBufferBase;
         buffer_map->buffers[vao_buffer_start].buf = NULL;
         buffer_map->buffers[vao_buffer_start].offset = 0;
+        buffer_map->buffers[vao_buffer_start].size = 0;
 
         // create attribute map
         //
@@ -1641,7 +2344,8 @@ void logDirtyBits(GLMContext ctx)
                     buffer_map->buffers[vao_buffer_start].attribute_mask |= (0x1 << att);
                     buffer_map->buffers[vao_buffer_start].buf = gl_buffer;
                     buffer_map->buffers[vao_buffer_start].buffer_base_index = next_vertex_binding_index++;
-                    buffer_map->buffers[vao_buffer_start].offset = 0;
+                    buffer_map->buffers[vao_buffer_start].offset = vao->attrib[att].binding_offset;
+                    buffer_map->buffers[vao_buffer_start].size = 0;
                     buffer_map->count++;
 
                     mapped_buffers++;
@@ -1663,7 +2367,8 @@ void logDirtyBits(GLMContext ctx)
                         // we need to check name and target, not pointers..
                         // FIX ME: I think we don't need a target as all attribs should be an array_buffer
                         if ((map_buffer->name == gl_buffer->name) &&
-                            (map_buffer->target == gl_buffer->target))
+                            (map_buffer->target == gl_buffer->target) &&
+                            (buffer_map->buffers[map].offset == vao->attrib[att].binding_offset))
                         {
                             // include it the list of attributes
                             buffer_map->buffers[map].attribute_mask |= (0x1 << att);
@@ -1689,7 +2394,8 @@ void logDirtyBits(GLMContext ctx)
                         buffer_map->buffers[buffer_map->count].attribute_mask = (0x1 << att);
                         buffer_map->buffers[buffer_map->count].buffer_base_index = next_vertex_binding_index++;
                         buffer_map->buffers[buffer_map->count].buf = gl_buffer;
-                        buffer_map->buffers[buffer_map->count].offset = 0;
+                        buffer_map->buffers[buffer_map->count].offset = vao->attrib[att].binding_offset;
+                        buffer_map->buffers[buffer_map->count].size = 0;
                         buffer_map->count++;
 
                         mapped_buffers++;
@@ -2007,11 +2713,12 @@ void logDirtyBits(GLMContext ctx)
         Buffer *attribBuffer = mglRendererGetValidatedBuffer(ctx, vao->attrib[i].buffer, __FUNCTION__, i);
         GLuint attribBufferName = attribBuffer ? attribBuffer->name : 0;
         if (kMGLVerboseBindLogs) {
-            NSLog(@"MGL VBIND attrib=%u enabled=%d buf=%p bufName=%u ptr=0x%llx stride=%u size=%u type=0x%x normalized=%u divisor=%u binding=%u",
+            NSLog(@"MGL VBIND attrib=%u enabled=%d buf=%p bufName=%u bindOffset=%lld ptr=0x%llx stride=%u size=%u type=0x%x normalized=%u divisor=%u binding=%u",
                   i,
                   enabled ? 1 : 0,
                   attribBuffer,
                   attribBufferName,
+                  (long long)vao->attrib[i].binding_offset,
                   (unsigned long long)(uintptr_t)vao->attrib[i].relativeoffset,
                   (unsigned)vao->attrib[i].stride,
                   (unsigned)vao->attrib[i].size,
@@ -2126,6 +2833,9 @@ void logDirtyBits(GLMContext ctx)
         }
 
         NSUInteger availableBytes = metalLen - bindOffset;
+        if (isBaseBinding && map->size > 0 && (NSUInteger)map->size < availableBytes) {
+            availableBytes = (NSUInteger)map->size;
+        }
         NSUInteger reflectedRequiredBytes = 0;
         NSUInteger requiredBindingBytes = kMGLMinimumStageBindingSize;
         if (isBaseBinding && bindingIndex < MAX_BINDABLE_BUFFERS) {
@@ -2150,6 +2860,9 @@ void logDirtyBits(GLMContext ctx)
                     size_t cpuOffset = bindOffset;
                     if (cpuOffset < cpuSize) {
                         size_t remaining = cpuSize - cpuOffset;
+                        if (map->size > 0 && (size_t)map->size < remaining) {
+                            remaining = (size_t)map->size;
+                        }
                         size_t paddedLen = (size_t)requiredBindingBytes;
                         uint8_t *paddedBytes = stackScratch;
                         bool usingHeap = false;
@@ -2273,7 +2986,22 @@ void logDirtyBits(GLMContext ctx)
             return false;
         }
 
-        GLintptr attrOffset = (GLintptr)(uintptr_t)vao->attrib[attrib].relativeoffset;
+        if (vao->attrib[attrib].binding_offset < 0) {
+            NSLog(@"MGL VBIND BLOCK draw: attrib=%u buffer=%u negative bindingOffset=%lld",
+                  attrib,
+                  attribBuffer->name,
+                  (long long)vao->attrib[attrib].binding_offset);
+            return false;
+        }
+        if (vao->attrib[attrib].relativeoffset < 0) {
+            NSLog(@"MGL VBIND BLOCK draw: attrib=%u buffer=%u negative relativeOffset=%lld",
+                  attrib,
+                  attribBuffer->name,
+                  (long long)vao->attrib[attrib].relativeoffset);
+            return false;
+        }
+        GLintptr attrOffset = vao->attrib[attrib].binding_offset +
+                              (GLintptr)(uintptr_t)vao->attrib[attrib].relativeoffset;
         size_t compSize = mglVertexAttribComponentSize(vao->attrib[attrib].type);
         size_t compCount = (size_t)vao->attrib[attrib].size;
         GLintptr attrSpan = 0;
@@ -2306,10 +3034,11 @@ void logDirtyBits(GLMContext ctx)
         }
 
         if (kMGLVerboseBindLogs) {
-            NSLog(@"MGL VBIND attrib map attrib=%u -> index=%lu buffer=%u",
+            NSLog(@"MGL VBIND attrib map attrib=%u -> index=%lu buffer=%u bindingOffset=%lld",
                   attrib,
                   (unsigned long)bindingIndex,
-                  (unsigned)attribBuffer->name);
+                  (unsigned)attribBuffer->name,
+                  (long long)vao->attrib[attrib].binding_offset);
         }
 
         if (!attribBuffer->data.mtl_data) {
@@ -2333,12 +3062,23 @@ void logDirtyBits(GLMContext ctx)
             continue;
         }
 
-        [_currentRenderEncoder setVertexBuffer:attribMetalBuffer offset:0 atIndex:bindingIndex];
+        NSUInteger attribBindingOffset = (NSUInteger)vao->attrib[attrib].binding_offset;
+        if (attribBindingOffset >= attribMetalBuffer.length) {
+            NSLog(@"MGL VBIND skip attrib=%u buffer=%u: bindingOffset=%lu >= metalLen=%lu",
+                  attrib,
+                  attribBuffer->name,
+                  (unsigned long)attribBindingOffset,
+                  (unsigned long)attribMetalBuffer.length);
+            continue;
+        }
+
+        [_currentRenderEncoder setVertexBuffer:attribMetalBuffer offset:attribBindingOffset atIndex:bindingIndex];
         anyBindingPresent[bindingIndex] = true;
         if (kMGLVerboseBindLogs) {
-            NSLog(@"MGL SET VERTEX ATTRIB BUFFER index=%lu glName=%u offset=0 available=%lu attrib=%u stride=%u attrOffset=0x%llx mtl=%p",
+            NSLog(@"MGL SET VERTEX ATTRIB BUFFER index=%lu glName=%u offset=%lu available=%lu attrib=%u stride=%u attrOffset=0x%llx mtl=%p",
                   (unsigned long)bindingIndex,
                   attribBuffer->name,
+                  (unsigned long)attribBindingOffset,
                   (unsigned long)attribMetalBuffer.length,
                   attrib,
                   (unsigned)vao->attrib[attrib].stride,
@@ -2610,6 +3350,9 @@ void logDirtyBits(GLMContext ctx)
             }
 
             NSUInteger availableBytes = metalLen - bindOffset;
+            if (isBaseBinding && map->size > 0 && (NSUInteger)map->size < availableBytes) {
+                availableBytes = (NSUInteger)map->size;
+            }
             NSUInteger reflectedRequiredBytes = 0;
             NSUInteger requiredBindingBytes = kMGLMinimumStageBindingSize;
             if (isBaseBinding && bindingIndex < MAX_BINDABLE_BUFFERS) {
@@ -2634,6 +3377,9 @@ void logDirtyBits(GLMContext ctx)
                         size_t cpuOffset = (size_t)offset;
                         if (cpuOffset < cpuSize) {
                             size_t remaining = cpuSize - cpuOffset;
+                            if (map->size > 0 && (size_t)map->size < remaining) {
+                                remaining = (size_t)map->size;
+                            }
                             size_t paddedLen = (size_t)requiredBindingBytes;
                             uint8_t *paddedBytes = stackScratch;
                             bool usingHeap = false;
@@ -2895,11 +3641,15 @@ void logDirtyBits(GLMContext ctx)
     MTLTextureType tex_type;
     MTLPixelFormat pixelFormat;
     uint num_faces;
+    GLuint effective_mipmap_levels;
+    GLuint upload_level_count;
     BOOL mipmapped;
     BOOL is_array;
 
     num_faces = 1;
     is_array = false;
+    effective_mipmap_levels = 0;
+    upload_level_count = 0;
 
     switch(tex->target)
     {
@@ -2940,21 +3690,63 @@ void logDirtyBits(GLMContext ctx)
     }
 
     // verify completeness of texture when used
+    effective_mipmap_levels = tex->mipmap_levels;
+    if (tex->params.max_level != 1000u) {
+        GLuint max_level_count = tex->params.max_level + 1u;
+        if (max_level_count > 0 && max_level_count < effective_mipmap_levels) {
+            effective_mipmap_levels = max_level_count;
+        }
+    }
+
     if (tex->num_levels > 1)
     {
         // mipmapped texture
-        if (tex->num_levels != tex->mipmap_levels)
+        if (effective_mipmap_levels == 0) {
+            effective_mipmap_levels = tex->num_levels;
+        }
+
+        if (tex->num_levels < effective_mipmap_levels)
         {
-            return NULL;
+            static uint64_t s_mipmap_count_mismatch_logs = 0;
+            if (++s_mipmap_count_mismatch_logs <= 32 || (s_mipmap_count_mismatch_logs % 512) == 0) {
+                NSLog(@"MGL TEXTURE MIP COMPAT: tex=%u target=0x%x size=%ux%u num_levels=%u mipmap_levels=%u effective=%u base=%u max=%u immutable=%u; capping Metal mip count to uploaded levels hit=%llu",
+                      tex->name,
+                      tex->target,
+                      tex->width,
+                      tex->height,
+                      tex->num_levels,
+                      tex->mipmap_levels,
+                      effective_mipmap_levels,
+                      tex->params.base_level,
+                      tex->params.max_level,
+                      tex->immutable_storage,
+                      (unsigned long long)s_mipmap_count_mismatch_logs);
+            }
+            effective_mipmap_levels = tex->num_levels;
         }
 
         for(int face=0; face<num_faces; face++)
         {
-            for (int i=0; i<tex->num_levels; i++)
+            for (int i=0; i<effective_mipmap_levels; i++)
             {
                 // incomplete texture
-                if (tex->faces[face].levels[i].complete == false)
+                if (tex->faces[face].levels[i].complete == false) {
+                    static uint64_t s_incomplete_mip_logs = 0;
+                    if (++s_incomplete_mip_logs <= 32 || (s_incomplete_mip_logs % 512) == 0) {
+                        NSLog(@"MGL TEXTURE INCOMPLETE: tex=%u target=0x%x face=%d level=%d incomplete num_levels=%u mipmap_levels=%u effective=%u base=%u max=%u hit=%llu",
+                              tex->name,
+                              tex->target,
+                              face,
+                              i,
+                              tex->num_levels,
+                              tex->mipmap_levels,
+                              effective_mipmap_levels,
+                              tex->params.base_level,
+                              tex->params.max_level,
+                              (unsigned long long)s_incomplete_mip_logs);
+                    }
                     return NULL;
+                }
             }
         }
 
@@ -2962,12 +3754,25 @@ void logDirtyBits(GLMContext ctx)
     }
     else if (tex->num_levels == 1)
     {
+        effective_mipmap_levels = 1;
         // single level texture
         // incomplete texture
         for(int face=0; face<num_faces; face++)
         {
             if (tex->faces[face].levels[0].complete == false)
+            {
+                static uint64_t s_incomplete_base_logs = 0;
+                if (++s_incomplete_base_logs <= 32 || (s_incomplete_base_logs % 512) == 0) {
+                    NSLog(@"MGL TEXTURE INCOMPLETE: tex=%u target=0x%x face=%d base incomplete size=%ux%u hit=%llu",
+                          tex->name,
+                          tex->target,
+                          face,
+                          tex->width,
+                          tex->height,
+                          (unsigned long long)s_incomplete_base_logs);
+                }
                 return NULL;
+            }
         }
     }
     else
@@ -3038,6 +3843,7 @@ void logDirtyBits(GLMContext ctx)
     height = tex->height;
     depth = tex->depth;
     mipmapped = tex->mipmapped == 1;
+    upload_level_count = mipmapped ? effective_mipmap_levels : tex->num_levels;
 
     tex_desc = [[MTLTextureDescriptor alloc] init];
     tex_desc.textureType = tex_type;
@@ -3085,7 +3891,7 @@ void logDirtyBits(GLMContext ctx)
 
     if (mipmapped)
     {
-        tex_desc.mipmapLevelCount = tex->mipmap_levels;
+        tex_desc.mipmapLevelCount = MAX((GLuint)1, effective_mipmap_levels);
     }
 
     switch(tex->access)
@@ -3158,14 +3964,14 @@ void logDirtyBits(GLMContext ctx)
     if (tex->dirty_bits & DIRTY_TEXTURE_DATA)
     {
         NSLog(@"MGL DEBUG: DIRTY_TEXTURE_DATA detected - attempting texture filling");
-        NSLog(@"MGL DEBUG: Texture details: target=0x%x, internalformat=0x%x, levels=%d",
-              tex->target, tex->internalformat, tex->num_levels);
+        NSLog(@"MGL DEBUG: Texture details: target=0x%x, internalformat=0x%x, levels=%d effectiveLevels=%u",
+              tex->target, tex->internalformat, tex->num_levels, upload_level_count);
 
         MTLRegion region;
 
         for(int face=0; face<num_faces; face++)
         {
-            for (int level=0; level<tex->num_levels; level++)
+            for (int level=0; level<upload_level_count; level++)
             {
                 width = tex->faces[face].levels[level].width;
                 height = tex->faces[face].levels[level].height;
@@ -4291,10 +5097,249 @@ void logDirtyBits(GLMContext ctx)
     return _fallbackCubeSampledTexture;
 }
 
+- (id<MTLTexture>)fallbackTextureBufferSampledTexture
+{
+    if (_fallbackSintTextureBuffer || !kMGLEnableSampledTextureFallback) {
+        return _fallbackSintTextureBuffer;
+    }
+
+    static const NSUInteger kFallbackTexelCount = 64;
+    static const NSUInteger kFallbackBytesPerTexel = 4;
+
+    if (!_fallbackTextureBufferStorage) {
+        _fallbackTextureBufferStorage = [_device newBufferWithLength:(kFallbackTexelCount * kFallbackBytesPerTexel)
+                                                              options:MTLResourceStorageModeShared];
+        if (_fallbackTextureBufferStorage && _fallbackTextureBufferStorage.contents) {
+            memset(_fallbackTextureBufferStorage.contents, 0, kFallbackTexelCount * kFallbackBytesPerTexel);
+        }
+    }
+
+    if (!_fallbackTextureBufferStorage) {
+        NSLog(@"MGL ERROR: Failed to create fallback texture-buffer backing storage");
+        return nil;
+    }
+
+    MTLTextureDescriptor *desc = [MTLTextureDescriptor new];
+    desc.textureType = MTLTextureTypeTextureBuffer;
+    desc.pixelFormat = MTLPixelFormatRGBA8Sint;
+    desc.width = kFallbackTexelCount;
+    desc.height = 1;
+    desc.depth = 1;
+    desc.mipmapLevelCount = 1;
+    desc.usage = MTLTextureUsageShaderRead;
+    desc.storageMode = MTLStorageModeShared;
+
+    @try {
+        _fallbackSintTextureBuffer = [_fallbackTextureBufferStorage newTextureWithDescriptor:desc
+                                                                                     offset:0
+                                                                                bytesPerRow:(kFallbackTexelCount * kFallbackBytesPerTexel)];
+    } @catch (NSException *exception) {
+        NSLog(@"MGL ERROR: Failed to create fallback texture-buffer texture: %@", exception);
+        _fallbackSintTextureBuffer = nil;
+    }
+
+    if (_fallbackSintTextureBuffer) {
+        NSLog(@"MGL INFO: Created fallback signed integer texture buffer for missing/invalid texel-buffer resources");
+    }
+
+    return _fallbackSintTextureBuffer;
+}
+
+- (id<MTLTexture>)fallbackSampledTextureForExpectedType:(MTLTextureType)expectedType
+                                               dataKind:(MGLTextureDataKind)dataKind
+{
+    if (!kMGLEnableSampledTextureFallback) {
+        return nil;
+    }
+
+    if (dataKind == MGLTextureDataKindUnknown || dataKind == MGLTextureDataKindFloat) {
+        if (expectedType == MTLTextureTypeCube) {
+            return [self fallbackCubeSampledTexture];
+        }
+        if (expectedType == MTLTextureTypeTextureBuffer) {
+            return [self fallbackTextureBufferSampledTexture];
+        }
+        return [self fallbackSampledTexture];
+    }
+
+    MTLPixelFormat pixelFormat = (dataKind == MGLTextureDataKindUint)
+        ? MTLPixelFormatRGBA8Uint
+        : MTLPixelFormatRGBA8Sint;
+
+    MTLTextureType textureType = expectedType ? expectedType : MTLTextureType2D;
+    if (textureType == MTLTextureTypeTextureBuffer) {
+        // Keep the existing texel-buffer fallback for signed integer paths.
+        // Uint texel-buffer fallback can be added when Minecraft hits that exact shader.
+        return [self fallbackTextureBufferSampledTexture];
+    }
+
+    if (!_fallbackSampledTextureCache) {
+        _fallbackSampledTextureCache = [[NSMutableDictionary alloc] initWithCapacity:8];
+    }
+
+    NSUInteger keyValue = (((NSUInteger)textureType) << 8u) | ((NSUInteger)dataKind);
+    NSNumber *key = @(keyValue);
+    id<MTLTexture> cached = _fallbackSampledTextureCache[key];
+    if (cached) {
+        return cached;
+    }
+
+    MTLTextureDescriptor *desc = [MTLTextureDescriptor new];
+    desc.textureType = textureType;
+    desc.pixelFormat = pixelFormat;
+    desc.width = 1;
+    desc.height = 1;
+    desc.depth = 1;
+    desc.arrayLength = (textureType == MTLTextureTypeCube ||
+                        textureType == MTLTextureTypeCubeArray ||
+                        textureType == MTLTextureType2DArray ||
+                        textureType == MTLTextureType1DArray ||
+                        textureType == MTLTextureType2DMultisampleArray) ? 1 : 1;
+    desc.mipmapLevelCount = 1;
+    desc.usage = MTLTextureUsageShaderRead;
+    desc.storageMode = MTLStorageModeShared;
+
+    id<MTLTexture> texture = [_device newTextureWithDescriptor:desc];
+    if (!texture) {
+        NSLog(@"MGL ERROR: Failed to create %@ fallback sampled texture type=%lu format=%lu",
+              [NSString stringWithUTF8String:mglTextureDataKindName(dataKind)],
+              (unsigned long)textureType,
+              (unsigned long)pixelFormat);
+        return nil;
+    }
+
+    uint32_t zeroPixel = 0u;
+    if (textureType == MTLTextureTypeCube || textureType == MTLTextureTypeCubeArray) {
+        NSUInteger sliceCount = (textureType == MTLTextureTypeCube) ? 6u : 6u;
+        for (NSUInteger slice = 0; slice < sliceCount; slice++) {
+            [texture replaceRegion:MTLRegionMake2D(0, 0, 1, 1)
+                       mipmapLevel:0
+                             slice:slice
+                         withBytes:&zeroPixel
+                       bytesPerRow:sizeof(zeroPixel)
+                     bytesPerImage:sizeof(zeroPixel)];
+        }
+    } else {
+        [texture replaceRegion:MTLRegionMake2D(0, 0, 1, 1)
+                   mipmapLevel:0
+                     withBytes:&zeroPixel
+                   bytesPerRow:sizeof(zeroPixel)];
+    }
+
+    _fallbackSampledTextureCache[key] = texture;
+    NSLog(@"MGL INFO: Created %@ fallback sampled texture type=%lu format=%lu",
+          [NSString stringWithUTF8String:mglTextureDataKindName(dataKind)],
+          (unsigned long)textureType,
+          (unsigned long)pixelFormat);
+
+    return texture;
+}
+
+- (id<MTLSamplerState>)scaledBlitSamplerForFilter:(GLuint)filter
+{
+    BOOL wantsNearest = (filter == GL_NEAREST);
+    id<MTLSamplerState> cached = wantsNearest ? _scaledBlitNearestSampler : _scaledBlitLinearSampler;
+    if (cached) {
+        return cached;
+    }
+
+    MTLSamplerDescriptor *desc = [[MTLSamplerDescriptor alloc] init];
+    desc.minFilter = wantsNearest ? MTLSamplerMinMagFilterNearest : MTLSamplerMinMagFilterLinear;
+    desc.magFilter = wantsNearest ? MTLSamplerMinMagFilterNearest : MTLSamplerMinMagFilterLinear;
+    desc.mipFilter = MTLSamplerMipFilterNotMipmapped;
+    desc.sAddressMode = MTLSamplerAddressModeClampToEdge;
+    desc.tAddressMode = MTLSamplerAddressModeClampToEdge;
+    desc.rAddressMode = MTLSamplerAddressModeClampToEdge;
+
+    id<MTLSamplerState> sampler = [_device newSamplerStateWithDescriptor:desc];
+    if (!sampler) {
+        NSLog(@"MGL ERROR: failed to create scaled blit sampler filter=0x%x", filter);
+        return nil;
+    }
+
+    if (wantsNearest) {
+        _scaledBlitNearestSampler = sampler;
+    } else {
+        _scaledBlitLinearSampler = sampler;
+    }
+
+    return sampler;
+}
+
+- (id<MTLRenderPipelineState>)scaledBlitPipelineForPixelFormat:(MTLPixelFormat)pixelFormat
+{
+    if (pixelFormat == MTLPixelFormatInvalid || pixelFormat == 0) {
+        pixelFormat = MTLPixelFormatBGRA8Unorm;
+    }
+
+    if (!_scaledBlitPipelineCache) {
+        _scaledBlitPipelineCache = [[NSMutableDictionary alloc] initWithCapacity:4];
+    }
+
+    NSNumber *key = @((NSUInteger)pixelFormat);
+    id<MTLRenderPipelineState> cached = _scaledBlitPipelineCache[key];
+    if (cached) {
+        return cached;
+    }
+
+    static NSString *source =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "struct MGLScaledBlitParams { float4 uvRect; };\n"
+         "struct MGLScaledBlitVOut { float4 position [[position]]; float2 uv; };\n"
+         "vertex MGLScaledBlitVOut mgl_scaled_blit_vs(uint vid [[vertex_id]], constant MGLScaledBlitParams& p [[buffer(0)]]) {\n"
+         "    float2 pos[4] = { float2(-1.0, -1.0), float2(1.0, -1.0), float2(-1.0, 1.0), float2(1.0, 1.0) };\n"
+         "    float2 uv[4] = { float2(p.uvRect.x, p.uvRect.w), float2(p.uvRect.z, p.uvRect.w), float2(p.uvRect.x, p.uvRect.y), float2(p.uvRect.z, p.uvRect.y) };\n"
+         "    MGLScaledBlitVOut o;\n"
+         "    o.position = float4(pos[vid], 0.0, 1.0);\n"
+         "    o.uv = uv[vid];\n"
+         "    return o;\n"
+         "}\n"
+         "fragment float4 mgl_scaled_blit_fs(MGLScaledBlitVOut in [[stage_in]], texture2d<float> src [[texture(0)]], sampler s [[sampler(0)]]) {\n"
+         "    return src.sample(s, in.uv);\n"
+         "}\n";
+
+    NSError *error = nil;
+    id<MTLLibrary> library = [_device newLibraryWithSource:source options:nil error:&error];
+    if (!library) {
+        NSLog(@"MGL ERROR: scaled blit shader compile failed: %@", error);
+        return nil;
+    }
+
+    id<MTLFunction> vs = [library newFunctionWithName:@"mgl_scaled_blit_vs"];
+    id<MTLFunction> fs = [library newFunctionWithName:@"mgl_scaled_blit_fs"];
+    if (!vs || !fs) {
+        NSLog(@"MGL ERROR: scaled blit shader functions missing vs=%@ fs=%@", vs, fs);
+        return nil;
+    }
+
+    MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
+    desc.label = @"MGL scaled blit";
+    desc.vertexFunction = vs;
+    desc.fragmentFunction = fs;
+    desc.colorAttachments[0].pixelFormat = pixelFormat;
+    desc.rasterSampleCount = 1;
+
+    id<MTLRenderPipelineState> pipeline = [_device newRenderPipelineStateWithDescriptor:desc error:&error];
+    if (!pipeline) {
+        NSLog(@"MGL ERROR: scaled blit pipeline create failed pixelFormat=%lu error=%@",
+              (unsigned long)pixelFormat,
+              error);
+        return nil;
+    }
+
+    _scaledBlitPipelineCache[key] = pipeline;
+    NSLog(@"MGL INFO: created scaled blit pipeline pixelFormat=%lu", (unsigned long)pixelFormat);
+    return pipeline;
+}
+
 - (id<MTLTexture>)fallbackSampledTextureForExpectedType:(MTLTextureType)expectedType
 {
     if (expectedType == MTLTextureTypeCube) {
         return [self fallbackCubeSampledTexture];
+    }
+    if (expectedType == MTLTextureTypeTextureBuffer) {
+        return [self fallbackTextureBufferSampledTexture];
     }
 
     return [self fallbackSampledTexture];
@@ -4410,6 +5455,9 @@ void logDirtyBits(GLMContext ctx)
         MTLTextureType expectedType = [self getProgramExpectedTextureType:_VERTEX_SHADER
                                                                       type:SPVC_RESOURCE_TYPE_SAMPLED_IMAGE
                                                                      index:(int)i];
+        MGLTextureDataKind expectedKind = [self getProgramExpectedTextureDataKind:_VERTEX_SHADER
+                                                                             type:SPVC_RESOURCE_TYPE_SAMPLED_IMAGE
+                                                                            index:(int)i];
         Texture *ptr = [self textureForSampledBinding:spirvBinding expectedType:expectedType];
         id<MTLTexture> texture = nil;
         id<MTLSamplerState> sampler = defaultSampler;
@@ -4433,7 +5481,26 @@ void logDirtyBits(GLMContext ctx)
                           (unsigned long)expectedType,
                           (unsigned long long)hit);
                 }
-                texture = [self fallbackSampledTextureForExpectedType:expectedType];
+                texture = [self fallbackSampledTextureForExpectedType:expectedType dataKind:expectedKind];
+                usedTypeFallback = YES;
+            }
+            if (texture &&
+                !mglTexturePixelFormatCompatibleWithExpectedDataKind(texture.pixelFormat, expectedKind)) {
+                static uint64_t s_vertexDataKindMismatchLogCount = 0;
+                uint64_t hit = ++s_vertexDataKindMismatchLogCount;
+                if (hit <= 32ull || (hit % 512ull) == 0ull) {
+                    NSLog(@"MGL TEX DATA MISMATCH vertex binding=%u program=%u glTex=%u glTarget=0x%x format=%lu actualKind=%s expectedKind=%s expectedType=%lu hit=%llu",
+                          (unsigned)spirvBinding,
+                          ctx ? (unsigned)ctx->state.program_name : 0u,
+                          (unsigned)ptr->name,
+                          (unsigned)ptr->target,
+                          (unsigned long)texture.pixelFormat,
+                          mglTextureDataKindName(mglTextureDataKindForPixelFormat(texture.pixelFormat)),
+                          mglTextureDataKindName(expectedKind),
+                          (unsigned long)expectedType,
+                          (unsigned long long)hit);
+                }
+                texture = [self fallbackSampledTextureForExpectedType:expectedType dataKind:expectedKind];
                 usedTypeFallback = YES;
             }
 
@@ -4454,7 +5521,7 @@ void logDirtyBits(GLMContext ctx)
         }
 
         if (!texture) {
-            texture = [self fallbackSampledTextureForExpectedType:expectedType];
+            texture = [self fallbackSampledTextureForExpectedType:expectedType dataKind:expectedKind];
             if (texture) {
                 vertexFallbackTextures++;
                 static uint64_t s_vertexFallbackLogCount = 0;
@@ -4493,6 +5560,9 @@ void logDirtyBits(GLMContext ctx)
         MTLTextureType expectedType = [self getProgramExpectedTextureType:_FRAGMENT_SHADER
                                                                       type:SPVC_RESOURCE_TYPE_SAMPLED_IMAGE
                                                                      index:(int)i];
+        MGLTextureDataKind expectedKind = [self getProgramExpectedTextureDataKind:_FRAGMENT_SHADER
+                                                                             type:SPVC_RESOURCE_TYPE_SAMPLED_IMAGE
+                                                                            index:(int)i];
         Texture *ptr = [self textureForSampledBinding:spirvBinding expectedType:expectedType];
         id<MTLTexture> texture = nil;
         id<MTLSamplerState> sampler = nil;
@@ -4516,7 +5586,26 @@ void logDirtyBits(GLMContext ctx)
                           (unsigned long)expectedType,
                           (unsigned long long)hit);
                 }
-                texture = [self fallbackSampledTextureForExpectedType:expectedType];
+                texture = [self fallbackSampledTextureForExpectedType:expectedType dataKind:expectedKind];
+                usedFallbackTexture = YES;
+            }
+            if (texture &&
+                !mglTexturePixelFormatCompatibleWithExpectedDataKind(texture.pixelFormat, expectedKind)) {
+                static uint64_t s_fragmentDataKindMismatchLogCount = 0;
+                uint64_t hit = ++s_fragmentDataKindMismatchLogCount;
+                if (hit <= 32ull || (hit % 512ull) == 0ull) {
+                    NSLog(@"MGL TEX DATA MISMATCH fragment binding=%u program=%u glTex=%u glTarget=0x%x format=%lu actualKind=%s expectedKind=%s expectedType=%lu hit=%llu",
+                          (unsigned)spirvBinding,
+                          ctx ? (unsigned)ctx->state.program_name : 0u,
+                          (unsigned)ptr->name,
+                          (unsigned)ptr->target,
+                          (unsigned long)texture.pixelFormat,
+                          mglTextureDataKindName(mglTextureDataKindForPixelFormat(texture.pixelFormat)),
+                          mglTextureDataKindName(expectedKind),
+                          (unsigned long)expectedType,
+                          (unsigned long long)hit);
+                }
+                texture = [self fallbackSampledTextureForExpectedType:expectedType dataKind:expectedKind];
                 usedFallbackTexture = YES;
             }
 
@@ -4537,9 +5626,12 @@ void logDirtyBits(GLMContext ctx)
         }
 
         if (!texture) {
-            texture = [self fallbackSampledTextureForExpectedType:expectedType];
+            texture = [self fallbackSampledTextureForExpectedType:expectedType dataKind:expectedKind];
             if (texture) {
                 usedFallbackTexture = YES;
+                mglFocusLoadingProgram(ctx ? (unsigned)ctx->state.program_name : 0u,
+                                       "sample-fallback",
+                                       bindCall);
                 fallbackSampledTextures++;
                 static uint64_t s_fragmentFallbackLogCount = 0;
                 uint64_t hit = ++s_fragmentFallbackLogCount;
@@ -4553,11 +5645,73 @@ void logDirtyBits(GLMContext ctx)
             }
         }
 
-        if (!sampler) {
-            sampler = defaultSampler;
-        }
+	        if (!sampler) {
+	            sampler = defaultSampler;
+	        }
 
-        [_currentRenderEncoder setFragmentTexture:texture atIndex:spirvBinding];
+		        GLuint sampleProgramName = ctx ? (unsigned)ctx->state.program_name : 0u;
+		        TextureLevel *sampleLevel0 = mglTraceTextureBaseLevel(ptr);
+		        BOOL focusedSample =
+		            mglIsFocusedLoadingProgram(sampleProgramName) &&
+		            (bindCall <= 2048ull || ((bindCall % 512ull) == 0ull));
+		        BOOL suspiciousSample =
+		            usedFallbackTexture ||
+		            (ptr && ptr->name == 13u) ||
+		            focusedSample ||
+		            (sampleLevel0 &&
+		             (sampleLevel0->suspicious_zero_upload ||
+		              !sampleLevel0->ever_written ||
+		              !sampleLevel0->has_initialized_data));
+	        if (suspiciousSample) {
+	            static uint64_t s_fragmentSampleDetailLogCount = 0;
+	            uint64_t hit = ++s_fragmentSampleDetailLogCount;
+	            if (hit <= 256ull || (hit % 512ull) == 0ull) {
+	                int expectedIndex = [self textureIndexForExpectedMetalType:expectedType];
+	                Texture *unitActive = STATE(active_textures[spirvBinding]);
+	                Texture *unitExpected = (expectedIndex >= 0 && expectedIndex < _MAX_TEXTURE_TYPES)
+	                    ? STATE(texture_units[spirvBinding].textures[expectedIndex])
+	                    : NULL;
+	                Texture *unit2D = STATE(texture_units[spirvBinding].textures[_TEXTURE_2D]);
+	                Texture *unitCube = STATE(texture_units[spirvBinding].textures[_TEXTURE_CUBE_MAP]);
+	                MTLTextureType actualType = texture ? texture.textureType : 0;
+
+	                NSLog(@"MGL TRACE texbind.sample-detail call=%llu hit=%llu stage=fragment program=%u binding=%u "
+	                      "expectedType=%lu expectedIndex=%d ptrTex=%u ptr=%p target=0x%x fallback=%d mtlTex=%p mtlType=%lu mtlSize=%lux%lu "
+	                      "unit(active=%u expected=%u tex2D=%u cube=%u) "
+	                      "l0=%ux%ux%u bytes=%lu init(ever=%u full=%u zero=%u source=%u upload=%lu src=%p hash=0x%016llx)",
+	                      (unsigned long long)bindCall,
+	                      (unsigned long long)hit,
+		                      sampleProgramName,
+	                      (unsigned)spirvBinding,
+	                      (unsigned long)expectedType,
+	                      expectedIndex,
+	                      mglTraceTextureName(ptr),
+	                      ptr,
+	                      ptr ? (unsigned)ptr->target : 0u,
+	                      usedFallbackTexture ? 1 : 0,
+	                      texture,
+	                      (unsigned long)actualType,
+	                      (unsigned long)(texture ? texture.width : 0),
+	                      (unsigned long)(texture ? texture.height : 0),
+	                      mglTraceTextureName(unitActive),
+	                      mglTraceTextureName(unitExpected),
+	                      mglTraceTextureName(unit2D),
+	                      mglTraceTextureName(unitCube),
+	                      sampleLevel0 ? (unsigned)sampleLevel0->width : 0u,
+	                      sampleLevel0 ? (unsigned)sampleLevel0->height : 0u,
+	                      sampleLevel0 ? (unsigned)sampleLevel0->depth : 0u,
+	                      (unsigned long)(sampleLevel0 ? sampleLevel0->data_size : 0u),
+	                      sampleLevel0 ? (unsigned)sampleLevel0->ever_written : 0u,
+	                      sampleLevel0 ? (unsigned)sampleLevel0->has_initialized_data : 0u,
+	                      sampleLevel0 ? (unsigned)sampleLevel0->suspicious_zero_upload : 0u,
+	                      sampleLevel0 ? (unsigned)sampleLevel0->last_init_source : 0u,
+	                      (unsigned long)(sampleLevel0 ? sampleLevel0->last_upload_size : 0u),
+	                      sampleLevel0 ? (void *)sampleLevel0->last_src_ptr : NULL,
+	                      (unsigned long long)(sampleLevel0 ? sampleLevel0->last_src_hash : 0ull));
+	            }
+	        }
+	
+	        [_currentRenderEncoder setFragmentTexture:texture atIndex:spirvBinding];
         if (texture && !usedFallbackTexture) {
             boundSampledTextures++;
         } else if (usedFallbackTexture) {
@@ -4898,6 +6052,111 @@ extern Texture *findTexture(GLMContext ctx, GLuint texture);
         return;
     }
 
+    BOOL needsScaledBlit =
+        (srcW != dstW || srcH != dstH ||
+         copyW != srcW || copyH != srcH ||
+         copyW != dstW || copyH != dstH);
+
+    GLint scaledSrcW = MIN(srcW, (GLint)((NSInteger)readtexid.width - srcMinX));
+    GLint scaledSrcH = MIN(srcH, (GLint)((NSInteger)readtexid.height - srcMinY));
+    GLint scaledDstW = MIN(dstW, (GLint)((NSInteger)drawtexid.width - dstMinX));
+    GLint scaledDstH = MIN(dstH, (GLint)((NSInteger)drawtexid.height - dstMinY));
+    if (scaledSrcW <= 0 || scaledSrcH <= 0 || scaledDstW <= 0 || scaledDstH <= 0) {
+        NSLog(@"MGL WARN: mtlBlitFramebuffer scaled region invalid src=%dx%d dst=%dx%d, skipping",
+              scaledSrcW, scaledSrcH, scaledDstW, scaledDstH);
+        return;
+    }
+
+    static uint64_t s_blitDiagCount = 0;
+    uint64_t blitDiag = ++s_blitDiagCount;
+    BOOL traceBlit = kMGLSwapPresentDiagnostics &&
+        (blitDiag <= 24ull || (blitDiag % 120ull) == 0ull || needsScaledBlit);
+    if (traceBlit) {
+        NSLog(@"MGL TRACE blitFramebuffer call=%llu readFBO=%p drawFBO=%p mask=0x%zx filter=0x%x "
+              "srcReq=(%zu,%zu)-(%zu,%zu) dstReq=(%zu,%zu)-(%zu,%zu) "
+              "copy src=(%d,%d %dx%d) dst=(%d,%d) scaled=%d scaledSrc=%dx%d scaledDst=%dx%d "
+              "srcTex=%p fmt=%lu %lux%lu dstTex=%p fmt=%lu %lux%lu drawBuf=0x%x readBuf=0x%x",
+              (unsigned long long)blitDiag,
+              readfbo,
+              drawfbo,
+              mask,
+              (unsigned)filter,
+              srcX0, srcY0, srcX1, srcY1,
+              dstX0, dstY0, dstX1, dstY1,
+              srcMinX, srcMinY, copyW, copyH,
+              dstMinX, dstMinY,
+              needsScaledBlit ? 1 : 0,
+              scaledSrcW, scaledSrcH,
+              scaledDstW, scaledDstH,
+              readtexid,
+              (unsigned long)readtexid.pixelFormat,
+              (unsigned long)readtexid.width,
+              (unsigned long)readtexid.height,
+              drawtexid,
+              (unsigned long)drawtexid.pixelFormat,
+              (unsigned long)drawtexid.width,
+              (unsigned long)drawtexid.height,
+              (unsigned)(glm_ctx ? glm_ctx->state.draw_buffer : 0u),
+              (unsigned)(glm_ctx ? glm_ctx->state.read_buffer : 0u));
+    }
+
+    if (needsScaledBlit) {
+        if (readtexid == drawtexid) {
+            NSLog(@"MGL WARN: mtlBlitFramebuffer scaled self-blit unsupported texture=%p, skipping", readtexid);
+            return;
+        }
+
+        id<MTLRenderPipelineState> pipeline = [self scaledBlitPipelineForPixelFormat:drawtexid.pixelFormat];
+        id<MTLSamplerState> sampler = [self scaledBlitSamplerForFilter:filter];
+        if (!pipeline || !sampler) {
+            NSLog(@"MGL WARN: mtlBlitFramebuffer scaled path unavailable pipeline=%p sampler=%p", pipeline, sampler);
+            return;
+        }
+
+        float invSrcW = readtexid.width ? (1.0f / (float)readtexid.width) : 0.0f;
+        float invSrcH = readtexid.height ? (1.0f / (float)readtexid.height) : 0.0f;
+        MGLScaledBlitParams params;
+        params.uvRect = (vector_float4){
+            MAX(0.0f, MIN(1.0f, (float)srcMinX * invSrcW)),
+            MAX(0.0f, MIN(1.0f, (float)srcMinY * invSrcH)),
+            MAX(0.0f, MIN(1.0f, (float)(srcMinX + scaledSrcW) * invSrcW)),
+            MAX(0.0f, MIN(1.0f, (float)(srcMinY + scaledSrcH) * invSrcH))
+        };
+
+        MTLRenderPassDescriptor *scaledPass = [MTLRenderPassDescriptor renderPassDescriptor];
+        scaledPass.colorAttachments[0].texture = drawtexid;
+        scaledPass.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        scaledPass.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+        id<MTLRenderCommandEncoder> encoder = [_currentCommandBuffer renderCommandEncoderWithDescriptor:scaledPass];
+        if (!encoder) {
+            NSLog(@"MGL WARN: mtlBlitFramebuffer failed to create scaled render encoder");
+            return;
+        }
+
+        [encoder setRenderPipelineState:pipeline];
+        [encoder setVertexBytes:&params length:sizeof(params) atIndex:0];
+        [encoder setFragmentTexture:readtexid atIndex:0];
+        [encoder setFragmentSamplerState:sampler atIndex:0];
+        [encoder setViewport:(MTLViewport){
+            .originX = (double)dstMinX,
+            .originY = (double)dstMinY,
+            .width = (double)scaledDstW,
+            .height = (double)scaledDstH,
+            .znear = 0.0,
+            .zfar = 1.0
+        }];
+        [encoder setScissorRect:(MTLScissorRect){
+            .x = (NSUInteger)MAX(dstMinX, 0),
+            .y = (NSUInteger)MAX(dstMinY, 0),
+            .width = (NSUInteger)scaledDstW,
+            .height = (NSUInteger)scaledDstH
+        }];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+        [encoder endEncoding];
+        return;
+    }
+
     // start blit encoder
     id<MTLBlitCommandEncoder> blitCommandEncoder;
     blitCommandEncoder = [_currentCommandBuffer blitCommandEncoder];
@@ -5202,23 +6461,81 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     }
 
     SpirvResource *res = &ptr->spirv_resources_list[stage][type].list[index];
+    MTLTextureType mslType = mglExpectedTextureTypeFromMSL(ptr->spirv[stage].msl_str, res->binding);
+
+    MTLTextureType spirvType = 0;
     switch ((SpvDim)res->image_dim) {
         case SpvDim1D:
-            return res->image_arrayed ? MTLTextureType1DArray : MTLTextureType1D;
+            spirvType = res->image_arrayed ? MTLTextureType1DArray : MTLTextureType1D;
+            break;
         case SpvDim2D:
             if (res->image_multisampled) {
-                return res->image_arrayed ? MTLTextureType2DMultisampleArray : MTLTextureType2DMultisample;
+                spirvType = res->image_arrayed ? MTLTextureType2DMultisampleArray : MTLTextureType2DMultisample;
+            } else {
+                spirvType = res->image_arrayed ? MTLTextureType2DArray : MTLTextureType2D;
             }
-            return res->image_arrayed ? MTLTextureType2DArray : MTLTextureType2D;
+            break;
         case SpvDim3D:
-            return MTLTextureType3D;
+            spirvType = MTLTextureType3D;
+            break;
         case SpvDimCube:
-            return res->image_arrayed ? MTLTextureTypeCubeArray : MTLTextureTypeCube;
+            spirvType = res->image_arrayed ? MTLTextureTypeCubeArray : MTLTextureTypeCube;
+            break;
         case SpvDimBuffer:
-            return MTLTextureTypeTextureBuffer;
+            spirvType = MTLTextureTypeTextureBuffer;
+            break;
         default:
-            return 0;
+            spirvType = 0;
+            break;
     }
+
+    if (mslType != 0 && mslType != spirvType) {
+        static uint64_t s_mslTextureTypeOverrideCount = 0;
+        uint64_t hit = ++s_mslTextureTypeOverrideCount;
+        if (hit <= 32ull || (hit % 512ull) == 0ull) {
+            NSLog(@"MGL TEX EXPECT override from MSL stage=%d type=%d index=%d binding=%u name=%s spirvType=%lu mslType=%lu imageDim=%u hit=%llu",
+                  stage,
+                  type,
+                  index,
+                  (unsigned)res->binding,
+                  res->name ? res->name : "(null)",
+                  (unsigned long)spirvType,
+                  (unsigned long)mslType,
+                  (unsigned)res->image_dim,
+                  (unsigned long long)hit);
+        }
+        return mslType;
+    }
+
+    return mslType ? mslType : spirvType;
+}
+
+- (MGLTextureDataKind)getProgramExpectedTextureDataKind:(int)stage type:(int)type index:(int)index
+{
+    if (stage < 0 || stage >= _MAX_SHADER_TYPES) {
+        return MGLTextureDataKindUnknown;
+    }
+    if (type < 0 || type >= _MAX_SPIRV_RES) {
+        return MGLTextureDataKindUnknown;
+    }
+
+    Program *ptr = mglResolveProgramFromState(ctx);
+    if (!ptr) {
+        return MGLTextureDataKindUnknown;
+    }
+    if (index < 0 || index >= (int)ptr->spirv_resources_list[stage][type].count) {
+        return MGLTextureDataKindUnknown;
+    }
+
+    SpirvResource *res = &ptr->spirv_resources_list[stage][type].list[index];
+    MGLTextureDataKind mslKind = mglExpectedTextureDataKindFromMSL(ptr->spirv[stage].msl_str, res->binding);
+    if (mslKind != MGLTextureDataKindUnknown) {
+        return mslKind;
+    }
+
+    // SPIRV-Cross can rewrite resource dimensionality/types in MSL; when the MSL
+    // line is not parseable, keep float as the compatibility default for sampled images.
+    return MGLTextureDataKindFloat;
 }
 
 - (NSUInteger)getProgramBindingRequiredSizeForStage:(int)stage binding:(GLuint)binding
@@ -5376,19 +6693,110 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 }
 
 #pragma mark draw buffers
+- (CGSize)mglSyncLayerDrawableSizeFromView:(const char *)reason
+{
+    if (!_layer) {
+        return CGSizeZero;
+    }
+
+    CGSize oldDrawableSize = _layer.drawableSize;
+    NSRect bounds = NSZeroRect;
+    NSRect backingBounds = NSZeroRect;
+    CGFloat scale = 1.0;
+
+    if (_view) {
+        [_view setWantsLayer:YES];
+        bounds = [_view bounds];
+        if (bounds.size.width <= 0.0 || bounds.size.height <= 0.0) {
+            bounds = [_view frame];
+            bounds.origin = NSZeroPoint;
+        }
+
+        backingBounds = [_view convertRectToBacking:bounds];
+        if (bounds.size.width > 0.0 && backingBounds.size.width > 0.0) {
+            scale = backingBounds.size.width / bounds.size.width;
+        } else {
+            NSWindow *window = [_view window];
+            if (window) {
+                scale = [window backingScaleFactor];
+            } else if ([NSScreen mainScreen]) {
+                scale = [[NSScreen mainScreen] backingScaleFactor];
+            }
+
+            if (scale <= 0.0) {
+                scale = 1.0;
+            }
+
+            backingBounds = NSMakeRect(0.0,
+                                       0.0,
+                                       bounds.size.width * scale,
+                                       bounds.size.height * scale);
+        }
+
+        _layer.frame = bounds;
+        _layer.contentsScale = scale;
+    } else if (oldDrawableSize.width <= 0.0 || oldDrawableSize.height <= 0.0) {
+        bounds = [_layer frame];
+        scale = _layer.contentsScale > 0.0 ? _layer.contentsScale : 1.0;
+        backingBounds = NSMakeRect(0.0,
+                                   0.0,
+                                   bounds.size.width * scale,
+                                   bounds.size.height * scale);
+    } else {
+        backingBounds = NSMakeRect(0.0, 0.0, oldDrawableSize.width, oldDrawableSize.height);
+    }
+
+    NSUInteger pixelWidth = (NSUInteger)MAX(1.0, backingBounds.size.width + 0.5);
+    NSUInteger pixelHeight = (NSUInteger)MAX(1.0, backingBounds.size.height + 0.5);
+    CGSize newDrawableSize = CGSizeMake((CGFloat)pixelWidth, (CGFloat)pixelHeight);
+
+    if (oldDrawableSize.width != newDrawableSize.width ||
+        oldDrawableSize.height != newDrawableSize.height) {
+        _layer.drawableSize = newDrawableSize;
+    }
+
+    static uint64_t s_sizeSyncCall = 0;
+    static NSUInteger s_lastPixelWidth = 0;
+    static NSUInteger s_lastPixelHeight = 0;
+    uint64_t call = ++s_sizeSyncCall;
+    BOOL sizeChanged = (s_lastPixelWidth != pixelWidth || s_lastPixelHeight != pixelHeight);
+
+    if (sizeChanged || call <= 8ull || ((call % 120ull) == 0ull)) {
+        NSWindow *window = _view ? [_view window] : nil;
+        NSRect windowFrame = window ? [window frame] : NSZeroRect;
+        NSLog(@"MGL SIZE sync reason=%s call=%llu viewBounds=%.1fx%.1f backing=%.1fx%.1f scale=%.3f drawable=%lux%lu old=%.0fx%.0f window=%.1fx%.1f",
+              reason ? reason : "unknown",
+              (unsigned long long)call,
+              bounds.size.width,
+              bounds.size.height,
+              backingBounds.size.width,
+              backingBounds.size.height,
+              scale,
+              (unsigned long)pixelWidth,
+              (unsigned long)pixelHeight,
+              oldDrawableSize.width,
+              oldDrawableSize.height,
+              windowFrame.size.width,
+              windowFrame.size.height);
+    }
+
+    s_lastPixelWidth = pixelWidth;
+    s_lastPixelHeight = pixelHeight;
+    return newDrawableSize;
+}
+
 - (id)newDrawBuffer:(MTLPixelFormat)pixelFormat isDepthStencil:(bool)depthStencil
 {
     id<MTLTexture> texture;
     MTLTextureDescriptor *tex_desc;
-    NSRect frame;
+    CGSize drawableSize;
 
     assert(_layer);
-    frame = [_layer frame];
+    drawableSize = [self mglSyncLayerDrawableSizeFromView:"newDrawBuffer"];
 
     tex_desc = [[MTLTextureDescriptor alloc] init];
-    tex_desc.width = frame.size.width;
-    tex_desc.height = frame.size.height;
-    tex_desc.width = frame.size.width;
+    tex_desc.width = (NSUInteger)MAX(1.0, drawableSize.width);
+    tex_desc.height = (NSUInteger)MAX(1.0, drawableSize.height);
     tex_desc.pixelFormat = pixelFormat;
     tex_desc.usage = MTLTextureUsageRenderTarget;
 
@@ -5409,9 +6817,8 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     MTLTextureDescriptor *tex_desc;
 
     tex_desc = [[MTLTextureDescriptor alloc] init];
-    tex_desc.width = size.width;
-    tex_desc.height = size.height;
-    tex_desc.width = size.width;
+    tex_desc.width = (NSUInteger)MAX(1.0, size.width);
+    tex_desc.height = (NSUInteger)MAX(1.0, size.height);
     tex_desc.pixelFormat = pixelFormat;
     tex_desc.usage = MTLTextureUsageRenderTarget;
 
@@ -5428,16 +6835,14 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
 - (bool) checkDrawBufferSize:(GLuint) index;
 {
-    NSRect frame;
-    NSSize size;
+    CGSize drawableSize;
 
-    frame = [_view frame];
-    size = frame.size;
+    drawableSize = [self mglSyncLayerDrawableSizeFromView:"checkDrawBufferSize"];
 
-    if (size.width != _drawBuffers[index].width)
+    if ((GLuint)drawableSize.width != _drawBuffers[index].width)
         return false;
 
-    if (size.height != _drawBuffers[index].height)
+    if ((GLuint)drawableSize.height != _drawBuffers[index].height)
         return false;
 
     return true;
@@ -5446,53 +6851,90 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 #pragma mark render encoder and command buffer init code
 - (MTLStencilOperation) mtlStencilOpForGLOp:(GLenum) op
 {
-    MTLStencilOperation stencil_op;
-
-    switch(ctx->state.var.stencil_fail)
+    switch(op)
     {
-        case GL_KEEP: stencil_op = MTLStencilOperationKeep; break;
-        case GL_ZERO: stencil_op = MTLStencilOperationZero; break;
-        case GL_REPLACE: stencil_op = MTLStencilOperationReplace; break;
-        case GL_INCR: stencil_op = MTLStencilOperationIncrementClamp; break;
-        case GL_INCR_WRAP: stencil_op = MTLStencilOperationDecrementClamp; break;
-        case GL_DECR: stencil_op = MTLStencilOperationInvert; break;
-        case GL_DECR_WRAP: stencil_op = MTLStencilOperationIncrementWrap; break;
-        case GL_INVERT: stencil_op = MTLStencilOperationDecrementWrap; break;
+        case GL_KEEP: return MTLStencilOperationKeep;
+        case GL_ZERO: return MTLStencilOperationZero;
+        case GL_REPLACE: return MTLStencilOperationReplace;
+        case GL_INCR: return MTLStencilOperationIncrementClamp;
+        case GL_INCR_WRAP: return MTLStencilOperationIncrementWrap;
+        case GL_DECR: return MTLStencilOperationDecrementClamp;
+        case GL_DECR_WRAP: return MTLStencilOperationDecrementWrap;
+        case GL_INVERT: return MTLStencilOperationInvert;
         default:
-            // CRITICAL FIX: Handle assertion gracefully instead of crashing
-            NSLog(@"MGL ERROR: Unknown stencil operation 0x%x", op);
+            NSLog(@"MGL WARNING: Unknown stencil operation 0x%x, falling back to KEEP", op);
             return MTLStencilOperationKeep;
     }
-
-    return stencil_op;
 }
 
 - (void) updateCurrentRenderEncoder
 {
-    if (ctx->state.caps.depth_test ||
-        ctx->state.caps.stencil_test)
+    BOOL passHasDepthAttachment =
+        (_renderPassDescriptor != nil &&
+         _renderPassDescriptor.depthAttachment.texture != nil);
+    BOOL passHasStencilAttachment =
+        (_renderPassDescriptor != nil &&
+         _renderPassDescriptor.stencilAttachment.texture != nil);
+    BOOL useDepthState = ctx->state.caps.depth_test && passHasDepthAttachment;
+    BOOL useStencilState = ctx->state.caps.stencil_test && passHasStencilAttachment;
+
+    if (ctx->state.caps.depth_test && !passHasDepthAttachment) {
+        static uint64_t s_missingDepthAttachmentCount = 0;
+        uint64_t hit = ++s_missingDepthAttachmentCount;
+        if (hit <= 32 || (hit % 256) == 0) {
+            NSLog(@"MGL WARNING: depth test/write requested without depth attachment, disabling depth for this pass hit=%llu fbo=%u drawBuf=0x%x",
+                  (unsigned long long)hit,
+                  ctx->state.framebuffer ? ctx->state.framebuffer->name : 0,
+                  ctx->state.draw_buffer);
+        }
+    }
+
+    if (ctx->state.caps.stencil_test && !passHasStencilAttachment) {
+        static uint64_t s_missingStencilAttachmentCount = 0;
+        uint64_t hit = ++s_missingStencilAttachmentCount;
+        if (hit <= 32 || (hit % 256) == 0) {
+            NSLog(@"MGL WARNING: stencil test requested without stencil attachment, disabling stencil for this pass hit=%llu fbo=%u drawBuf=0x%x",
+                  (unsigned long long)hit,
+                  ctx->state.framebuffer ? ctx->state.framebuffer->name : 0,
+                  ctx->state.draw_buffer);
+        }
+    }
+
+    if (useDepthState || useStencilState)
     {
         MTLDepthStencilDescriptor *dsDesc = [[MTLDepthStencilDescriptor alloc] init];
 
-        // mtl maps directly to gl
-        if (ctx->state.caps.depth_test)
+        if (useDepthState)
         {
-            MTLCompareFunction depthCompareFunction;
+            if (!mglIsValidGLCompareFunction(ctx->state.var.depth_func)) {
+                mglLogRenderStateRepair("depth_func", ctx->state.var.depth_func, GL_LESS);
+                ctx->state.var.depth_func = GL_LESS;
+                ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
+            }
 
-            depthCompareFunction = ctx->state.var.depth_func - GL_NEVER;
-            dsDesc.depthCompareFunction = depthCompareFunction;
-
+            dsDesc.depthCompareFunction =
+                mglMTLCompareFunctionForGL(ctx->state.var.depth_func,
+                                           MTLCompareFunctionLess,
+                                           "depth");
             dsDesc.depthWriteEnabled = ctx->state.var.depth_writemask;
         }
 
-        if (ctx->state.caps.stencil_test)
+        if (useStencilState)
         {
-            // mtl maps directly to gl
             if (ctx->state.var.stencil_func != GL_NEVER)
             {
+                if (!mglIsValidGLCompareFunction(ctx->state.var.stencil_func)) {
+                    mglLogRenderStateRepair("stencil_func", ctx->state.var.stencil_func, GL_ALWAYS);
+                    ctx->state.var.stencil_func = GL_ALWAYS;
+                    ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
+                }
+
                 MTLStencilDescriptor *frontSDesc = [[MTLStencilDescriptor alloc] init];
 
-                frontSDesc.stencilCompareFunction = ctx->state.var.stencil_func - GL_NEVER;
+                frontSDesc.stencilCompareFunction =
+                    mglMTLCompareFunctionForGL(ctx->state.var.stencil_func,
+                                               MTLCompareFunctionAlways,
+                                               "front-stencil");
                 frontSDesc.stencilFailureOperation = [self mtlStencilOpForGLOp:ctx->state.var.stencil_fail ];
                 frontSDesc.depthFailureOperation = [self mtlStencilOpForGLOp:ctx->state.var.stencil_pass_depth_fail];
                 frontSDesc.depthStencilPassOperation = [self mtlStencilOpForGLOp:ctx->state.var.stencil_pass_depth_pass];
@@ -5502,11 +6944,20 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                 dsDesc.frontFaceStencil = frontSDesc;
             }
 
-            if (ctx->state.var.stencil_func != GL_NEVER)
+            if (ctx->state.var.stencil_back_func != GL_NEVER)
             {
+                if (!mglIsValidGLCompareFunction(ctx->state.var.stencil_back_func)) {
+                    mglLogRenderStateRepair("stencil_back_func", ctx->state.var.stencil_back_func, GL_ALWAYS);
+                    ctx->state.var.stencil_back_func = GL_ALWAYS;
+                    ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
+                }
+
                 MTLStencilDescriptor *backSDesc = [[MTLStencilDescriptor alloc] init];
 
-                backSDesc.stencilCompareFunction = ctx->state.var.stencil_back_func - GL_NEVER;
+                backSDesc.stencilCompareFunction =
+                    mglMTLCompareFunctionForGL(ctx->state.var.stencil_back_func,
+                                               MTLCompareFunctionAlways,
+                                               "back-stencil");
                 backSDesc.stencilFailureOperation = [self mtlStencilOpForGLOp:ctx->state.var.stencil_back_fail ];
                 backSDesc.depthFailureOperation = [self mtlStencilOpForGLOp:ctx->state.var.stencil_back_pass_depth_fail];
                 backSDesc.depthStencilPassOperation = [self mtlStencilOpForGLOp:ctx->state.var.stencil_back_pass_depth_pass];
@@ -5521,6 +6972,18 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                                   newDepthStencilStateWithDescriptor:dsDesc];
 
         [_currentRenderEncoder setDepthStencilState: dsState];
+    }
+    else
+    {
+        MTLDepthStencilDescriptor *disabledDSDesc = [[MTLDepthStencilDescriptor alloc] init];
+        disabledDSDesc.depthCompareFunction = MTLCompareFunctionAlways;
+        disabledDSDesc.depthWriteEnabled = NO;
+
+        id <MTLDepthStencilState> disabledDSState = [_device
+                                      newDepthStencilStateWithDescriptor:disabledDSDesc];
+        if (disabledDSState) {
+            [_currentRenderEncoder setDepthStencilState:disabledDSState];
+        }
     }
 
     // Metal validates viewport/scissor strictly against the active render pass dimensions.
@@ -5711,11 +7174,93 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
                 }
             }
 
-            if (traceEncoderState || vx != rawVx || vy != rawVy || vw != rawVw || vh != rawVh) {
+            BOOL viewportWasClamped = (vx != rawVx || vy != rawVy || vw != rawVw || vh != rawVh);
+            if (traceEncoderState || viewportWasClamped) {
                 NSLog(@"MGL VIEWPORT apply pass=%lux%lu raw=(%.3f,%.3f,%.3f,%.3f) resolved=(%.3f,%.3f,%.3f,%.3f)",
                       (unsigned long)passWidth, (unsigned long)passHeight,
                       rawVx, rawVy, rawVw, rawVh,
                       vx, vy, vw, vh);
+            }
+
+            if (viewportWasClamped) {
+                static uint64_t s_viewportClampDetailCount = 0;
+                uint64_t clampHit = ++s_viewportClampDetailCount;
+                BOOL logClampDetail = (clampHit <= 80ull || (clampHit % 120ull) == 0ull);
+
+                if (logClampDetail) {
+                    Framebuffer *debugFbo = ctx->state.framebuffer;
+                    BOOL debugFboValid = (debugFbo != NULL &&
+                                          mglRendererPointerInHashTable(&ctx->state.framebuffer_table, debugFbo));
+                    id<MTLTexture> rpColor0 = _renderPassDescriptor.colorAttachments[0].texture;
+                    id<MTLTexture> rpDepth = _renderPassDescriptor.depthAttachment.texture;
+                    id<MTLTexture> drawableTexture = (_drawable ? _drawable.texture : nil);
+
+                    NSLog(@"MGL VIEWPORT CLAMP DETAIL hit=%llu fbo=%p valid=%d fboName=%u drawBuffer=0x%x pass=%lux%lu "
+                          "rpColor0=%p(%lux%lu) rpDepth=%p(%lux%lu) drawable=%p(%lux%lu) raw=(%.3f,%.3f,%.3f,%.3f) "
+                          "resolved=(%.3f,%.3f,%.3f,%.3f)",
+                          (unsigned long long)clampHit,
+                          debugFbo,
+                          debugFboValid ? 1 : 0,
+                          (debugFboValid ? debugFbo->name : 0),
+                          ctx->state.draw_buffer,
+                          (unsigned long)passWidth,
+                          (unsigned long)passHeight,
+                          rpColor0,
+                          (unsigned long)(rpColor0 ? rpColor0.width : 0),
+                          (unsigned long)(rpColor0 ? rpColor0.height : 0),
+                          rpDepth,
+                          (unsigned long)(rpDepth ? rpDepth.width : 0),
+                          (unsigned long)(rpDepth ? rpDepth.height : 0),
+                          drawableTexture,
+                          (unsigned long)(drawableTexture ? drawableTexture.width : 0),
+                          (unsigned long)(drawableTexture ? drawableTexture.height : 0),
+                          rawVx, rawVy, rawVw, rawVh,
+                          vx, vy, vw, vh);
+
+                    if (debugFboValid) {
+                        for (int attIndex = 0; attIndex < MAX_COLOR_ATTACHMENTS; attIndex++) {
+                            FBOAttachment *attachment = &debugFbo->color_attachments[attIndex];
+                            if (attachment->texture == 0 && attachment->buf.tex == NULL && attachment->buf.rbo == NULL) {
+                                continue;
+                            }
+
+                            Texture *attachmentTexture = NULL;
+                            if (attachment->textarget == GL_RENDERBUFFER) {
+                                attachmentTexture = attachment->buf.rbo ? attachment->buf.rbo->tex : NULL;
+                            } else {
+                                attachmentTexture = attachment->buf.tex;
+                                if (!attachmentTexture && attachment->texture != 0) {
+                                    attachmentTexture = findTexture(ctx, attachment->texture);
+                                }
+                            }
+
+                            id<MTLTexture> attachmentMtl = (attachmentTexture && attachmentTexture->mtl_data)
+                                ? (__bridge id<MTLTexture>)(attachmentTexture->mtl_data)
+                                : nil;
+                            id<MTLTexture> rpAttachment = _renderPassDescriptor.colorAttachments[attIndex].texture;
+
+                            NSLog(@"MGL VIEWPORT CLAMP FBO att=%d name=%u textarget=0x%x level=%d layer=%d tex=%p "
+                                  "texName=%u texTarget=0x%x texSize=%ux%ux%u mtl=%p(%lux%lu) rpTex=%p(%lux%lu)",
+                                  attIndex,
+                                  attachment->texture,
+                                  attachment->textarget,
+                                  attachment->level,
+                                  attachment->layer,
+                                  attachmentTexture,
+                                  attachmentTexture ? attachmentTexture->name : 0,
+                                  attachmentTexture ? attachmentTexture->target : 0,
+                                  attachmentTexture ? attachmentTexture->width : 0,
+                                  attachmentTexture ? attachmentTexture->height : 0,
+                                  attachmentTexture ? attachmentTexture->depth : 0,
+                                  attachmentMtl,
+                                  (unsigned long)(attachmentMtl ? attachmentMtl.width : 0),
+                                  (unsigned long)(attachmentMtl ? attachmentMtl.height : 0),
+                                  rpAttachment,
+                                  (unsigned long)(rpAttachment ? rpAttachment.width : 0),
+                                  (unsigned long)(rpAttachment ? rpAttachment.height : 0));
+                        }
+                    }
+                }
             }
 
             [_currentRenderEncoder setViewport:(MTLViewport){vx, vy, vw, vh,
@@ -5744,16 +7289,31 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
         [_currentRenderEncoder setCullMode:cull_mode];
 
-        MTLWinding winding;
+        if (ctx->state.var.front_face != GL_CW && ctx->state.var.front_face != GL_CCW) {
+            mglLogRenderStateRepair("front_face", ctx->state.var.front_face, GL_CCW);
+            ctx->state.var.front_face = GL_CCW;
+            ctx->state.dirty_bits |= DIRTY_RENDER_STATE;
+        }
 
-        winding = ctx->state.var.front_face - GL_CW;
-
-        [_currentRenderEncoder setFrontFacingWinding:winding];
+        [_currentRenderEncoder setFrontFacingWinding:mglMTLWindingForGL(ctx->state.var.front_face)];
     }
 
     if (ctx->state.caps.depth_clamp)
     {
         [_currentRenderEncoder setDepthClipMode: MTLDepthClipModeClamp];
+    }
+
+    if (ctx->state.caps.polygon_offset_fill ||
+        ctx->state.caps.polygon_offset_line ||
+        ctx->state.caps.polygon_offset_point)
+    {
+        [_currentRenderEncoder setDepthBias:ctx->state.var.polygon_offset_units
+                                 slopeScale:ctx->state.var.polygon_offset_factor
+                                      clamp:0.0f];
+    }
+    else
+    {
+        [_currentRenderEncoder setDepthBias:0.0f slopeScale:0.0f clamp:0.0f];
     }
 
     if (ctx->state.var.polygon_mode == GL_LINES)
@@ -5796,18 +7356,23 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
             return false;
         }
 
+        CGSize expectedDrawableSize = [self mglSyncLayerDrawableSizeFromView:"newRenderEncoder.nextDrawable"];
         _drawable = [_layer nextDrawable];
 
         // late init of gl scissor box on attachment to window system
-        NSRect frame;
-        frame = [_layer frame];
+        NSUInteger drawableWidth = (NSUInteger)MAX(1.0, expectedDrawableSize.width);
+        NSUInteger drawableHeight = (NSUInteger)MAX(1.0, expectedDrawableSize.height);
+        if (_drawable && _drawable.texture) {
+            drawableWidth = (NSUInteger)_drawable.texture.width;
+            drawableHeight = (NSUInteger)_drawable.texture.height;
+        }
 
         if (!ctx->state.caps.scissor_test) {
             ctx->state.var.scissor_box[0] = 0;
             ctx->state.var.scissor_box[1] = 0;
         }
-        ctx->state.var.scissor_box[2] = frame.size.width;
-        ctx->state.var.scissor_box[3] = frame.size.height;
+        ctx->state.var.scissor_box[2] = (GLint)drawableWidth;
+        ctx->state.var.scissor_box[3] = (GLint)drawableHeight;
     }
 
     _renderPassDescriptor = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -5904,7 +7469,9 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
     else
     {
         GLuint mgl_drawbuffer;
-        id<MTLTexture> texture, depth_texture, stencil_texture;
+        id<MTLTexture> texture = nil;
+        id<MTLTexture> depth_texture = nil;
+        id<MTLTexture> stencil_texture = nil;
         
         switch(ctx->state.draw_buffer)
         {
@@ -5973,32 +7540,56 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
             _drawBuffers[mgl_drawbuffer].drawbuffer = texture;
         }
 
-        // attach depth
-        if (ctx->depth_format.mtl_pixel_format &&
-            ctx->state.caps.depth_test)
+        // attach depth. The default framebuffer must have a usable depth
+        // attachment whenever GL depth testing is active, even if the legacy
+        // context format fields were left unset by the window/bootstrap path.
+        BOOL defaultPassNeedsDepth = ctx->state.caps.depth_test || ctx->state.var.depth_writemask;
+        if (defaultPassNeedsDepth)
         {
+            MTLPixelFormat depthFormat = ctx->depth_format.mtl_pixel_format;
+            if (depthFormat == MTLPixelFormatInvalid) {
+                depthFormat = MTLPixelFormatDepth32Float;
+            }
+
             if(_drawBuffers[mgl_drawbuffer].depthbuffer)
             {
                 depth_texture = _drawBuffers[mgl_drawbuffer].depthbuffer;
             }
             else
             {
-                depth_texture = [self newDrawBufferWithCustomSize:ctx->depth_format.mtl_pixel_format isDepthStencil:true customSize: CGSizeMake(texture.width, texture.height) ];
+                depth_texture = [self newDrawBufferWithCustomSize:depthFormat isDepthStencil:true customSize: CGSizeMake(texture.width, texture.height) ];
                 _drawBuffers[mgl_drawbuffer].depthbuffer = depth_texture;
+                if (depth_texture) {
+                    static uint64_t s_defaultDepthCreateCount = 0;
+                    uint64_t hit = ++s_defaultDepthCreateCount;
+                    if (hit <= 8) {
+                        NSLog(@"MGL DEFAULT FBO: created depth attachment fmt=%lu size=%lux%lu drawBuffer=%u",
+                              (unsigned long)depthFormat,
+                              (unsigned long)depth_texture.width,
+                              (unsigned long)depth_texture.height,
+                              mgl_drawbuffer);
+                    }
+                }
             }
         }
 
         // attach stencil
-        if (ctx->stencil_format.mtl_pixel_format &&
-            ctx->state.caps.stencil_test)
+        BOOL defaultPassNeedsStencil = ctx->state.caps.stencil_test || ctx->stencil_format.format;
+        if (defaultPassNeedsStencil)
         {
+            MTLPixelFormat stencilFormat = ctx->stencil_format.mtl_pixel_format;
+            if (stencilFormat == MTLPixelFormatInvalid ||
+                stencilFormat == MTLPixelFormatDepth32Float_Stencil8) {
+                stencilFormat = MTLPixelFormatStencil8;
+            }
+
             if(_drawBuffers[mgl_drawbuffer].stencilbuffer)
             {
                 stencil_texture = _drawBuffers[mgl_drawbuffer].stencilbuffer;
             }
             else
             {
-                stencil_texture = [self newDrawBufferWithCustomSize:ctx->stencil_format.mtl_pixel_format isDepthStencil:true customSize: CGSizeMake(texture.width, texture.height) ];
+                stencil_texture = [self newDrawBufferWithCustomSize:stencilFormat isDepthStencil:true customSize: CGSizeMake(texture.width, texture.height) ];
                 _drawBuffers[mgl_drawbuffer].stencilbuffer = stencil_texture;
             }
         }
@@ -6011,131 +7602,154 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
         _renderPassDescriptor.renderTargetHeight = texture.height;
     }
 
-    GLbitfield pendingClearMask = ctx->state.clear_bitmask;
-    GLuint fboColorClearCount = 0;
-    GLbitfield fboColorClearMask = 0;
-    GLbitfield fboColorAttachment0ClearMask = 0;
-    BOOL globalColorClearRequested = ((pendingClearMask & GL_COLOR_BUFFER_BIT) != 0);
-    BOOL globalColorClearPreserved = NO;
+    if (ctx->state.caps.depth_test && !_renderPassDescriptor.depthAttachment.texture) {
+        NSUInteger depthWidth = _renderPassDescriptor.renderTargetWidth;
+        NSUInteger depthHeight = _renderPassDescriptor.renderTargetHeight;
 
-    // in case one of the framebuffers should be cleared
-    if (pendingClearMask)
-    {
-        if (pendingClearMask & GL_COLOR_BUFFER_BIT)
-        {
-            _renderPassDescriptor.colorAttachments[0].clearColor =
-                MTLClearColorMake(STATE(color_clear_value[0]),
-                                  STATE(color_clear_value[1]),
-                                  STATE(color_clear_value[2]),
-                                  STATE(color_clear_value[3]));
-
-            _renderPassDescriptor.colorAttachments[0].loadAction = MTLLoadActionClear;
-        }
-        else
-        {
-            _renderPassDescriptor.colorAttachments[0].loadAction = MTLLoadActionLoad;
-        }
-
-        if (ctx->state.framebuffer) {
-            Framebuffer * fbo = ctx->state.framebuffer;
-            for(int i=0; i<STATE(max_color_attachments);i++) {
-                FBOAttachment * fboa;
-                fboa = &fbo->color_attachments[i];
-                if (i == 0) {
-                    fboColorAttachment0ClearMask = fboa->clear_bitmask;
-                }
-                if (fboa->clear_bitmask & GL_COLOR_BUFFER_BIT) {
-                    _renderPassDescriptor.colorAttachments[i].clearColor =
-                        MTLClearColorMake(fboa->clear_color[0],
-                                        fboa->clear_color[1],
-                                        fboa->clear_color[2],
-                                        fboa->clear_color[3]);
-
-                    _renderPassDescriptor.colorAttachments[i].loadAction = MTLLoadActionClear;
-                    fboColorClearCount++;
-                    fboColorClearMask |= (GLbitfield)(1u << i);
-                } else {
-                    BOOL preserveGlobalClear = (globalColorClearRequested &&
-                                                i == 0 &&
-                                                _renderPassDescriptor.colorAttachments[i].loadAction == MTLLoadActionClear);
-                    if (preserveGlobalClear) {
-                        globalColorClearPreserved = YES;
-                        if (kMGLDiagnosticStateLogs && traceRenderEncoder) {
-                            NSLog(@"MGL TRACE clear.preserve call=%llu fbo=%u att=%d reason=global_clear_kept "
-                                  "pendingMask=0x%x attClearMask=0x%x globalColorClear=1 keepLA=%s",
-                                  (unsigned long long)renderEncoderCall,
-                                  (unsigned)(ctx->state.framebuffer ? ctx->state.framebuffer->name : 0),
-                                  i,
-                                  (unsigned)pendingClearMask,
-                                  (unsigned)fboa->clear_bitmask,
-                                  mglLoadActionName(_renderPassDescriptor.colorAttachments[i].loadAction));
-                        }
-                        continue;
-                    }
-                    if (kMGLDiagnosticStateLogs &&
-                        globalColorClearRequested &&
-                        i == 0 &&
-                        _renderPassDescriptor.colorAttachments[i].loadAction == MTLLoadActionClear) {
-                        NSLog(@"MGL TRACE clear.override call=%llu fbo=%u att=%d reason=fbo_attachment_clear_bit_missing "
-                              "pendingMask=0x%x attClearMask=0x%x globalColorClear=1 oldLA=%s newLA=%s",
-                              (unsigned long long)renderEncoderCall,
-                              (unsigned)(ctx->state.framebuffer ? ctx->state.framebuffer->name : 0),
-                              i,
-                              (unsigned)pendingClearMask,
-                              (unsigned)fboa->clear_bitmask,
-                              mglLoadActionName(MTLLoadActionClear),
-                              mglLoadActionName(MTLLoadActionLoad));
-                    }
-                    _renderPassDescriptor.colorAttachments[i].loadAction = MTLLoadActionLoad;
-                }
+        if (depthWidth == 0 || depthHeight == 0) {
+            id<MTLTexture> color0 = _renderPassDescriptor.colorAttachments[0].texture;
+            if (color0) {
+                depthWidth = color0.width;
+                depthHeight = color0.height;
             }
         }
 
-        if (pendingClearMask & GL_DEPTH_BUFFER_BIT)
-        {
-            _renderPassDescriptor.depthAttachment.clearDepth = STATE_VAR(depth_clear_value);
+        if (depthWidth > 0 && depthHeight > 0) {
+            if (!_transientDepthTexture ||
+                _transientDepthTextureWidth != depthWidth ||
+                _transientDepthTextureHeight != depthHeight) {
+                MTLTextureDescriptor *depthDesc =
+                    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+                                                                       width:depthWidth
+                                                                      height:depthHeight
+                                                                   mipmapped:NO];
+                depthDesc.usage = MTLTextureUsageRenderTarget;
+                depthDesc.storageMode = MTLStorageModePrivate;
+                _transientDepthTexture = [_device newTextureWithDescriptor:depthDesc];
+                _transientDepthTextureWidth = depthWidth;
+                _transientDepthTextureHeight = depthHeight;
 
-            _renderPassDescriptor.depthAttachment.loadAction = MTLLoadActionClear;
+                if (_transientDepthTexture) {
+                    static uint64_t s_transientDepthCreateCount = 0;
+                    uint64_t hit = ++s_transientDepthCreateCount;
+                    if (hit <= 16 || (hit % 128) == 0) {
+                        NSLog(@"MGL TRANSIENT FBO: created depth attachment fmt=%lu size=%lux%lu fbo=%u",
+                              (unsigned long)MTLPixelFormatDepth32Float,
+                              (unsigned long)depthWidth,
+                              (unsigned long)depthHeight,
+                              (unsigned)(ctx->state.framebuffer ? ctx->state.framebuffer->name : 0));
+                    }
+                } else {
+                    NSLog(@"MGL ERROR: failed to create transient depth attachment size=%lux%lu fbo=%u",
+                          (unsigned long)depthWidth,
+                          (unsigned long)depthHeight,
+                          (unsigned)(ctx->state.framebuffer ? ctx->state.framebuffer->name : 0));
+                }
+            }
+
+            if (_transientDepthTexture) {
+                _renderPassDescriptor.depthAttachment.texture = _transientDepthTexture;
+                _renderPassDescriptor.depthAttachment.loadAction = MTLLoadActionClear;
+                _renderPassDescriptor.depthAttachment.storeAction = MTLStoreActionDontCare;
+                _renderPassDescriptor.depthAttachment.clearDepth = ctx->state.var.depth_clear_value;
+            }
         }
-        else
-        {
+    }
+
+    GLuint fboColorClearCount = 0;
+    GLbitfield fboColorClearMask = 0;
+    GLbitfield fboColorAttachment0ClearMask = 0;
+
+    Framebuffer *fbo = ctx->state.framebuffer;
+    if (fbo) {
+        for (int i = 0; i < STATE(max_color_attachments); ++i) {
+            if ((fbo->color_attachment_bitfield >> i) == 0) break;
+            
+            FBOAttachment *att = &fbo->color_attachments[i];
+            if (i == 0) {
+                fboColorAttachment0ClearMask = att->clear_bitmask;
+            }
+            
+            if (att->clear_bitmask & GL_COLOR_BUFFER_BIT) {
+                _renderPassDescriptor.colorAttachments[i].clearColor =
+                    MTLClearColorMake(att->clear_color[0],
+                                      att->clear_color[1],
+                                      att->clear_color[2],
+                                      att->clear_color[3]);
+                _renderPassDescriptor.colorAttachments[i].loadAction = MTLLoadActionClear;
+                _renderPassDescriptor.colorAttachments[i].storeAction = MTLStoreActionStore;
+                
+                att->clear_bitmask &= ~GL_COLOR_BUFFER_BIT;
+                
+                fboColorClearCount++;
+                fboColorClearMask |= (GLbitfield)(1u << i);
+            } else {
+                _renderPassDescriptor.colorAttachments[i].loadAction = MTLLoadActionLoad;
+            }
+        }
+
+        if (fbo->depth.clear_bitmask & GL_DEPTH_BUFFER_BIT) {
+            _renderPassDescriptor.depthAttachment.clearDepth = fbo->depth.clear_color[0];
+            _renderPassDescriptor.depthAttachment.loadAction = MTLLoadActionClear;
+            _renderPassDescriptor.depthAttachment.storeAction = MTLStoreActionStore;
+            fbo->depth.clear_bitmask &= ~GL_DEPTH_BUFFER_BIT;
+        } else {
             _renderPassDescriptor.depthAttachment.loadAction = MTLLoadActionLoad;
         }
 
-        if (pendingClearMask & GL_STENCIL_BUFFER_BIT)
-        {
-            _renderPassDescriptor.stencilAttachment.clearStencil = STATE_VAR(stencil_clear_value);
-
+        if (fbo->stencil.clear_bitmask & GL_STENCIL_BUFFER_BIT) {
+            _renderPassDescriptor.stencilAttachment.clearStencil = (uint32_t)fbo->stencil.clear_color[0];
             _renderPassDescriptor.stencilAttachment.loadAction = MTLLoadActionClear;
-        }
-        else
-        {
+            _renderPassDescriptor.stencilAttachment.storeAction = MTLStoreActionStore;
+            fbo->stencil.clear_bitmask &= ~GL_STENCIL_BUFFER_BIT;
+        } else {
             _renderPassDescriptor.stencilAttachment.loadAction = MTLLoadActionLoad;
         }
+    } else {
+        GLbitfield defaultClearMask = ctx->state.default_fbo_clear_bitmask;
 
-        ctx->state.clear_bitmask = 0;
-    }
-    else
-    {
-        _renderPassDescriptor.colorAttachments[0].loadAction = MTLLoadActionLoad;
-        _renderPassDescriptor.depthAttachment.loadAction = MTLLoadActionLoad;
-        _renderPassDescriptor.stencilAttachment.loadAction = MTLLoadActionLoad;
+        if (defaultClearMask & GL_COLOR_BUFFER_BIT) {
+            _renderPassDescriptor.colorAttachments[0].clearColor =
+                MTLClearColorMake(ctx->state.default_clear_color[0],
+                                  ctx->state.default_clear_color[1],
+                                  ctx->state.default_clear_color[2],
+                                  ctx->state.default_clear_color[3]);
+            _renderPassDescriptor.colorAttachments[0].loadAction = MTLLoadActionClear;
+            _renderPassDescriptor.colorAttachments[0].storeAction = MTLStoreActionStore;
+            ctx->state.default_fbo_clear_bitmask &= ~GL_COLOR_BUFFER_BIT;
+        } else {
+            _renderPassDescriptor.colorAttachments[0].loadAction = MTLLoadActionLoad;
+        }
+
+        if (defaultClearMask & GL_DEPTH_BUFFER_BIT) {
+            _renderPassDescriptor.depthAttachment.clearDepth = STATE_VAR(depth_clear_value);
+            _renderPassDescriptor.depthAttachment.loadAction = MTLLoadActionClear;
+            _renderPassDescriptor.depthAttachment.storeAction = MTLStoreActionStore;
+            ctx->state.default_fbo_clear_bitmask &= ~GL_DEPTH_BUFFER_BIT;
+        } else {
+            _renderPassDescriptor.depthAttachment.loadAction = MTLLoadActionLoad;
+        }
+
+        if (defaultClearMask & GL_STENCIL_BUFFER_BIT) {
+            _renderPassDescriptor.stencilAttachment.clearStencil = STATE_VAR(stencil_clear_value);
+            _renderPassDescriptor.stencilAttachment.loadAction = MTLLoadActionClear;
+            _renderPassDescriptor.stencilAttachment.storeAction = MTLStoreActionStore;
+            ctx->state.default_fbo_clear_bitmask &= ~GL_STENCIL_BUFFER_BIT;
+        } else {
+            _renderPassDescriptor.stencilAttachment.loadAction = MTLLoadActionLoad;
+        }
     }
 
-    if (kMGLDiagnosticStateLogs && traceRenderEncoder) {
-        MTLClearColor c0 = _renderPassDescriptor.colorAttachments[0].clearColor;
-        NSLog(@"MGL TRACE clear.resolve call=%llu fbo=%u pendingMask=0x%x consumedMask=0x%x "
-              "fboColorClears=%u fboColorMask=0x%x fboAtt0ClearMask=0x%x globalColorClear=%d globalPreserved=%d c0LA=%s depthLA=%s stencilLA=%s "
-              "c0Clear=(%.3f,%.3f,%.3f,%.3f) depthClear=%.3f stencilClear=%u",
+	    if (kMGLDiagnosticStateLogs && traceRenderEncoder) {
+	        MTLClearColor c0 = _renderPassDescriptor.colorAttachments[0].clearColor;
+	        NSLog(@"MGL TRACE clear.resolve call=%llu fbo=%u "
+	              "fboColorClears=%u fboColorMask=0x%x fboAtt0ClearMask=0x%x c0LA=%s depthLA=%s stencilLA=%s "
+	              "c0Clear=(%.3f,%.3f,%.3f,%.3f) depthClear=%.3f stencilClear=%u",
               (unsigned long long)renderEncoderCall,
               (unsigned)(ctx->state.framebuffer ? ctx->state.framebuffer->name : 0),
-              (unsigned)pendingClearMask,
-              (unsigned)ctx->state.clear_bitmask,
               (unsigned)fboColorClearCount,
               (unsigned)fboColorClearMask,
               (unsigned)fboColorAttachment0ClearMask,
-              globalColorClearRequested ? 1 : 0,
-              globalColorClearPreserved ? 1 : 0,
               mglLoadActionName(_renderPassDescriptor.colorAttachments[0].loadAction),
               mglLoadActionName(_renderPassDescriptor.depthAttachment.loadAction),
               mglLoadActionName(_renderPassDescriptor.stencilAttachment.loadAction),
@@ -6143,11 +7757,55 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
               c0.green,
               c0.blue,
               c0.alpha,
-              _renderPassDescriptor.depthAttachment.clearDepth,
-              (unsigned)_renderPassDescriptor.stencilAttachment.clearStencil);
-    }
+	              _renderPassDescriptor.depthAttachment.clearDepth,
+	              (unsigned)_renderPassDescriptor.stencilAttachment.clearStencil);
+	    }
 
-    _renderPassDescriptor.colorAttachments[0].storeAction = MTLStoreActionStore;
+	    BOOL clearResolveInteresting =
+	        (fboColorClearCount != 0) ||
+	        (fboColorAttachment0ClearMask != 0);
+	    if (clearResolveInteresting) {
+	        static uint64_t s_clearResolveDetailLogCount = 0;
+	        uint64_t hit = ++s_clearResolveDetailLogCount;
+	        if (hit <= 256ull || (hit % 512ull) == 0ull) {
+	            MTLClearColor c0 = _renderPassDescriptor.colorAttachments[0].clearColor;
+	            id<MTLTexture> c0Tex = _renderPassDescriptor.colorAttachments[0].texture;
+	            id<MTLTexture> dTex = _renderPassDescriptor.depthAttachment.texture;
+	            id<MTLTexture> sTex = _renderPassDescriptor.stencilAttachment.texture;
+	            NSLog(@"MGL TRACE clear.resolve-detail call=%llu hit=%llu fbo=%u drawBuf=0x%x "
+	                  "fboColorClears=%u fboColorMask=0x%x fboAtt0Mask=0x%x "
+	                  "c0LA=%s c0SA=%s depthLA=%s depthSA=%s stencilLA=%s stencilSA=%s "
+	                  "c0Tex=%p fmt=%lu size=%lux%lu depthTex=%p stencilTex=%p "
+	                  "clearRGBA=(%.3f,%.3f,%.3f,%.3f) depthClear=%.3f stencilClear=%u",
+	                  (unsigned long long)renderEncoderCall,
+	                  (unsigned long long)hit,
+	                  (unsigned)(ctx->state.framebuffer ? ctx->state.framebuffer->name : 0),
+	                  (unsigned)ctx->state.draw_buffer,
+	                  (unsigned)fboColorClearCount,
+	                  (unsigned)fboColorClearMask,
+	                  (unsigned)fboColorAttachment0ClearMask,
+	                  mglLoadActionName(_renderPassDescriptor.colorAttachments[0].loadAction),
+	                  mglStoreActionName(_renderPassDescriptor.colorAttachments[0].storeAction),
+	                  mglLoadActionName(_renderPassDescriptor.depthAttachment.loadAction),
+	                  mglStoreActionName(_renderPassDescriptor.depthAttachment.storeAction),
+	                  mglLoadActionName(_renderPassDescriptor.stencilAttachment.loadAction),
+	                  mglStoreActionName(_renderPassDescriptor.stencilAttachment.storeAction),
+	                  c0Tex,
+	                  (unsigned long)(c0Tex ? c0Tex.pixelFormat : MTLPixelFormatInvalid),
+	                  (unsigned long)(c0Tex ? c0Tex.width : 0),
+	                  (unsigned long)(c0Tex ? c0Tex.height : 0),
+	                  dTex,
+	                  sTex,
+	                  c0.red,
+	                  c0.green,
+	                  c0.blue,
+	                  c0.alpha,
+	                  _renderPassDescriptor.depthAttachment.clearDepth,
+	                  (unsigned)_renderPassDescriptor.stencilAttachment.clearStencil);
+	        }
+	    }
+	
+	    _renderPassDescriptor.colorAttachments[0].storeAction = MTLStoreActionStore;
 
     if (kMGLDiagnosticStateLogs && traceRenderEncoder) {
         id<MTLTexture> c0Tex = _renderPassDescriptor.colorAttachments[0].texture;
@@ -7044,14 +8702,21 @@ create_new_command_buffer:
         }
         pipelineStateDescriptor.colorAttachments[0].pixelFormat = preferredColor0;
 
-        if (ctx->depth_format.format &&
-            ctx->depth_format.mtl_pixel_format != MTLPixelFormatInvalid) {
-            pipelineStateDescriptor.depthAttachmentPixelFormat = ctx->depth_format.mtl_pixel_format;
+        if (ctx->depth_format.format) {
+            MTLPixelFormat depthFormat = ctx->depth_format.mtl_pixel_format;
+            if (depthFormat == MTLPixelFormatInvalid) {
+                depthFormat = MTLPixelFormatDepth32Float;
+            }
+            pipelineStateDescriptor.depthAttachmentPixelFormat = depthFormat;
         }
 
-        if (ctx->stencil_format.format &&
-            ctx->stencil_format.mtl_pixel_format != MTLPixelFormatInvalid) {
-            pipelineStateDescriptor.stencilAttachmentPixelFormat = ctx->stencil_format.mtl_pixel_format;
+        if (ctx->stencil_format.format) {
+            MTLPixelFormat stencilFormat = ctx->stencil_format.mtl_pixel_format;
+            if (stencilFormat == MTLPixelFormatInvalid ||
+                stencilFormat == MTLPixelFormatDepth32Float_Stencil8) {
+                stencilFormat = MTLPixelFormatStencil8;
+            }
+            pipelineStateDescriptor.stencilAttachmentPixelFormat = stencilFormat;
         }
     }
 
@@ -7212,11 +8877,12 @@ create_new_command_buffer:
             }
 
             if (kMGLVerbosePipelineLogs) {
-                NSLog(@"MGL VERTEX DESC attrib=%u enabled=%u glBuffer=%u metalIndex=%d offset=0x%llx stride=%u size=%u type=0x%x normalized=%u divisor=%u format=%lu(%s)",
+                NSLog(@"MGL VERTEX DESC attrib=%u enabled=%u glBuffer=%u metalIndex=%d bindingOffset=%lld offset=0x%llx stride=%u size=%u type=0x%x normalized=%u divisor=%u format=%lu(%s)",
                       i,
                       1u,
                       attribBuffer->name,
                       mapped_buffer_index,
+                      (long long)vao->attrib[i].binding_offset,
                       (unsigned long long)(uintptr_t)vao->attrib[i].relativeoffset,
                       (unsigned)vao->attrib[i].stride,
                       (unsigned)vao->attrib[i].size,
@@ -7265,14 +8931,20 @@ create_new_command_buffer:
         case GL_ONE_MINUS_SRC_ALPHA: factor = MTLBlendFactorOneMinusSourceAlpha; break;
         case GL_DST_ALPHA: factor = MTLBlendFactorDestinationAlpha; break;
         case GL_ONE_MINUS_DST_ALPHA: factor = MTLBlendFactorOneMinusDestinationAlpha; break;
-        case GL_CONSTANT_COLOR: factor = MTLBlendFactorSource1Color; break;
-        case GL_ONE_MINUS_CONSTANT_COLOR: factor = MTLBlendFactorOneMinusSource1Color; break;
-        case GL_CONSTANT_ALPHA: factor = MTLBlendFactorSource1Alpha; break;
-        case GL_ONE_MINUS_CONSTANT_ALPHA: factor = MTLBlendFactorOneMinusSource1Alpha; break;
+        case GL_CONSTANT_COLOR: factor = MTLBlendFactorBlendColor; break;
+        case GL_ONE_MINUS_CONSTANT_COLOR: factor = MTLBlendFactorOneMinusBlendColor; break;
+        case GL_CONSTANT_ALPHA: factor = MTLBlendFactorBlendAlpha; break;
+        case GL_ONE_MINUS_CONSTANT_ALPHA: factor = MTLBlendFactorOneMinusBlendAlpha; break;
+        case GL_SRC_ALPHA_SATURATE: factor = MTLBlendFactorSourceAlphaSaturated; break;
 
         default:
             // CRITICAL FIX: Handle assertion gracefully instead of crashing
-            NSLog(@"MGL ERROR: Unknown blend factor 0x%x", gl_blend);
+            static uint64_t s_unknownBlendFactorCount = 0;
+            uint64_t hit = ++s_unknownBlendFactorCount;
+            if (hit <= 32 || (hit % 512) == 0) {
+                NSLog(@"MGL ERROR: Unknown blend factor 0x%x hit=%llu",
+                      gl_blend, (unsigned long long)hit);
+            }
             return MTLBlendFactorZero;
     }
 
@@ -7293,7 +8965,12 @@ create_new_command_buffer:
 
         default:
             // CRITICAL FIX: Handle assertion gracefully instead of crashing
-            NSLog(@"MGL ERROR: Unknown blend operation 0x%x", gl_blend_op);
+            static uint64_t s_unknownBlendOperationCount = 0;
+            uint64_t hit = ++s_unknownBlendOperationCount;
+            if (hit <= 32 || (hit % 512) == 0) {
+                NSLog(@"MGL ERROR: Unknown blend operation 0x%x hit=%llu",
+                      gl_blend_op, (unsigned long long)hit);
+            }
             return MTLBlendOperationAdd;
     }
 
@@ -7304,6 +8981,31 @@ create_new_command_buffer:
 {
     for(int i=0; i<MAX_COLOR_ATTACHMENTS; i++)
     {
+        if (!mglIsValidGLBlendFactor(ctx->state.var.blend_src_rgb[i])) {
+            mglLogRenderStateRepair("blend_src_rgb", ctx->state.var.blend_src_rgb[i], GL_ONE);
+            ctx->state.var.blend_src_rgb[i] = GL_ONE;
+        }
+        if (!mglIsValidGLBlendFactor(ctx->state.var.blend_src_alpha[i])) {
+            mglLogRenderStateRepair("blend_src_alpha", ctx->state.var.blend_src_alpha[i], GL_ONE);
+            ctx->state.var.blend_src_alpha[i] = GL_ONE;
+        }
+        if (!mglIsValidGLBlendFactor(ctx->state.var.blend_dst_rgb[i])) {
+            mglLogRenderStateRepair("blend_dst_rgb", ctx->state.var.blend_dst_rgb[i], GL_ZERO);
+            ctx->state.var.blend_dst_rgb[i] = GL_ZERO;
+        }
+        if (!mglIsValidGLBlendFactor(ctx->state.var.blend_dst_alpha[i])) {
+            mglLogRenderStateRepair("blend_dst_alpha", ctx->state.var.blend_dst_alpha[i], GL_ZERO);
+            ctx->state.var.blend_dst_alpha[i] = GL_ZERO;
+        }
+        if (!mglIsValidGLBlendEquation(ctx->state.var.blend_equation_rgb[i])) {
+            mglLogRenderStateRepair("blend_equation_rgb", ctx->state.var.blend_equation_rgb[i], GL_FUNC_ADD);
+            ctx->state.var.blend_equation_rgb[i] = GL_FUNC_ADD;
+        }
+        if (!mglIsValidGLBlendEquation(ctx->state.var.blend_equation_alpha[i])) {
+            mglLogRenderStateRepair("blend_equation_alpha", ctx->state.var.blend_equation_alpha[i], GL_FUNC_ADD);
+            ctx->state.var.blend_equation_alpha[i] = GL_FUNC_ADD;
+        }
+
         _src_blend_rgb_factor[i] = [self blendFactorFromGL:ctx->state.var.blend_src_rgb[i]];
         _src_blend_alpha_factor[i] = [self blendFactorFromGL:ctx->state.var.blend_src_alpha[i]];
 
@@ -7688,6 +9390,33 @@ create_new_command_buffer:
 
     if (ctx->state.dirty_bits)
     {
+        // FBO binding/attachment changes alter the Metal render pass itself. They must
+        // be handled even when no generic DIRTY_STATE bit is present; otherwise the
+        // current render encoder can keep drawing into an old attachment while GL state
+        // already points at a different FBO.
+        if (ctx->state.dirty_bits & DIRTY_FBO)
+        {
+            if (ctx->state.framebuffer)
+            {
+                uintptr_t fb_addr = (uintptr_t)ctx->state.framebuffer;
+                if (fb_addr < 0x1000) {
+                    NSLog(@"MGL ERROR: Invalid framebuffer pointer detected during FBO pass rebuild: 0x%lx", fb_addr);
+                    return false;
+                }
+
+                if (ctx->state.framebuffer->dirty_bits & DIRTY_FBO_BINDING)
+                {
+                    RETURN_FALSE_ON_FAILURE([self bindFramebufferAttachmentTextures]);
+                    if (ctx->state.framebuffer) {
+                        ctx->state.framebuffer->dirty_bits &= ~DIRTY_FBO_BINDING;
+                    }
+                }
+            }
+
+            [self endRenderEncoding];
+            RETURN_FALSE_ON_FAILURE([self newRenderEncoder]);
+        }
+
         // dirty state covers all rendering attachments and general state
         if (ctx->state.dirty_bits & DIRTY_STATE)
         {
@@ -9167,6 +10896,15 @@ void mtlFlush (GLMContext glm_ctx, bool finish)
     uint64_t swapCall = ++s_swapCallCount;
     double swapStartSeconds = mglNowSeconds();
     bool traceSwap = mglShouldTraceCall(swapCall);
+    g_mglSwapCallCount = swapCall;
+    g_mglLastSwapSeconds = swapStartSeconds;
+    if (swapCall <= 20ull || (swapCall % 60ull) == 0ull) {
+        NSLog(@"MGL TRACE swap.entry call=%llu drawArraysSinceSwap=%llu drawElementsSinceSwap=%llu processDrawCallsSinceSwap=%llu",
+              (unsigned long long)swapCall,
+              (unsigned long long)g_mglDrawArraysSinceSwap,
+              (unsigned long long)g_mglDrawElementsSinceSwap,
+              (unsigned long long)g_mglProcessDrawCallsSinceSwap);
+    }
     mglLogLoopHeartbeat("swap.loop",
                         swapCall,
                         swapStartSeconds,
@@ -9308,6 +11046,7 @@ void mtlFlush (GLMContext glm_ctx, bool finish)
             if (traceSwap) {
                 NSLog(@"MGL TRACE swap.nextDrawable.begin call=%llu stage=pre_present", (unsigned long long)swapCall);
             }
+            [self mglSyncLayerDrawableSizeFromView:"swap.pre_present"];
             _drawable = [_layer nextDrawable];
             if (traceSwap) {
                 id<MTLTexture> tex = _drawable ? _drawable.texture : nil;
@@ -9325,6 +11064,7 @@ void mtlFlush (GLMContext glm_ctx, bool finish)
             if (traceSwap) {
                 NSLog(@"MGL TRACE swap.nextDrawable.begin call=%llu stage=pre_present_retry", (unsigned long long)swapCall);
             }
+            [self mglSyncLayerDrawableSizeFromView:"swap.pre_present_retry"];
             _drawable = [_layer nextDrawable];
             if (traceSwap) {
                 id<MTLTexture> tex = _drawable ? _drawable.texture : nil;
@@ -9350,7 +11090,10 @@ void mtlFlush (GLMContext glm_ctx, bool finish)
             rpColor0 &&
             drawableTexture &&
             rpColor0 != drawableTexture) {
-            if (traceSwap) {
+            BOOL traceCopyToDrawable = traceSwap ||
+                (kMGLSwapPresentDiagnostics &&
+                 (swapCall <= 12ull || (swapCall % 120ull) == 0ull));
+            if (traceCopyToDrawable) {
                 NSLog(@"MGL TRACE swap.copyToDrawable.begin call=%llu src=%p fmt=%lu %lux%lu dst=%p fmt=%lu %lux%lu",
                       (unsigned long long)swapCall,
                       rpColor0,
@@ -9389,7 +11132,7 @@ void mtlFlush (GLMContext glm_ctx, bool finish)
                       (unsigned long)drawableTexture.pixelFormat);
             }
 
-            if (traceSwap) {
+            if (traceCopyToDrawable) {
                 NSLog(@"MGL TRACE swap.copyToDrawable.end call=%llu", (unsigned long long)swapCall);
             }
         }
@@ -9397,8 +11140,8 @@ void mtlFlush (GLMContext glm_ctx, bool finish)
         // Low-frequency dual texture sampling for black-screen diagnostics.
         // Sample both render-pass color source and drawable target so we can
         // distinguish "rendered black" from "copy/present black".
-        if (kMGLDiagnosticStateLogs &&
-            ((swapCall <= 10ull && (swapCall % 2ull) == 0ull) || ((swapCall % 10ull) == 0ull))) {
+        if (kMGLSwapPresentDiagnostics &&
+            ((swapCall <= 12ull && (swapCall % 3ull) == 0ull) || ((swapCall % 120ull) == 0ull))) {
             void (^scheduleTextureSample)(id<MTLTexture>, NSString *, NSUInteger, NSUInteger) =
                 ^(id<MTLTexture> sampleTexture, NSString *sampleTag, NSUInteger originX, NSUInteger originY) {
                     if (!sampleTexture) {
@@ -9577,21 +11320,33 @@ void mtlFlush (GLMContext glm_ctx, bool finish)
             if (rpColor0) {
                 NSUInteger cx = ((NSUInteger)rpColor0.width > 8u) ? (((NSUInteger)rpColor0.width / 2u) - 4u) : 0u;
                 NSUInteger cy = ((NSUInteger)rpColor0.height > 8u) ? (((NSUInteger)rpColor0.height / 2u) - 4u) : 0u;
+                NSUInteger rx = ((NSUInteger)rpColor0.width > 8u) ? ((NSUInteger)rpColor0.width - 8u) : 0u;
+                NSUInteger by = ((NSUInteger)rpColor0.height > 8u) ? ((NSUInteger)rpColor0.height - 8u) : 0u;
                 scheduleTextureSample(rpColor0, @"src.center", cx, cy);
+                scheduleTextureSample(rpColor0, @"src.right", rx, cy);
+                scheduleTextureSample(rpColor0, @"src.bottom", cx, by);
             }
             if (drawableTexture != rpColor0) {
                 scheduleTextureSample(drawableTexture, @"dst.tl", 0u, 0u);
                 if (drawableTexture) {
                     NSUInteger dcx = ((NSUInteger)drawableTexture.width > 8u) ? (((NSUInteger)drawableTexture.width / 2u) - 4u) : 0u;
                     NSUInteger dcy = ((NSUInteger)drawableTexture.height > 8u) ? (((NSUInteger)drawableTexture.height / 2u) - 4u) : 0u;
+                    NSUInteger drx = ((NSUInteger)drawableTexture.width > 8u) ? ((NSUInteger)drawableTexture.width - 8u) : 0u;
+                    NSUInteger dby = ((NSUInteger)drawableTexture.height > 8u) ? ((NSUInteger)drawableTexture.height - 8u) : 0u;
                     scheduleTextureSample(drawableTexture, @"dst.center", dcx, dcy);
+                    scheduleTextureSample(drawableTexture, @"dst.right", drx, dcy);
+                    scheduleTextureSample(drawableTexture, @"dst.bottom", dcx, dby);
                 }
             } else {
                 scheduleTextureSample(drawableTexture, @"srcdst.tl", 0u, 0u);
                 if (drawableTexture) {
                     NSUInteger sx = ((NSUInteger)drawableTexture.width > 8u) ? (((NSUInteger)drawableTexture.width / 2u) - 4u) : 0u;
                     NSUInteger sy = ((NSUInteger)drawableTexture.height > 8u) ? (((NSUInteger)drawableTexture.height / 2u) - 4u) : 0u;
+                    NSUInteger srx = ((NSUInteger)drawableTexture.width > 8u) ? ((NSUInteger)drawableTexture.width - 8u) : 0u;
+                    NSUInteger sby = ((NSUInteger)drawableTexture.height > 8u) ? ((NSUInteger)drawableTexture.height - 8u) : 0u;
                     scheduleTextureSample(drawableTexture, @"srcdst.center", sx, sy);
+                    scheduleTextureSample(drawableTexture, @"srcdst.right", srx, sy);
+                    scheduleTextureSample(drawableTexture, @"srcdst.bottom", sx, sby);
                 }
             }
         }
@@ -10370,8 +12125,6 @@ MTLPrimitiveType getMTLPrimitiveType(GLenum mode)
         case GL_TRIANGLE_FAN:
         case GL_TRIANGLE_STRIP_ADJACENCY:
         case GL_PATCHES:
-            // CRITICAL FIX: Handle assertion gracefully instead of crashing
-            NSLog(@"MGL ERROR: Assertion hit in MGLRenderer.m at line %d", __LINE__);
             return (MTLPrimitiveType)0xFFFFFFFF;
             break;
     }
@@ -10479,11 +12232,12 @@ Buffer *getElementBuffer(GLMContext ctx)
             return false;
         }
 
-        if (a->relativeoffset < 0) {
-            NSLog(@"MGL DRAWARRAYS BLOCK call=%llu attrib=%u buffer=%u reason=negative_attrib_offset offset=%lld",
+        if (a->binding_offset < 0 || a->relativeoffset < 0) {
+            NSLog(@"MGL DRAWARRAYS BLOCK call=%llu attrib=%u buffer=%u reason=negative_attrib_offset bindingOffset=%lld relativeOffset=%lld",
                   (unsigned long long)drawCall,
                   (unsigned)attrib,
                   (unsigned)vbo->name,
+                  (long long)a->binding_offset,
                   (long long)a->relativeoffset);
             return false;
         }
@@ -10512,7 +12266,18 @@ Buffer *getElementBuffer(GLMContext ctx)
 
         uint64_t elemBytes = (uint64_t)(compSize * compCount);
         uint64_t stride = (a->stride > 0u) ? (uint64_t)a->stride : elemBytes;
-        uint64_t relOffset = (uint64_t)a->relativeoffset;
+        uint64_t bindingOffset = (uint64_t)a->binding_offset;
+        uint64_t attrRelativeOffset = (uint64_t)a->relativeoffset;
+        if (bindingOffset > UINT64_MAX - attrRelativeOffset) {
+            NSLog(@"MGL DRAWARRAYS BLOCK call=%llu attrib=%u buffer=%u reason=offset_overflow bindingOffset=%llu relativeOffset=%llu",
+                  (unsigned long long)drawCall,
+                  (unsigned)attrib,
+                  (unsigned)vbo->name,
+                  (unsigned long long)bindingOffset,
+                  (unsigned long long)attrRelativeOffset);
+            return false;
+        }
+        uint64_t relOffset = bindingOffset + attrRelativeOffset;
         if (stride == 0u || elemBytes == 0u) {
             NSLog(@"MGL DRAWARRAYS BLOCK call=%llu attrib=%u buffer=%u reason=zero_stride_or_elem stride=%llu elem=%llu",
                   (unsigned long long)drawCall,
@@ -10528,16 +12293,29 @@ Buffer *getElementBuffer(GLMContext ctx)
         uint64_t rangeFirst = (a->divisor != 0u) ? 0u : firstVertex;
         uint64_t rangeLast = (a->divisor != 0u) ? 0u : lastVertex;
 
+        if (relOffset > UINT64_MAX - elemBytes) {
+            NSLog(@"MGL DRAWARRAYS BLOCK call=%llu attrib=%u buffer=%u reason=byte_range_overflow bindingOffset=%llu relOffset=%llu elemBytes=%llu divisor=%u",
+                  (unsigned long long)drawCall,
+                  (unsigned)attrib,
+                  (unsigned)vbo->name,
+                  (unsigned long long)bindingOffset,
+                  (unsigned long long)relOffset,
+                  (unsigned long long)elemBytes,
+                  (unsigned)a->divisor);
+            return false;
+        }
+
         if (rangeLast > (UINT64_MAX - relOffset - elemBytes) / stride ||
             rangeFirst > (UINT64_MAX - relOffset) / stride) {
             NSLog(@"MGL DRAWARRAYS BLOCK call=%llu attrib=%u buffer=%u reason=byte_range_overflow "
-                  "range=[%llu,%llu] stride=%llu relOffset=%llu elemBytes=%llu divisor=%u",
+                  "range=[%llu,%llu] stride=%llu bindingOffset=%llu relOffset=%llu elemBytes=%llu divisor=%u",
                   (unsigned long long)drawCall,
                   (unsigned)attrib,
                   (unsigned)vbo->name,
                   (unsigned long long)rangeFirst,
                   (unsigned long long)rangeLast,
                   (unsigned long long)stride,
+                  (unsigned long long)bindingOffset,
                   (unsigned long long)relOffset,
                   (unsigned long long)elemBytes,
                   (unsigned)a->divisor);
@@ -10550,7 +12328,7 @@ Buffer *getElementBuffer(GLMContext ctx)
         if (byteEnd > vboSize) {
             NSLog(@"MGL DRAWARRAYS BLOCK call=%llu attrib=%u buffer=%u reason=vbo_oob "
                   "vertexRange=[%llu,%llu] byteRange=[%llu,%llu) vboSize=%llu "
-                  "mode=0x%x first=%d count=%d stride=%llu relOffset=%llu elemBytes=%llu type=0x%x size=%u divisor=%u",
+                  "mode=0x%x first=%d count=%d stride=%llu bindingOffset=%llu relOffset=%llu elemBytes=%llu type=0x%x size=%u divisor=%u",
                   (unsigned long long)drawCall,
                   (unsigned)attrib,
                   (unsigned)vbo->name,
@@ -10563,6 +12341,7 @@ Buffer *getElementBuffer(GLMContext ctx)
                   (int)first,
                   (int)count,
                   (unsigned long long)stride,
+                  (unsigned long long)bindingOffset,
                   (unsigned long long)relOffset,
                   (unsigned long long)elemBytes,
                   (unsigned)a->type,
@@ -10631,7 +12410,7 @@ Buffer *getElementBuffer(GLMContext ctx)
 
         if (mglShouldInspectDrawCall(drawCall, drawCtx->state.program_name) && attrib == 0u) {
             NSLog(@"MGL TRACE drawArrays.attrib0 call=%llu program=%u buffer=%u first=%d count=%d "
-                  "byteRange=[%llu,%llu) vboSize=%llu metalLen=%llu stride=%llu relOffset=%llu elemBytes=%llu",
+                  "byteRange=[%llu,%llu) vboSize=%llu metalLen=%llu stride=%llu bindingOffset=%llu relOffset=%llu elemBytes=%llu",
                   (unsigned long long)drawCall,
                   (unsigned)drawCtx->state.program_name,
                   (unsigned)vbo->name,
@@ -10642,6 +12421,7 @@ Buffer *getElementBuffer(GLMContext ctx)
                   (unsigned long long)vboSize,
                   (unsigned long long)metalLen,
                   (unsigned long long)stride,
+                  (unsigned long long)bindingOffset,
                   (unsigned long long)relOffset,
                   (unsigned long long)elemBytes);
         }
@@ -10750,9 +12530,6 @@ Buffer *getIndirectBuffer(GLMContext ctx)
         }
     }
 
-    primitiveType = getMTLPrimitiveType(mode);
-    if ((GLuint)primitiveType == 0xFFFFFFFF) { NSLog(@"MGL WARNING: Unsupported primitive mode=0x%x, skipping draw call", mode); return; }
-
     if (![self validateDrawArraysVertexInputs:ctx
                                          mode:mode
                                         first:first
@@ -10762,6 +12539,41 @@ Buffer *getIndirectBuffer(GLMContext ctx)
         return;
     }
 
+    BOOL emulateTriangleFan = (mode == GL_TRIANGLE_FAN);
+    if (emulateTriangleFan) {
+        if (count < 3) {
+            return;
+        }
+
+        NSUInteger fanIndexCount = 0u;
+        id<MTLBuffer> fanIndexBuffer = mglNewTriangleFanArrayIndexBuffer(_device,
+                                                                         (NSUInteger)count,
+                                                                         &fanIndexCount);
+        if (!fanIndexBuffer || fanIndexCount == 0u) {
+            NSLog(@"MGL WARNING: drawArrays triangle fan emulation failed count=%d first=%d",
+                  (int)count,
+                  (int)first);
+            g_mglDrawArraysSkippedSinceSwap++;
+            return;
+        }
+
+        @try {
+            [_currentRenderEncoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                              indexCount:fanIndexCount
+                                               indexType:MTLIndexTypeUInt32
+                                             indexBuffer:fanIndexBuffer
+                                       indexBufferOffset:0
+                                           instanceCount:1
+                                              baseVertex:first
+                                            baseInstance:0];
+        } @catch (NSException *exception) {
+            NSLog(@"MGL ERROR: mtlDrawArrays triangle fan drawIndexedPrimitives failed: %@", exception);
+            return;
+        }
+    } else {
+        primitiveType = getMTLPrimitiveType(mode);
+        if ((GLuint)primitiveType == 0xFFFFFFFF) { NSLog(@"MGL WARNING: Unsupported primitive mode=0x%x, skipping draw call", mode); return; }
+
     @try {
         [_currentRenderEncoder drawPrimitives: primitiveType
                                  vertexStart: first
@@ -10770,6 +12582,7 @@ Buffer *getIndirectBuffer(GLMContext ctx)
         NSLog(@"MGL ERROR: mtlDrawArrays - drawPrimitives failed: %@", exception);
         // Don't crash, just return gracefully
         return;
+    }
     }
 
     g_mglLastDrawArraysCall = drawCall;
@@ -10781,6 +12594,12 @@ Buffer *getIndirectBuffer(GLMContext ctx)
     if (count > 0) {
         g_mglDrawArrayVerticesSinceSwap += (uint64_t)count;
     }
+    mglLogDrawWithoutSwapWatchdog("arrays",
+                                  drawCall,
+                                  ctx,
+                                  _currentCommandBuffer,
+                                  _currentRenderEncoder,
+                                  _renderPassDescriptor);
 
     double drawElapsedMs = (mglNowSeconds() - drawStartSeconds) * 1000.0;
     if (traceDraw || drawElapsedMs >= 16.0) {
@@ -10876,8 +12695,21 @@ void mtlDrawArrays(GLMContext glm_ctx, GLenum mode, GLint first, GLsizei count)
     }
 
     activeProgramName = ctx ? (ctx->state.program_name ? ctx->state.program_name : (ctx->state.program ? ctx->state.program->name : 0u)) : 0u;
+    if (ctx && activeProgramName != 0u) {
+        GLuint enabledAttribMask = ctx->state.vao ? ctx->state.vao->enabled_attribs : 0u;
+        Program *drawProgram = mglPeekProgramByName(ctx, activeProgramName);
 
-    primitiveType = getMTLPrimitiveType(mode);
+        mglObserveProgramDrawForFocus(activeProgramName, count, enabledAttribMask);
+
+        // SPIR-V image dimension enum values: Cube is 3. Keep this literal here to avoid
+        // depending on which SPIR-V enum header variant is pulled through spirv_cross_c.h.
+        if (mglProgramHasImageDim(drawProgram, 3u)) {
+            mglFocusLoadingProgram(activeProgramName, "cube-sampled-image", drawCall);
+        }
+    }
+
+    BOOL emulateTriangleFan = (mode == GL_TRIANGLE_FAN);
+    primitiveType = emulateTriangleFan ? MTLPrimitiveTypeTriangle : getMTLPrimitiveType(mode);
     if ((GLuint)primitiveType == 0xFFFFFFFF) { NSLog(@"MGL WARNING: Unsupported primitive mode=0x%x, skipping draw call", mode); return; }
 
     indexType = getMTLIndexType(type);
@@ -10997,11 +12829,12 @@ void mtlDrawArrays(GLMContext glm_ctx, GLenum mode, GLint first, GLsizei count)
                     return;
                 }
 
-                if (a->relativeoffset < 0) {
-                    NSLog(@"MGL VBORANGE BLOCK drawElements call=%llu attrib=%u buffer=%u negative relative offset=%lld",
+                if (a->binding_offset < 0 || a->relativeoffset < 0) {
+                    NSLog(@"MGL VBORANGE BLOCK drawElements call=%llu attrib=%u buffer=%u negative attrib offset bindingOffset=%lld relativeOffset=%lld",
                           (unsigned long long)drawCall,
                           (unsigned)attrib,
                           (unsigned)vbo->name,
+                          (long long)a->binding_offset,
                           (long long)a->relativeoffset);
                     return;
                 }
@@ -11028,7 +12861,18 @@ void mtlDrawArrays(GLMContext glm_ctx, GLenum mode, GLint first, GLsizei count)
                 }
 
                 uint64_t stride = (a->stride > 0u) ? (uint64_t)a->stride : elemBytes;
-                uint64_t relOffset = (uint64_t)(uintptr_t)a->relativeoffset;
+                uint64_t bindingOffset = (uint64_t)a->binding_offset;
+                uint64_t attrRelativeOffset = (uint64_t)(uintptr_t)a->relativeoffset;
+                if (bindingOffset > UINT64_MAX - attrRelativeOffset) {
+                    NSLog(@"MGL VBORANGE BLOCK drawElements call=%llu attrib=%u buffer=%u offset overflow bindingOffset=%llu relativeOffset=%llu",
+                          (unsigned long long)drawCall,
+                          (unsigned)attrib,
+                          (unsigned)vbo->name,
+                          (unsigned long long)bindingOffset,
+                          (unsigned long long)attrRelativeOffset);
+                    return;
+                }
+                uint64_t relOffset = bindingOffset + attrRelativeOffset;
                 if (stride == 0u) {
                     continue;
                 }
@@ -11036,12 +12880,24 @@ void mtlDrawArrays(GLMContext glm_ctx, GLenum mode, GLint first, GLsizei count)
                 uint32_t attribMinIndex = (a->divisor != 0u) ? 0u : minIndexForDraw;
                 uint32_t attribMaxIndex = (a->divisor != 0u) ? 0u : maxIndexForDraw;
 
+                if (relOffset > UINT64_MAX - elemBytes) {
+                    NSLog(@"MGL VBORANGE BLOCK drawElements call=%llu attrib=%u overflow computing vertex range bindingOffset=%llu relOffset=%llu elemBytes=%llu divisor=%u",
+                          (unsigned long long)drawCall,
+                          (unsigned)attrib,
+                          (unsigned long long)bindingOffset,
+                          (unsigned long long)relOffset,
+                          (unsigned long long)elemBytes,
+                          (unsigned)a->divisor);
+                    return;
+                }
+
                 if ((uint64_t)attribMaxIndex > (UINT64_MAX - relOffset - elemBytes) / stride) {
-                    NSLog(@"MGL VBORANGE BLOCK drawElements call=%llu attrib=%u overflow computing vertex range maxIndex=%u stride=%llu relOffset=%llu elemBytes=%llu divisor=%u",
+                    NSLog(@"MGL VBORANGE BLOCK drawElements call=%llu attrib=%u overflow computing vertex range maxIndex=%u stride=%llu bindingOffset=%llu relOffset=%llu elemBytes=%llu divisor=%u",
                           (unsigned long long)drawCall,
                           (unsigned)attrib,
                           (unsigned)attribMaxIndex,
                           (unsigned long long)stride,
+                          (unsigned long long)bindingOffset,
                           (unsigned long long)relOffset,
                           (unsigned long long)elemBytes,
                           (unsigned)a->divisor);
@@ -11049,11 +12905,12 @@ void mtlDrawArrays(GLMContext glm_ctx, GLenum mode, GLint first, GLsizei count)
                 }
 
                 if ((uint64_t)attribMinIndex > (UINT64_MAX - relOffset) / stride) {
-                    NSLog(@"MGL VBORANGE BLOCK drawElements call=%llu attrib=%u overflow computing min range minIndex=%u stride=%llu relOffset=%llu divisor=%u",
+                    NSLog(@"MGL VBORANGE BLOCK drawElements call=%llu attrib=%u overflow computing min range minIndex=%u stride=%llu bindingOffset=%llu relOffset=%llu divisor=%u",
                           (unsigned long long)drawCall,
                           (unsigned)attrib,
                           (unsigned)attribMinIndex,
                           (unsigned long long)stride,
+                          (unsigned long long)bindingOffset,
                           (unsigned long long)relOffset,
                           (unsigned)a->divisor);
                     return;
@@ -11064,7 +12921,7 @@ void mtlDrawArrays(GLMContext glm_ctx, GLenum mode, GLint first, GLsizei count)
                 uint64_t vboSize = (vbo->size > 0) ? (uint64_t)vbo->size : 0u;
 
                 if (maxEnd > vboSize) {
-                    NSLog(@"MGL VBORANGE BLOCK drawElements call=%llu attrib=%u buffer=%u indexRange=[%u,%u] byteRange=[%llu,%llu) exceeds vboSize=%llu (stride=%llu relOffset=%llu elemBytes=%llu divisor=%u)",
+                    NSLog(@"MGL VBORANGE BLOCK drawElements call=%llu attrib=%u buffer=%u indexRange=[%u,%u] byteRange=[%llu,%llu) exceeds vboSize=%llu (stride=%llu bindingOffset=%llu relOffset=%llu elemBytes=%llu divisor=%u)",
                           (unsigned long long)drawCall,
                           (unsigned)attrib,
                           (unsigned)vbo->name,
@@ -11074,6 +12931,7 @@ void mtlDrawArrays(GLMContext glm_ctx, GLenum mode, GLint first, GLsizei count)
                           (unsigned long long)maxEnd,
                           (unsigned long long)vboSize,
                           (unsigned long long)stride,
+                          (unsigned long long)bindingOffset,
                           (unsigned long long)relOffset,
                           (unsigned long long)elemBytes,
                           (unsigned)a->divisor);
@@ -11103,7 +12961,7 @@ void mtlDrawArrays(GLMContext glm_ctx, GLenum mode, GLint first, GLsizei count)
 
                 uint64_t metalLen = (uint64_t)attribMetalBuffer.length;
                 if (maxEnd > metalLen) {
-                    NSLog(@"MGL VBORANGE BLOCK drawElements call=%llu attrib=%u buffer=%u indexRange=[%u,%u] byteRange=[%llu,%llu) exceeds metalLen=%llu vboSize=%llu stride=%llu relOffset=%llu elemBytes=%llu divisor=%u",
+                    NSLog(@"MGL VBORANGE BLOCK drawElements call=%llu attrib=%u buffer=%u indexRange=[%u,%u] byteRange=[%llu,%llu) exceeds metalLen=%llu vboSize=%llu stride=%llu bindingOffset=%llu relOffset=%llu elemBytes=%llu divisor=%u",
                           (unsigned long long)drawCall,
                           (unsigned)attrib,
                           (unsigned)vbo->name,
@@ -11114,6 +12972,7 @@ void mtlDrawArrays(GLMContext glm_ctx, GLenum mode, GLint first, GLsizei count)
                           (unsigned long long)metalLen,
                           (unsigned long long)vboSize,
                           (unsigned long long)stride,
+                          (unsigned long long)bindingOffset,
                           (unsigned long long)relOffset,
                           (unsigned long long)elemBytes,
                           (unsigned)a->divisor);
@@ -11154,6 +13013,16 @@ void mtlDrawArrays(GLMContext glm_ctx, GLenum mode, GLint first, GLsizei count)
     }
 
     if (mglShouldInspectDrawCall(drawCall, activeProgramName)) {
+        if (ctx && mglIsFocusedLoadingProgram(activeProgramName)) {
+            Program *focusedProgram = mglResolveProgramFromState(ctx);
+            if (focusedProgram) {
+                mglWriteProgramMSLDump(focusedProgram,
+                                       [NSString stringWithFormat:@"drawElements hot program %u call %llu",
+                                                                  (unsigned)activeProgramName,
+                                                                  (unsigned long long)drawCall]);
+            }
+        }
+
         if (ctx) {
             NSLog(@"MGL TRACE drawElements.state call=%llu program=%u colorMask(use=%d rgba=%d%d%d%d) depth(write=%d test=%d) blend=%d cull=%d viewport=%d,%d,%d,%d",
                   (unsigned long long)drawCall,
@@ -11238,17 +13107,21 @@ void mtlDrawArrays(GLMContext glm_ctx, GLenum mode, GLint first, GLsizei count)
                         (a0->size >= 2u && a0->size <= 4u) &&
                         a0->stride >= (sizeof(float) * a0->size)) {
                         uint32_t firstIndex = mglReadIndexValue(start, indexType, 0u);
-                        NSUInteger vertexOffset = (NSUInteger)a0->relativeoffset + ((NSUInteger)firstIndex * (NSUInteger)a0->stride);
+                        NSUInteger bindingOffset = (a0->binding_offset > 0) ? (NSUInteger)a0->binding_offset : 0u;
+                        NSUInteger vertexOffset = bindingOffset +
+                                                  (NSUInteger)a0->relativeoffset +
+                                                  ((NSUInteger)firstIndex * (NSUInteger)a0->stride);
                         NSUInteger needed = sizeof(float) * a0->size;
                         if (vertexOffset <= (NSUInteger)vbo->size &&
                             ((NSUInteger)vbo->size - vertexOffset) >= needed) {
                             float comps[4] = {0.f, 0.f, 0.f, 0.f};
                             memcpy(comps, vboBytes + vertexOffset, needed);
-                            NSLog(@"MGL TRACE drawElements.attrib0 call=%llu program=%u vbo=%u firstIndex=%u relOffset=%u stride=%u size=%u vec=(%.4f,%.4f,%.4f,%.4f) vboSize=%lld init(ever=%u full=%u source=%u off=%lld size=%lld src=%p hash=0x%016llx)",
+                            NSLog(@"MGL TRACE drawElements.attrib0 call=%llu program=%u vbo=%u firstIndex=%u bindingOffset=%lu relOffset=%u stride=%u size=%u vec=(%.4f,%.4f,%.4f,%.4f) vboSize=%lld init(ever=%u full=%u source=%u off=%lld size=%lld src=%p hash=0x%016llx)",
                                   (unsigned long long)drawCall,
                                   (unsigned)activeProgramName,
                                   (unsigned)vbo->name,
                                   (unsigned)firstIndex,
+                                  (unsigned long)bindingOffset,
                                   (unsigned)a0->relativeoffset,
                                   (unsigned)a0->stride,
                                   (unsigned)a0->size,
@@ -11262,8 +13135,24 @@ void mtlDrawArrays(GLMContext glm_ctx, GLenum mode, GLint first, GLsizei count)
                                   vbo->last_write_src_ptr,
                                   (unsigned long long)vbo->last_write_src_hash);
 
-                            static bool s_dumpedAttrib0RawBuffer = false;
-                            if (!s_dumpedAttrib0RawBuffer && vbo->size > 0) {
+                            typedef struct MGLAttrib0DumpKey {
+                                GLuint program;
+                                GLuint vbo;
+                            } MGLAttrib0DumpKey;
+                            static MGLAttrib0DumpKey s_dumpedAttrib0RawBuffers[24] = {{0, 0}};
+                            static uint32_t s_dumpedAttrib0RawBufferCount = 0;
+                            BOOL alreadyDumpedAttrib0 = NO;
+                            for (uint32_t dumpIndex = 0; dumpIndex < s_dumpedAttrib0RawBufferCount; dumpIndex++) {
+                                if (s_dumpedAttrib0RawBuffers[dumpIndex].program == activeProgramName &&
+                                    s_dumpedAttrib0RawBuffers[dumpIndex].vbo == vbo->name) {
+                                    alreadyDumpedAttrib0 = YES;
+                                    break;
+                                }
+                            }
+
+                            if (!alreadyDumpedAttrib0 &&
+                                s_dumpedAttrib0RawBufferCount < (uint32_t)(sizeof(s_dumpedAttrib0RawBuffers) / sizeof(s_dumpedAttrib0RawBuffers[0])) &&
+                                vbo->size > 0) {
                                 size_t totalSize = (size_t)vbo->size;
                                 size_t headLen = MIN((size_t)256, totalSize);
                                 size_t windowOffset = (size_t)vertexOffset;
@@ -11275,7 +13164,7 @@ void mtlDrawArrays(GLMContext glm_ctx, GLenum mode, GLint first, GLsizei count)
                                     windowLen = MIN((size_t)128, totalSize - windowOffset);
                                 }
 
-                                NSLog(@"MGL DUMP attrib0.raw.begin call=%llu program=%u vbo=%u size=%zu firstIndex=%u vertexOffset=%zu stride=%u relOffset=%u",
+                                NSLog(@"MGL DUMP attrib0.raw.begin call=%llu program=%u vbo=%u size=%zu firstIndex=%u vertexOffset=%zu stride=%u bindingOffset=%lu relOffset=%u",
                                       (unsigned long long)drawCall,
                                       (unsigned)activeProgramName,
                                       (unsigned)vbo->name,
@@ -11283,6 +13172,7 @@ void mtlDrawArrays(GLMContext glm_ctx, GLenum mode, GLint first, GLsizei count)
                                       (unsigned)firstIndex,
                                       (size_t)vertexOffset,
                                       (unsigned)a0->stride,
+                                      (unsigned long)bindingOffset,
                                       (unsigned)a0->relativeoffset);
                                 mglDumpBytesToLog(@"attrib0.vbo.head", vboBytes, headLen, 0u);
                                 if (windowLen > 0) {
@@ -11292,12 +13182,15 @@ void mtlDrawArrays(GLMContext glm_ctx, GLenum mode, GLint first, GLsizei count)
                                                       windowOffset);
                                 }
                                 NSLog(@"MGL DUMP attrib0.raw.end vbo=%u", (unsigned)vbo->name);
-                                s_dumpedAttrib0RawBuffer = true;
+                                s_dumpedAttrib0RawBuffers[s_dumpedAttrib0RawBufferCount].program = activeProgramName;
+                                s_dumpedAttrib0RawBuffers[s_dumpedAttrib0RawBufferCount].vbo = vbo->name;
+                                s_dumpedAttrib0RawBufferCount++;
                             }
                         } else {
-                            NSLog(@"MGL WARNING: drawElements.attrib0 call=%llu OOB firstIndex=%u relOffset=%u stride=%u size=%u vboSize=%lld",
+                            NSLog(@"MGL WARNING: drawElements.attrib0 call=%llu OOB firstIndex=%u bindingOffset=%lu relOffset=%u stride=%u size=%u vboSize=%lld",
                                   (unsigned long long)drawCall,
                                   (unsigned)firstIndex,
+                                  (unsigned long)bindingOffset,
                                   (unsigned)a0->relativeoffset,
                                   (unsigned)a0->stride,
                                   (unsigned)a0->size,
@@ -11342,8 +13235,39 @@ void mtlDrawArrays(GLMContext glm_ctx, GLenum mode, GLint first, GLsizei count)
     }
 
     @try {
-        [_currentRenderEncoder drawIndexedPrimitives:primitiveType indexCount:count indexType:indexType
-                                         indexBuffer:indexBuffer indexBufferOffset:indexOffset instanceCount:1];
+        if (emulateTriangleFan) {
+            if (count < 3) {
+                return;
+            }
+
+            const uint8_t *fanSource = indexBytesForValidation ? (indexBytesForValidation + indexOffset) : NULL;
+            NSUInteger fanIndexCount = 0u;
+            id<MTLBuffer> fanIndexBuffer = mglNewTriangleFanElementIndexBuffer(_device,
+                                                                               fanSource,
+                                                                               indexType,
+                                                                               (NSUInteger)count,
+                                                                               &fanIndexCount);
+            if (!fanIndexBuffer || fanIndexCount == 0u) {
+                NSLog(@"MGL WARNING: drawElements call=%llu triangle fan emulation failed ebo=%u count=%d offset=%lu source=%p",
+                      (unsigned long long)drawCall,
+                      (unsigned)gl_element_buffer->name,
+                      (int)count,
+                      (unsigned long)indexOffset,
+                      fanSource);
+                g_mglDrawElementsSkippedSinceSwap++;
+                return;
+            }
+
+            [_currentRenderEncoder drawIndexedPrimitives:MTLPrimitiveTypeTriangle
+                                              indexCount:fanIndexCount
+                                               indexType:MTLIndexTypeUInt32
+                                             indexBuffer:fanIndexBuffer
+                                       indexBufferOffset:0
+                                           instanceCount:1];
+        } else {
+            [_currentRenderEncoder drawIndexedPrimitives:primitiveType indexCount:count indexType:indexType
+                                             indexBuffer:indexBuffer indexBufferOffset:indexOffset instanceCount:1];
+        }
     } @catch (NSException *exception) {
         NSLog(@"MGL ERROR: drawElements call=%llu drawIndexedPrimitives exception: %@",
               (unsigned long long)drawCall, exception);
@@ -11359,6 +13283,12 @@ void mtlDrawArrays(GLMContext glm_ctx, GLenum mode, GLint first, GLsizei count)
     if (count > 0) {
         g_mglDrawElementIndicesSinceSwap += (uint64_t)count;
     }
+    mglLogDrawWithoutSwapWatchdog("elements",
+                                  drawCall,
+                                  ctx,
+                                  _currentCommandBuffer,
+                                  _currentRenderEncoder,
+                                  _renderPassDescriptor);
 
     double drawElapsedMs = (mglNowSeconds() - drawStartSeconds) * 1000.0;
     if (traceDraw || drawElapsedMs >= 16.0) {
@@ -12192,13 +14122,8 @@ void* CppCreateMGLRendererAndBindToContext (void *glm_ctx)
     NSLog(@"MGL CAMetalLayer pixelFormat=%lu", (unsigned long)_layer.pixelFormat);
     _layer.framebufferOnly = NO; // enable blitting to main color buffer
     _layer.allowsNextDrawableTimeout = YES; // avoid indefinite nextDrawable stalls
-    _layer.frame = view.layer.frame;
     _layer.magnificationFilter = kCAFilterNearest;
     _layer.presentsWithTransaction = NO;
-
-    // AGX-safe scale factor handling
-    int scaleFactor = [[NSScreen mainScreen] backingScaleFactor];
-    [_layer setContentsScale: scaleFactor];
 
     // AGX-safe layer attachment
     if ([_view layer]) {
@@ -12206,6 +14131,7 @@ void* CppCreateMGLRendererAndBindToContext (void *glm_ctx)
     } else {
         [_view setLayer: _layer];
     }
+    [self mglSyncLayerDrawableSizeFromView:"createRenderer"];
 
     mglDrawBuffer(glm_ctx, GL_FRONT);
 

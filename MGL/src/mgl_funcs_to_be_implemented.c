@@ -350,9 +350,26 @@ void mglClipControl(GLMContext ctx, GLenum origin, GLenum depth)
 
 void mglColorMaski(GLMContext ctx, GLuint index, GLboolean r, GLboolean g, GLboolean b, GLboolean a)
 {
-	// Indexed color mask - use global mask for simplicity
-	(void)index;
-	mglColorMask(ctx, r, g, b, a);
+	if (!ctx) {
+		return;
+	}
+
+	if (index >= MAX_COLOR_ATTACHMENTS) {
+		STATE(error) = GL_INVALID_VALUE;
+		return;
+	}
+
+	STATE(caps.use_color_mask[index]) = (r == GL_FALSE ||
+	                                     g == GL_FALSE ||
+	                                     b == GL_FALSE ||
+	                                     a == GL_FALSE) ? GL_TRUE : GL_FALSE;
+	STATE(var.color_writemask[index][0]) = r ? GL_TRUE : GL_FALSE;
+	STATE(var.color_writemask[index][1]) = g ? GL_TRUE : GL_FALSE;
+	STATE(var.color_writemask[index][2]) = b ? GL_TRUE : GL_FALSE;
+	STATE(var.color_writemask[index][3]) = a ? GL_TRUE : GL_FALSE;
+
+	// Color write masks are part of the Metal pipeline descriptor.
+	STATE(dirty_bits) |= DIRTY_RENDER_STATE | DIRTY_ALPHA_STATE;
 }
 
 void mglColorP3ui(GLMContext ctx, GLenum type, GLuint color)
@@ -836,12 +853,28 @@ void mglGetMultisamplefv(GLMContext ctx, GLenum pname, GLuint index, GLfloat *va
 
 void mglGetObjectLabel(GLMContext ctx, GLenum identifier, GLuint name, GLsizei bufSize, GLsizei *length, GLchar *label)
 {
-	// No labels stored
-	(void)ctx;
-	(void)identifier;
-	(void)name;
-	if (length) *length = 0;
-	if (label && bufSize > 0) label[0] = '\0';
+	const char *stored_label = "";
+	if (ctx && identifier == GL_TEXTURE && name != 0) {
+		Texture *tex = findTexture(ctx, name);
+		if (tex && tex->debug_label[0] != '\0') {
+			stored_label = tex->debug_label;
+		}
+	}
+
+	GLsizei stored_len = (GLsizei)strlen(stored_label);
+	if (length) {
+		*length = stored_len;
+	}
+	if (label && bufSize > 0) {
+		GLsizei copy_len = stored_len;
+		if (copy_len >= bufSize) {
+			copy_len = bufSize - 1;
+		}
+		if (copy_len > 0) {
+			memcpy(label, stored_label, (size_t)copy_len);
+		}
+		label[copy_len] = '\0';
+	}
 }
 
 void mglGetObjectPtrLabel(GLMContext ctx, const void *ptr, GLsizei bufSize, GLsizei *length, GLchar *label)
@@ -1434,12 +1467,48 @@ void mglNormalP3uiv(GLMContext ctx, GLenum type, const GLuint *coords)
 
 void mglObjectLabel(GLMContext ctx, GLenum identifier, GLuint name, GLsizei length, const GLchar *label)
 {
-	// Object label - no-op
-	(void)ctx;
-	(void)identifier;
-	(void)name;
-	(void)length;
-	(void)label;
+	if (!ctx) {
+		return;
+	}
+
+	if (identifier != GL_TEXTURE) {
+		/* Keep unsupported labels non-fatal; they are diagnostics only. */
+		return;
+	}
+
+	if (name == 0) {
+		STATE(error) = GL_INVALID_VALUE;
+		return;
+	}
+
+	Texture *tex = findTexture(ctx, name);
+	if (!tex) {
+		STATE(error) = GL_INVALID_VALUE;
+		return;
+	}
+
+	size_t max_len = sizeof(tex->debug_label) - 1u;
+	size_t copy_len = 0u;
+	if (label) {
+		if (length < 0) {
+			copy_len = strnlen(label, max_len);
+		} else {
+			copy_len = (size_t)length;
+			if (copy_len > max_len) {
+				copy_len = max_len;
+			}
+		}
+		if (copy_len > 0u) {
+			memcpy(tex->debug_label, label, copy_len);
+		}
+	}
+	tex->debug_label[copy_len] = '\0';
+	fprintf(stderr,
+	        "MGL TRACE ObjectLabel texture=%u label=\"%s\" length=%d stored=%zu\n",
+	        name,
+	        tex->debug_label,
+	        length,
+	        copy_len);
 }
 
 void mglObjectPtrLabel(GLMContext ctx, const void *ptr, GLsizei length, const GLchar *label)
@@ -1476,8 +1545,8 @@ void mglPauseTransformFeedback(GLMContext ctx)
 
 void mglPolygonOffsetClamp(GLMContext ctx, GLfloat factor, GLfloat units, GLfloat clamp)
 {
-	mgl_unimplemented(ctx, __FUNCTION__);
-	(void)ctx;
+	(void)clamp;
+	mglPolygonOffset(ctx, factor, units);
 }
 
 void mglPopDebugGroup(GLMContext ctx)

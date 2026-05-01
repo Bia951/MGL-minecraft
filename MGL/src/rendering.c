@@ -46,8 +46,71 @@ void mglClear(GLMContext ctx, GLbitfield mask)
         ERROR_RETURN(GL_INVALID_VALUE);
     }
 
+    Framebuffer *fbo = ctx->state.framebuffer;
     GLbitfield previousMask = ctx->state.clear_bitmask;
     ctx->state.clear_bitmask = mask;
+
+    if (mask & GL_COLOR_BUFFER_BIT)
+    {
+        if (fbo)
+        {
+            GLuint draw_index = 0;
+            GLuint draw_buffer = ctx->state.draw_buffer;
+            if (draw_buffer >= GL_COLOR_ATTACHMENT0 &&
+                draw_buffer < GL_COLOR_ATTACHMENT0 + ctx->state.max_color_attachments)
+            {
+                draw_index = draw_buffer - GL_COLOR_ATTACHMENT0;
+            }
+
+            for (GLuint i = 0; i < ctx->state.max_color_attachments; ++i)
+            {
+                if (fbo->color_attachment_bitfield & (1u << i))
+                {
+                    FBOAttachment *att = &fbo->color_attachments[i];
+                    att->clear_bitmask |= GL_COLOR_BUFFER_BIT;
+                    att->clear_color[0] = ctx->state.color_clear_value[0];
+                    att->clear_color[1] = ctx->state.color_clear_value[1];
+                    att->clear_color[2] = ctx->state.color_clear_value[2];
+                    att->clear_color[3] = ctx->state.color_clear_value[3];
+                }
+            }
+        }
+        else
+        {
+            ctx->state.default_fbo_clear_bitmask |= GL_COLOR_BUFFER_BIT;
+            ctx->state.default_clear_color[0] = ctx->state.color_clear_value[0];
+            ctx->state.default_clear_color[1] = ctx->state.color_clear_value[1];
+            ctx->state.default_clear_color[2] = ctx->state.color_clear_value[2];
+            ctx->state.default_clear_color[3] = ctx->state.color_clear_value[3];
+        }
+    }
+
+    if (mask & GL_DEPTH_BUFFER_BIT)
+    {
+        if (fbo)
+        {
+            fbo->depth.clear_bitmask |= GL_DEPTH_BUFFER_BIT;
+            fbo->depth.clear_color[0] = (GLfloat)ctx->state.var.depth_clear_value;
+        }
+        else
+        {
+            ctx->state.default_fbo_clear_bitmask |= GL_DEPTH_BUFFER_BIT;
+        }
+    }
+
+    if (mask & GL_STENCIL_BUFFER_BIT)
+    {
+        if (fbo)
+        {
+            fbo->stencil.clear_bitmask |= GL_STENCIL_BUFFER_BIT;
+            fbo->stencil.clear_color[0] = (GLfloat)ctx->state.var.stencil_clear_value;
+        }
+        else
+        {
+            ctx->state.default_fbo_clear_bitmask |= GL_STENCIL_BUFFER_BIT;
+        }
+    }
+
     if (mglShouldTraceClearCall(callCount)) {
         fprintf(stderr,
                 "MGL TRACE clear.set call=%llu mask=0x%x prevMask=0x%x drawBuf=0x%x readBuf=0x%x fbo=%p(%u) dirty=0x%x\n",
@@ -95,22 +158,40 @@ void mglClearBufferfv(GLMContext ctx, GLenum buffer, GLint drawbuffer, const GLf
 
     switch (buffer) {
         case GL_COLOR:
-            fboa = &fbo->color_attachments[drawbuffer];
-            fboa->clear_bitmask |= GL_COLOR_BUFFER_BIT;
-            fboa->clear_color[0] = value[0];
-            fboa->clear_color[1] = value[1];
-            fboa->clear_color[2] = value[2];
-            fboa->clear_color[3] = value[3];
+            if (fbo) {
+                fboa = &fbo->color_attachments[drawbuffer];
+                fboa->clear_bitmask |= GL_COLOR_BUFFER_BIT;
+                fboa->clear_color[0] = value[0];
+                fboa->clear_color[1] = value[1];
+                fboa->clear_color[2] = value[2];
+                fboa->clear_color[3] = value[3];
+            } else {
+                ctx->state.default_fbo_clear_bitmask |= GL_COLOR_BUFFER_BIT;
+                ctx->state.default_clear_color[0] = value[0];
+                ctx->state.default_clear_color[1] = value[1];
+                ctx->state.default_clear_color[2] = value[2];
+                ctx->state.default_clear_color[3] = value[3];
+            }
             break;
         case GL_DEPTH:
-            fboa = &fbo->depth;
-            fboa->clear_bitmask |= GL_DEPTH_BUFFER_BIT;
-            fboa->clear_color[0] = value[0];
+            if (fbo) {
+                fboa = &fbo->depth;
+                fboa->clear_bitmask |= GL_DEPTH_BUFFER_BIT;
+                fboa->clear_color[0] = value[0];
+            } else {
+                ctx->state.default_fbo_clear_bitmask |= GL_DEPTH_BUFFER_BIT;
+                ctx->state.var.depth_clear_value = (GLdouble)value[0];
+            }
             break;
         case GL_STENCIL:
-            fboa = &fbo->stencil;
-            fboa->clear_bitmask |= GL_STENCIL_BUFFER_BIT;
-            fboa->clear_color[0] = value[0];
+            if (fbo) {
+                fboa = &fbo->stencil;
+                fboa->clear_bitmask |= GL_STENCIL_BUFFER_BIT;
+                fboa->clear_color[0] = value[0];
+            } else {
+                ctx->state.default_fbo_clear_bitmask |= GL_STENCIL_BUFFER_BIT;
+                ctx->state.var.stencil_clear_value = (GLuint)value[0];
+            }
             break;
         default:
             fprintf(stderr, "MGL Error: mglClearBufferfv: invalid buffer 0x%x\n", buffer);
@@ -142,13 +223,19 @@ void mglClearBufferfi(GLMContext ctx, GLenum buffer, GLint drawbuffer, GLfloat d
 
     switch (buffer) {
         case GL_DEPTH_STENCIL:
-            fboa = &fbo->depth;
-            fboa->clear_bitmask |= GL_DEPTH_BUFFER_BIT;
-            fboa->clear_color[0] = depth;
+            if (fbo) {
+                fboa = &fbo->depth;
+                fboa->clear_bitmask |= GL_DEPTH_BUFFER_BIT;
+                fboa->clear_color[0] = depth;
 
-            fboa = &fbo->stencil;
-            fboa->clear_bitmask |= GL_STENCIL_BUFFER_BIT;
-            fboa->clear_color[0] = stencil;
+                fboa = &fbo->stencil;
+                fboa->clear_bitmask |= GL_STENCIL_BUFFER_BIT;
+                fboa->clear_color[0] = (GLfloat)stencil;
+            } else {
+                ctx->state.default_fbo_clear_bitmask |= GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT;
+                ctx->state.var.depth_clear_value = (GLdouble)depth;
+                ctx->state.var.stencil_clear_value = (GLuint)stencil;
+            }
             break;
         default:
             fprintf(stderr, "MGL Error: mglClearBufferfi: invalid buffer 0x%x\n", buffer);

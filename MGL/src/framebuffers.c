@@ -420,8 +420,14 @@ void mglGetRenderbufferParameteriv(GLMContext ctx, GLenum target, GLenum pname, 
 }
 
 #pragma mark Framebuffer Texture Bind calls
+static bool mglColorAttachmentIndex(GLMContext ctx, GLenum attachment, GLuint *index_out);
+
 FBOAttachment *getFBOAttachment(GLMContext ctx, Framebuffer *fbo, GLenum attachment)
 {
+    if (!ctx || !fbo) {
+        return NULL;
+    }
+
     switch(attachment)
     {
         case GL_DEPTH_ATTACHMENT:
@@ -434,9 +440,13 @@ FBOAttachment *getFBOAttachment(GLMContext ctx, Framebuffer *fbo, GLenum attachm
             break;
 
         default:
-            attachment = attachment - GL_COLOR_ATTACHMENT0;
-            return &fbo->color_attachments[attachment];
-            break;
+        {
+            GLuint index;
+            if (!mglColorAttachmentIndex(ctx, attachment, &index)) {
+                return NULL;
+            }
+            return &fbo->color_attachments[index];
+        }
     }
 }
 
@@ -444,6 +454,23 @@ bool isColorAttachment(GLMContext ctx, GLuint attachment)
 {
     return ((attachment >= GL_COLOR_ATTACHMENT0) &&
             (attachment < (GL_COLOR_ATTACHMENT0 + STATE(max_color_attachments))));
+}
+
+static bool mglColorAttachmentIndex(GLMContext ctx, GLenum attachment, GLuint *index_out)
+{
+    if (!ctx || attachment < GL_COLOR_ATTACHMENT0) {
+        return false;
+    }
+
+    GLuint index = attachment - GL_COLOR_ATTACHMENT0;
+    if (index >= STATE(max_color_attachments) || index >= MAX_COLOR_ATTACHMENTS) {
+        return false;
+    }
+
+    if (index_out) {
+        *index_out = index;
+    }
+    return true;
 }
 
 bool isCubeMapTarget(GLMContext ctx, GLuint textarget)
@@ -477,11 +504,10 @@ void framebufferTexture(GLMContext ctx, GLenum target, GLenum attachment_type, G
             break;
 
         default:
-            if (isColorAttachment(ctx, attachment))
+        {
+            GLuint index;
+            if (mglColorAttachmentIndex(ctx, attachment, &index))
             {
-                GLuint index;
-
-                index = attachment - GL_COLOR_ATTACHMENT0;
                 if (texture)
                 {
                     fbo->color_attachment_bitfield |= (0x1 << index);
@@ -493,7 +519,17 @@ void framebufferTexture(GLMContext ctx, GLenum target, GLenum attachment_type, G
                 break;
             }
 
-            assert(attachment < STATE(max_color_attachments));
+            fprintf(stderr,
+                    "MGL ERROR: framebufferTexture invalid attachment=0x%x maxColor=%u target=0x%x texture=%u textarget=0x%x level=%d\n",
+                    attachment,
+                    STATE(max_color_attachments),
+                    target,
+                    texture,
+                    textarget,
+                    level);
+            ERROR_RETURN(GL_INVALID_ENUM);
+            return;
+        }
     }
 
     if (texture)
@@ -616,6 +652,14 @@ void framebufferTexture(GLMContext ctx, GLenum target, GLenum attachment_type, G
     }
 
     fbo_attachment_ptr = getFBOAttachment(ctx, fbo, attachment);
+    if (!fbo_attachment_ptr) {
+        fprintf(stderr,
+                "MGL ERROR: framebufferTexture could not resolve attachment=0x%x fbo=%p\n",
+                attachment,
+                fbo);
+        ERROR_RETURN(GL_INVALID_OPERATION);
+        return;
+    }
 
     fbo_attachment_ptr->texture = texture;
     fbo_attachment_ptr->textarget = textarget;
@@ -634,6 +678,7 @@ void framebufferTexture(GLMContext ctx, GLenum target, GLenum attachment_type, G
     }
 
     fbo->dirty_bits |= DIRTY_FBO_BINDING;
+    STATE(dirty_bits) |= DIRTY_FBO;
 }
 
 /*
@@ -721,11 +766,10 @@ void mglFramebufferRenderbuffer(GLMContext ctx, GLenum target, GLenum attachment
             break;
 
         default:
-            if (isColorAttachment(ctx, attachment))
+        {
+            GLuint index;
+            if (mglColorAttachmentIndex(ctx, attachment, &index))
             {
-                GLuint index;
-
-                index = attachment - GL_COLOR_ATTACHMENT0;
                 if (renderbuffer)
                 {
                     fbo->color_attachment_bitfield |= (0x1 << index);
@@ -737,7 +781,15 @@ void mglFramebufferRenderbuffer(GLMContext ctx, GLenum target, GLenum attachment
                 break;
             }
 
-            assert(attachment < STATE(max_color_attachments));
+            fprintf(stderr,
+                    "MGL ERROR: mglFramebufferRenderbuffer invalid attachment=0x%x maxColor=%u target=0x%x renderbuffer=%u\n",
+                    attachment,
+                    STATE(max_color_attachments),
+                    target,
+                    renderbuffer);
+            ERROR_RETURN(GL_INVALID_ENUM);
+            return;
+        }
     }
 
     if (renderbuffer)
@@ -767,6 +819,7 @@ void mglFramebufferRenderbuffer(GLMContext ctx, GLenum target, GLenum attachment
     }
 
     fbo->dirty_bits |= DIRTY_FBO_BINDING;
+    STATE(dirty_bits) |= DIRTY_FBO;
 }
 
 #pragma mark =====

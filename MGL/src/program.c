@@ -803,6 +803,68 @@ static void clearStageCompileState(Program *pptr, int stage)
     }
 }
 
+static void alignFragmentInputLocationsToVertexOutputs(Program *pptr)
+{
+    if (!pptr ||
+        !pptr->spirv[_FRAGMENT_SHADER].msl_str ||
+        !pptr->spirv[_VERTEX_SHADER].msl_str) {
+        return;
+    }
+
+    SpirvResourceList *vertex_outputs =
+        &pptr->spirv_resources_list[_VERTEX_SHADER][SPVC_RESOURCE_TYPE_STAGE_OUTPUT];
+    SpirvResourceList *fragment_inputs =
+        &pptr->spirv_resources_list[_FRAGMENT_SHADER][SPVC_RESOURCE_TYPE_STAGE_INPUT];
+
+    if (!vertex_outputs->list || !fragment_inputs->list) {
+        return;
+    }
+
+    for (GLuint f = 0; f < fragment_inputs->count; f++) {
+        SpirvResource *fs_in = &fragment_inputs->list[f];
+        if (!fs_in->name || fs_in->name[0] == '\0') {
+            continue;
+        }
+
+        for (GLuint v = 0; v < vertex_outputs->count; v++) {
+            SpirvResource *vs_out = &vertex_outputs->list[v];
+            if (!vs_out->name || strcmp(fs_in->name, vs_out->name) != 0) {
+                continue;
+            }
+
+            if (fs_in->location == vs_out->location) {
+                break;
+            }
+
+            char from[256];
+            char to[256];
+            snprintf(from, sizeof(from), "%s [[user(locn%u)]]",
+                     fs_in->name, (unsigned)fs_in->location);
+            snprintf(to, sizeof(to), "%s [[user(locn%u)]]",
+                     fs_in->name, (unsigned)vs_out->location);
+
+            if (strstr(pptr->spirv[_FRAGMENT_SHADER].msl_str, from)) {
+                fprintf(stderr,
+                        "MGL IFACE FIX: program=%u fragment input %s loc %u -> %u to match vertex output\n",
+                        pptr->name,
+                        fs_in->name,
+                        (unsigned)fs_in->location,
+                        (unsigned)vs_out->location);
+                replace_all_substr(&pptr->spirv[_FRAGMENT_SHADER].msl_str, from, to);
+                fs_in->location = vs_out->location;
+            } else {
+                fprintf(stderr,
+                        "MGL IFACE WARNING: program=%u wanted to align %s loc %u -> %u but MSL pattern was not found\n",
+                        pptr->name,
+                        fs_in->name,
+                        (unsigned)fs_in->location,
+                        (unsigned)vs_out->location);
+            }
+            break;
+        }
+    }
+}
+
 static bool compileStageFromLinkedProgram(GLMContext ctx, Program *pptr, glslang_program_t *glsl_program, int stage)
 {
     const char *spirv_messages;
@@ -963,6 +1025,8 @@ void mglLinkProgram(GLMContext ctx, GLuint program)
         pptr->linked_glsl_program = NULL;
         return;
     }
+
+    alignFragmentInputLocationsToVertexOutputs(pptr);
 
     /* linked_glsl_program is used as a linked-state marker only. */
     pptr->linked_glsl_program = (glslang_program_t *)pptr;

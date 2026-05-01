@@ -28,6 +28,29 @@
 #if 0
 MTLPixelFormat mtlPixelFormatForGLFormatType(GLenum gl_format, GLenum gl_type)
 {
+    switch(gl_format)
+    {
+        case GL_DEPTH_COMPONENT16:
+            return MTLPixelFormatDepth16Unorm;
+
+        case GL_DEPTH_COMPONENT:
+        case GL_DEPTH_COMPONENT24:
+        case GL_DEPTH_COMPONENT32:
+        case GL_DEPTH_COMPONENT32F:
+            return MTLPixelFormatDepth32Float;
+
+        case GL_DEPTH_STENCIL:
+        case GL_DEPTH24_STENCIL8:
+        case GL_DEPTH32F_STENCIL8:
+            return MTLPixelFormatDepth32Float_Stencil8;
+
+        case GL_STENCIL_INDEX8:
+            return MTLPixelFormatStencil8;
+
+        default:
+            break;
+    }
+
     switch(gl_type)
     {
         case GL_UNSIGNED_BYTE:
@@ -199,7 +222,7 @@ MTLPixelFormat mtlFormatForGLInternalFormat(GLenum internal_format)
             return MTLPixelFormatDepth16Unorm;
 
         case GL_DEPTH_COMPONENT24:
-            return MTLPixelFormatInvalid;
+            return MTLPixelFormatDepth32Float;
 
         case GL_DEPTH_COMPONENT32:
             return MTLPixelFormatDepth32Float;
@@ -301,7 +324,7 @@ MTLPixelFormat mtlFormatForGLInternalFormat(GLenum internal_format)
             return MTLPixelFormatDepth32Float_Stencil8;
 
         case GL_DEPTH24_STENCIL8:
-            return MTLPixelFormatX24_Stencil8;
+            return MTLPixelFormatDepth32Float_Stencil8;
 
         case GL_STENCIL_INDEX1:
             return MTLPixelFormatInvalid;
@@ -541,4 +564,3 @@ MTLPixelFormat mtlPixelFormatForGLTex(Texture * tex)
 }
 
 #endif
-

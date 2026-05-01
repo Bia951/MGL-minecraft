@@ -1,0 +1,3 @@
+Premain-Class: mglprobe.TexProbeAgent
+Can-Redefine-Classes: false
+Can-Retransform-Classes: false

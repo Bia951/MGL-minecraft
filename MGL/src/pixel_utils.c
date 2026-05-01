@@ -1971,7 +1971,7 @@ MTLPixelFormat mtlFormatForGLInternalFormat(GLenum internal_format)
             return MTLPixelFormatRGBA8Uint;
 
         case GL_RGB8UI:
-            return MTLPixelFormatRGBA8Sint;
+            return MTLPixelFormatRGBA8Uint;
 
         case GL_RGBA32I:
             return MTLPixelFormatRGBA32Sint;
@@ -1986,10 +1986,10 @@ MTLPixelFormat mtlFormatForGLInternalFormat(GLenum internal_format)
             return MTLPixelFormatRGBA16Sint;
 
         case GL_RGBA8I:
-            return MTLPixelFormatRGBA8Uint;
+            return MTLPixelFormatRGBA8Sint;
 
         case GL_RGB8I:
-            return MTLPixelFormatRGBA8Uint;
+            return MTLPixelFormatRGBA8Sint;
 
         case GL_DEPTH_COMPONENT32F:
             return MTLPixelFormatDepth32Float;
@@ -2349,6 +2349,31 @@ MTLPixelFormat mtlFormatForGLInternalFormat(GLenum internal_format)
 
 MTLPixelFormat mtlPixelFormatForGLFormatType(GLenum gl_format, GLenum gl_type)
 {
+    switch(gl_format)
+    {
+        case GL_DEPTH_COMPONENT16:
+            return MTLPixelFormatDepth16Unorm;
+
+        case GL_DEPTH_COMPONENT:
+        case GL_DEPTH_COMPONENT24:
+        case GL_DEPTH_COMPONENT32:
+        case GL_DEPTH_COMPONENT32F:
+            // Metal has no portable pure D24 texture on Apple Silicon. Use D32F
+            // so default GL_DEPTH_COMPONENT24 contexts still get a depth target.
+            return MTLPixelFormatDepth32Float;
+
+        case GL_DEPTH_STENCIL:
+        case GL_DEPTH24_STENCIL8:
+        case GL_DEPTH32F_STENCIL8:
+            return MTLPixelFormatDepth32Float_Stencil8;
+
+        case GL_STENCIL_INDEX8:
+            return MTLPixelFormatStencil8;
+
+        default:
+            break;
+    }
+
     switch(gl_type)
     {
         case GL_UNSIGNED_BYTE:
@@ -2425,7 +2450,7 @@ MTLPixelFormat mtlPixelFormatForGLFormatType(GLenum gl_format, GLenum gl_type)
                 case GL_RG: return MTLPixelFormatRG32Float;
                 case GL_RGBA: return MTLPixelFormatRGBA32Float;
                 case GL_DEPTH_COMPONENT: return MTLPixelFormatDepth32Float;
-                case GL_DEPTH_STENCIL: return MTLPixelFormatDepth24Unorm_Stencil8;
+                case GL_DEPTH_STENCIL: return MTLPixelFormatDepth32Float_Stencil8;
 
                 default:
                     return 0;
@@ -2493,4 +2518,3 @@ MTLPixelFormat mtlPixelFormatForGLTex(Texture * tex)
 
     return mtl_format;
 }
-

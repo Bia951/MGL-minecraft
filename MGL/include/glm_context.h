@@ -223,6 +223,7 @@ typedef struct Buffer_t {
     GLsizeiptr last_write_size;
     const void *last_write_src_ptr;
     uint64_t last_write_src_hash;
+    void *mapped_ptr;
 } Buffer;
 
 typedef struct BufferBaseTarget_t {
@@ -336,6 +337,7 @@ typedef struct Texture_t {
     GLuint mipmap_levels;
     TextureFace faces[6];
     void    *mtl_data;
+    char debug_label[128];
 } Texture;
 
 typedef struct TextureUnit_t {
@@ -368,6 +370,7 @@ typedef struct VertexAttrib_t {
     GLuint  stride;
     GLuint  divisor;
     GLintptr  relativeoffset;
+    GLintptr  binding_offset;
     GLuint  buffer_bindingindex;
 } VertexAttrib;
 
@@ -443,6 +446,7 @@ typedef struct BufferMap_t {
     GLuint      attribute_mask;
     Buffer      *buf;
     GLintptr    offset;
+    GLsizeiptr  size;
 } BufferMap;
 
 typedef struct BufferMapList_t {
@@ -596,7 +600,12 @@ typedef struct {
     GLuint dirty_bits;
 
     // clear request clear_bitmask from glClear to Metal
+    // NOTE: clear_bitmask is deprecated - clears are recorded per-FBO/attachment
     GLbitfield  clear_bitmask;
+
+    // Default framebuffer clear state (used when framebuffer == NULL)
+    GLbitfield  default_fbo_clear_bitmask;
+    GLfloat     default_clear_color[4];
 
     // opengl state
 

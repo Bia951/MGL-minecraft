@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <stdio.h>
 
 #include <stdint.h>
 
@@ -112,6 +113,29 @@ GLMContext createGLMContext(GLenum format, GLenum type,
     // use a CGL context to read guestimates of gl params for installed GPU
     getMacOSDefaults(ctx);
 
+    if (STATE(max_color_attachments) == 0 ||
+        STATE(max_color_attachments) > MAX_COLOR_ATTACHMENTS ||
+        STATE(max_color_attachments) == 0x01010101u)
+    {
+        fprintf(stderr,
+                "MGL WARNING: GL_MAX_COLOR_ATTACHMENTS state value suspicious (%u), using fallback %u\n",
+                STATE(max_color_attachments),
+                MAX_COLOR_ATTACHMENTS);
+        STATE(max_color_attachments) = MAX_COLOR_ATTACHMENTS;
+    }
+    STATE(var.max_color_attachments) = STATE(max_color_attachments);
+
+    if (STATE(var.max_draw_buffers) == 0 ||
+        STATE(var.max_draw_buffers) > MAX_COLOR_ATTACHMENTS ||
+        STATE(var.max_draw_buffers) == 0x01010101u)
+    {
+        fprintf(stderr,
+                "MGL WARNING: GL_MAX_DRAW_BUFFERS state value suspicious (%u), using fallback %u\n",
+                STATE(var.max_draw_buffers),
+                MAX_COLOR_ATTACHMENTS);
+        STATE(var.max_draw_buffers) = MAX_COLOR_ATTACHMENTS;
+    }
+
     assert(STATE(max_color_attachments) <= MAX_COLOR_ATTACHMENTS);
     assert(STATE(max_vertex_attribs) <= MAX_ATTRIBS);
 
@@ -178,6 +202,8 @@ GLMContext createGLMContext(GLenum format, GLenum type,
     STATE(var.line_width) = 1.0f;
     STATE(var.point_size) = 1.0f;
     STATE(var.polygon_mode) = GL_FILL;
+    STATE(var.polygon_offset_factor) = 0.0f;
+    STATE(var.polygon_offset_units) = 0.0f;
 
     STATE(var.scissor_box[0]) = 0;
     STATE(var.scissor_box[1]) = 0;
@@ -209,6 +235,13 @@ GLMContext createGLMContext(GLenum format, GLenum type,
     STATE(color_clear_value[1]) = 0.0f;
     STATE(color_clear_value[2]) = 0.0f;
     STATE(color_clear_value[3]) = 1.0f;
+
+    // Initialize default FBO clear state
+    STATE(default_fbo_clear_bitmask) = 0;
+    STATE(default_clear_color[0]) = 0.0f;
+    STATE(default_clear_color[1]) = 0.0f;
+    STATE(default_clear_color[2]) = 0.0f;
+    STATE(default_clear_color[3]) = 1.0f;
 
     STATE(var.logic_op) = GL_COPY;
     STATE(var.stencil_func) = GL_ALWAYS;
@@ -330,11 +363,30 @@ void MGLget(GLMContext ctx, GLenum param, GLuint *data)
 
 void MGLswapBuffers(GLMContext ctx)
 {
+    static uint64_t s_mglSwapBuffersCalls = 0;
+    uint64_t call = ++s_mglSwapBuffersCalls;
+
     if (ctx == NULL)
         ctx = _ctx;
 
-    if (ctx == NULL)
+    if (ctx == NULL) {
+        if (call <= 20 || (call % 60) == 0) {
+            fprintf(stderr, "MGL TRACE MGLswapBuffers.entry call=%llu ctx=NULL\n",
+                    (unsigned long long)call);
+        }
         return;
+    }
+
+    if (call <= 20 || (call % 60) == 0) {
+        fprintf(stderr,
+                "MGL TRACE MGLswapBuffers.entry call=%llu ctx=%p mtlSwap=%p drawBuf=0x%x fbo=%p program=%u\n",
+                (unsigned long long)call,
+                (void *)ctx,
+                (void *)ctx->mtl_funcs.mtlSwapBuffers,
+                (unsigned)ctx->state.draw_buffer,
+                (void *)ctx->state.framebuffer,
+                (unsigned)ctx->state.program_name);
+    }
 
     ctx->mtl_funcs.mtlSwapBuffers(ctx);
 }

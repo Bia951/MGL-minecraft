@@ -49,6 +49,7 @@ static VertexArray *mglGetOrCreateDefaultVAO(GLMContext ctx)
             vao->attrib[i].stride = 0;
             vao->attrib[i].divisor = 0;
             vao->attrib[i].relativeoffset = 0;
+            vao->attrib[i].binding_offset = 0;
             vao->attrib[i].buffer_bindingindex = 0;
         }
 

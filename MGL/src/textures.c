@@ -23,9 +23,15 @@
 #include <mach/vm_map.h>
 #include <mach/mach_time.h>
 
+#include <errno.h>
+#include <execinfo.h>
 #include <inttypes.h>
+#include <signal.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <string.h>
+#include <unistd.h>
 
 #include <Accelerate/Accelerate.h>
 
@@ -105,6 +111,504 @@ static void mglDumpBytesToStderr(const char *label,
     }
 }
 
+static void mglDumpByteWindowToStderr(const char *label,
+                                      const uint8_t *bytes,
+                                      size_t total_length,
+                                      size_t requested_offset,
+                                      size_t window_length)
+{
+    if (!bytes || total_length == 0 || window_length == 0) {
+        fprintf(stderr,
+                "MGL DUMP %s unavailable base=%p total=%zu window=%zu\n",
+                label ? label : "window",
+                bytes,
+                total_length,
+                window_length);
+        return;
+    }
+
+    size_t offset = requested_offset;
+    if (offset >= total_length) {
+        offset = total_length - 1u;
+    }
+
+    if (offset + window_length > total_length) {
+        window_length = total_length - offset;
+    }
+
+    mglDumpBytesToStderr(label, bytes + offset, window_length, offset);
+}
+
+static uint64_t mglHashBytesSampled(const void *data, size_t len);
+
+static void mglDumpTextureUploadRowSamples(const char *prefix,
+                                           const uint8_t *bytes,
+                                           size_t total_length,
+                                           size_t pitch,
+                                           size_t row_bytes,
+                                           GLsizei width,
+                                           GLsizei height,
+                                           GLsizei depth,
+                                           size_t pixel_size)
+{
+    if (!prefix) {
+        prefix = "texSubImage.zeroProbe.row";
+    }
+
+    if (!bytes || total_length == 0u || pitch == 0u || row_bytes == 0u ||
+        width <= 0 || height <= 0 || depth <= 0) {
+        fprintf(stderr,
+                "MGL DUMP %s.rows unavailable base=%p total=%zu pitch=%zu rowBytes=%zu dims=%dx%dx%d pixelSize=%zu\n",
+                prefix,
+                bytes,
+                total_length,
+                pitch,
+                row_bytes,
+                width,
+                height,
+                depth,
+                pixel_size);
+        return;
+    }
+
+    const size_t h = (size_t)height;
+    const size_t d = (size_t)depth;
+    const size_t plane_pitch = pitch * h;
+    const size_t planes[2] = {0u, d > 1u ? (d / 2u) : 0u};
+    const size_t rows[7] = {
+        0u,
+        h > 1u ? 1u : 0u,
+        h > 2u ? 2u : 0u,
+        h / 2u,
+        h > 3u ? h - 3u : 0u,
+        h > 2u ? h - 2u : 0u,
+        h > 1u ? h - 1u : 0u
+    };
+
+    for (size_t pi = 0u; pi < (d > 1u ? 2u : 1u); pi++) {
+        size_t z = planes[pi];
+        if (z >= d) {
+            continue;
+        }
+
+        for (size_t ri = 0u; ri < 7u; ri++) {
+            size_t y = rows[ri];
+            if (y >= h) {
+                continue;
+            }
+
+            bool duplicate = false;
+            for (size_t prev = 0u; prev < ri; prev++) {
+                if (rows[prev] == y) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) {
+                continue;
+            }
+
+            size_t offset = z * plane_pitch + y * pitch;
+            if (offset >= total_length) {
+                fprintf(stderr,
+                        "MGL DUMP %s.row z=%zu y=%zu offset=%zu outside total=%zu\n",
+                        prefix,
+                        z,
+                        y,
+                        offset,
+                        total_length);
+                continue;
+            }
+
+            size_t available = total_length - offset;
+            size_t scan_len = row_bytes < available ? row_bytes : available;
+            size_t nonzero = 0u;
+            for (size_t i = 0u; i < scan_len; i++) {
+                if (bytes[offset + i] != 0u) {
+                    nonzero++;
+                }
+            }
+
+            uint32_t first_pixel = 0u;
+            size_t first_pixel_bytes = pixel_size < sizeof(first_pixel) ? pixel_size : sizeof(first_pixel);
+            if (first_pixel_bytes > 0u && available >= first_pixel_bytes) {
+                memcpy(&first_pixel, bytes + offset, first_pixel_bytes);
+            }
+
+            fprintf(stderr,
+                    "MGL DUMP %s.row z=%zu y=%zu offset=%zu pitch=%zu rowBytes=%zu scan=%zu nonZero=%zu hash=0x%016" PRIx64 " firstPixel=0x%08x\n",
+                    prefix,
+                    z,
+                    y,
+                    offset,
+                    pitch,
+                    row_bytes,
+                    scan_len,
+                    nonzero,
+                    mglHashBytesSampled(bytes + offset, scan_len),
+                    first_pixel);
+
+            char label[128];
+            snprintf(label, sizeof(label), "%s.row.z%zu.y%zu.first64", prefix, z, y);
+            mglDumpByteWindowToStderr(label, bytes, total_length, offset, 64u);
+        }
+    }
+}
+
+static void mglDumpTextureUploadSamples(Texture *tex,
+                                        GLuint face,
+                                        GLint level,
+                                        const uint8_t *src,
+                                        size_t src_total,
+                                        size_t src_pitch,
+                                        const uint8_t *dst,
+                                        size_t dst_total,
+                                        size_t dst_pitch,
+                                        size_t pixel_size,
+                                        GLsizei width,
+                                        GLsizei height,
+                                        GLsizei depth)
+{
+    size_t sample_len = 64u;
+    size_t src_center = 0u;
+    size_t dst_center = 0u;
+    size_t src_tail = src_total > sample_len ? src_total - sample_len : 0u;
+    size_t dst_tail = dst_total > sample_len ? dst_total - sample_len : 0u;
+
+    if (width > 0 && height > 0 && pixel_size > 0) {
+        size_t cx = (size_t)width / 2u;
+        size_t cy = (size_t)height / 2u;
+        size_t cz = depth > 1 ? (size_t)depth / 2u : 0u;
+        size_t src_plane = src_pitch * (size_t)MAX(height, 1);
+        size_t dst_plane = dst_pitch * (size_t)MAX(height, 1);
+
+        src_center = (cz * src_plane) + (cy * src_pitch) + (cx * pixel_size);
+        dst_center = (cz * dst_plane) + (cy * dst_pitch) + (cx * pixel_size);
+    }
+
+    fprintf(stderr,
+            "MGL DUMP texSubImage.zeroProbe.begin tex=%u face=%u level=%d dims=%dx%dx%d "
+            "src=%p srcTotal=%zu srcPitch=%zu dst=%p dstTotal=%zu dstPitch=%zu pixelSize=%zu\n",
+            tex ? tex->name : 0u,
+            face,
+            level,
+            width,
+            height,
+            depth,
+            src,
+            src_total,
+            src_pitch,
+            dst,
+            dst_total,
+            dst_pitch,
+            pixel_size);
+
+    mglDumpByteWindowToStderr("texSubImage.zeroProbe.src.first64", src, src_total, 0u, sample_len);
+    mglDumpByteWindowToStderr("texSubImage.zeroProbe.src.center64", src, src_total, src_center, sample_len);
+    mglDumpByteWindowToStderr("texSubImage.zeroProbe.src.tail64", src, src_total, src_tail, sample_len);
+    mglDumpByteWindowToStderr("texSubImage.zeroProbe.dst.first64", dst, dst_total, 0u, sample_len);
+    mglDumpByteWindowToStderr("texSubImage.zeroProbe.dst.center64", dst, dst_total, dst_center, sample_len);
+    mglDumpByteWindowToStderr("texSubImage.zeroProbe.dst.tail64", dst, dst_total, dst_tail, sample_len);
+
+    size_t row_bytes = 0u;
+    if (width > 0 && pixel_size > 0u) {
+        row_bytes = (size_t)width * pixel_size;
+    }
+    if (row_bytes > 0u) {
+        mglDumpTextureUploadRowSamples("texSubImage.zeroProbe.src",
+                                       src,
+                                       src_total,
+                                       src_pitch,
+                                       row_bytes,
+                                       width,
+                                       height,
+                                       depth,
+                                       pixel_size);
+        mglDumpTextureUploadRowSamples("texSubImage.zeroProbe.dst",
+                                       dst,
+                                       dst_total,
+                                       dst_pitch,
+                                       row_bytes,
+                                       width,
+                                       height,
+                                       depth,
+                                       pixel_size);
+    }
+
+    fprintf(stderr,
+            "MGL DUMP texSubImage.zeroProbe.end tex=%u\n",
+            tex ? tex->name : 0u);
+}
+
+static const char *mglTextureInitSourceName(GLuint source)
+{
+    switch ((MGLTexLevelInitSource)source) {
+        case kTexInitNone: return "none";
+        case kTexImageNull: return "TexImage(NULL)";
+        case kTexImageCopy: return "TexImage(copy)";
+        case kTexSubImageCPU: return "TexSubImage(CPU)";
+        case kTexSubImagePBO: return "TexSubImage(PBO)";
+        default: return "unknown";
+    }
+}
+
+static const char *mglBufferInitSourceName(MGLBufferInitSource source)
+{
+    switch (source) {
+        case kInitNone: return "none";
+        case kInitBufferDataNull: return "BufferData(NULL)";
+        case kInitBufferDataCopy: return "BufferData(copy)";
+        case kInitBufferSubData: return "BufferSubData";
+        case kInitCopyBufferSubData: return "CopyBufferSubData";
+        case kInitMapWrite: return "MapWrite";
+        default: return "unknown";
+    }
+}
+
+static void mglDumpNativeBacktraceToStderr(const char *tag, size_t max_frames)
+{
+    const char *safe_tag = tag ? tag : "backtrace";
+    void *frames[64];
+    int limit = (int)(max_frames > 64u ? 64u : max_frames);
+    if (limit <= 0) {
+        limit = 1;
+    }
+
+    int count = backtrace(frames, limit);
+    char **symbols = backtrace_symbols(frames, count);
+
+    fprintf(stderr,
+            "MGL TRACE %s nativeBacktrace frames=%d\n",
+            safe_tag,
+            count);
+
+    for (int i = 0; i < count; i++) {
+        fprintf(stderr,
+                "MGL TRACE %s bt[%02d]=%s\n",
+                safe_tag,
+                i,
+                symbols ? symbols[i] : "(symbol unavailable)");
+    }
+
+    if (symbols) {
+        free(symbols);
+    }
+}
+
+static void mglRequestJavaThreadDumpForZeroCpuUpload(Texture *tex,
+                                                     GLuint face,
+                                                     GLint level,
+                                                     GLsizei width,
+                                                     GLsizei height,
+                                                     GLsizei depth,
+                                                     uint64_t warning_id)
+{
+    static int s_requested_512_zero_cpu_thread_dump = 0;
+
+    /*
+     * HotSpot treats SIGQUIT as "print all Java thread stacks" instead of a
+     * fatal signal.  This gives us symbolic Minecraft/LWJGL frames for the JIT
+     * addresses shown by native backtrace_symbols().
+     */
+    if (s_requested_512_zero_cpu_thread_dump ||
+        width != 512 ||
+        height != 512 ||
+        depth != 1) {
+        return;
+    }
+
+    if (getenv("MGL_DISABLE_ZERO_UPLOAD_JAVA_STACK")) {
+        fprintf(stderr,
+                "MGL TRACE texSubImage.zeroCPU javaThreadDump skipped by MGL_DISABLE_ZERO_UPLOAD_JAVA_STACK tex=%u warn=%" PRIu64 "\n",
+                tex ? tex->name : 0u,
+                warning_id);
+        s_requested_512_zero_cpu_thread_dump = 1;
+        return;
+    }
+
+    s_requested_512_zero_cpu_thread_dump = 1;
+    errno = 0;
+    int rc = kill(getpid(), SIGQUIT);
+
+    fprintf(stderr,
+            "MGL TRACE texSubImage.zeroCPU javaThreadDump request rc=%d errno=%d (%s) tex=%u face=%u level=%d dims=%dx%dx%d warn=%" PRIu64 "\n",
+            rc,
+            errno,
+            strerror(errno),
+            tex ? tex->name : 0u,
+            face,
+            level,
+            width,
+            height,
+            depth,
+            warning_id);
+}
+
+static void mglDumpTexSubImageZeroCpuResourceTag(GLMContext ctx,
+                                                 Texture *tex,
+                                                 TextureLevel *lvl,
+                                                 GLuint face,
+                                                 GLint level,
+                                                 GLint xoffset,
+                                                 GLint yoffset,
+                                                 GLint zoffset,
+                                                 GLsizei width,
+                                                 GLsizei height,
+                                                 GLsizei depth,
+                                                 GLenum format,
+                                                 GLenum type,
+                                                 const void *pixels_raw,
+                                                 const uint8_t *resolved_src,
+                                                 Buffer *resolved_unpack_buf,
+                                                 size_t required_bytes,
+                                                 size_t compact_upload_bytes,
+                                                 size_t src_pitch,
+                                                 size_t compact_upload_row_bytes,
+                                                 size_t pixel_size,
+                                                 uint64_t warning_id)
+{
+    GLuint active_unit = ctx ? ctx->state.active_texture : 0u;
+    Texture *active_tex = NULL;
+    Texture *bound_2d = NULL;
+    Texture *bound_cube = NULL;
+    Texture *bound_2d_array = NULL;
+    Sampler *bound_sampler = NULL;
+    Buffer *unpack = NULL;
+    unsigned mask_word = 0u;
+    GLuint program_name = 0u;
+
+    if (ctx) {
+        program_name = ctx->state.program_name;
+        unpack = ctx->state.buffers[_PIXEL_UNPACK_BUFFER];
+        if (active_unit < TEXTURE_UNITS) {
+            active_tex = ctx->state.active_textures[active_unit];
+            bound_2d = ctx->state.texture_units[active_unit].textures[_TEXTURE_2D];
+            bound_cube = ctx->state.texture_units[active_unit].textures[_TEXTURE_CUBE_MAP];
+            bound_2d_array = ctx->state.texture_units[active_unit].textures[_TEXTURE_2D_ARRAY];
+            bound_sampler = ctx->state.texture_samplers[active_unit];
+            mask_word = ctx->state.active_texture_mask[active_unit / 32u];
+        }
+    }
+
+    fprintf(stderr,
+            "MGL ZERO CPU UPLOAD resource warn=%" PRIu64 " tex=%u texPtr=%p target=0x%x index=%u face=%u level=%d "
+            "label=\"%s\" dims=%dx%dx%d off=(%d,%d,%d) fmt=0x%x type=0x%x internal=0x%x base=%ux%ux%u levels=%u complete=%d "
+            "mtl=%p pixelsRaw=%p resolvedSrc=%p resolvedUnpack=%u\n",
+            warning_id,
+            tex ? tex->name : 0u,
+            (void *)tex,
+            tex ? tex->target : 0u,
+            tex ? tex->index : 0u,
+            face,
+            level,
+            (tex && tex->debug_label[0] != '\0') ? tex->debug_label : "(none)",
+            width,
+            height,
+            depth,
+            xoffset,
+            yoffset,
+            zoffset,
+            format,
+            type,
+            tex ? tex->internalformat : 0u,
+            tex ? tex->width : 0u,
+            tex ? tex->height : 0u,
+            tex ? tex->depth : 0u,
+            tex ? tex->num_levels : 0u,
+            tex ? tex->complete : 0,
+            tex ? tex->mtl_data : NULL,
+            pixels_raw,
+            resolved_src,
+            resolved_unpack_buf ? resolved_unpack_buf->name : 0u);
+
+    fprintf(stderr,
+            "MGL ZERO CPU UPLOAD state warn=%" PRIu64 " program=%u activeUnit=%u activeTex=%u tex2D=%u cube=%u tex2DArray=%u "
+            "sampler=%u maskWord=0x%x unpackBuffer=%u unpackPtr=%p unpackSize=%lld unpackWritten=%d unpackRange=[%lld,%lld) "
+            "unpackSource=%s rowLength=%d imageHeight=%d alignment=%d skipPixels=%d skipRows=%d skipImages=%d "
+            "required=%zu compact=%zu srcPitch=%zu compactRow=%zu pixelSize=%zu\n",
+            warning_id,
+            program_name,
+            active_unit,
+            active_tex ? active_tex->name : 0u,
+            bound_2d ? bound_2d->name : 0u,
+            bound_cube ? bound_cube->name : 0u,
+            bound_2d_array ? bound_2d_array->name : 0u,
+            bound_sampler ? bound_sampler->name : 0u,
+            mask_word,
+            unpack ? unpack->name : 0u,
+            (void *)unpack,
+            unpack ? (long long)unpack->size : 0ll,
+            unpack ? unpack->ever_written : 0,
+            unpack ? (long long)unpack->written_min : -1ll,
+            unpack ? (long long)unpack->written_max : -1ll,
+            unpack ? mglBufferInitSourceName(unpack->last_init_source) : "none",
+            ctx ? ctx->state.unpack.row_length : 0,
+            ctx ? ctx->state.unpack.image_height : 0,
+            ctx ? ctx->state.unpack.alignment : 0,
+            ctx ? ctx->state.unpack.skip_pixels : 0,
+            ctx ? ctx->state.unpack.skip_rows : 0,
+            ctx ? ctx->state.unpack.skip_images : 0,
+            required_bytes,
+            compact_upload_bytes,
+            src_pitch,
+            compact_upload_row_bytes,
+            pixel_size);
+
+    if (lvl) {
+        fprintf(stderr,
+                "MGL ZERO CPU UPLOAD level warn=%" PRIu64 " tex=%u face=%u level=%d levelComplete=%d levelSize=%ux%ux%u "
+                "pitch=%zu dataSize=%zu data=%p ever=%d initialized=%d suspicious=%d lastSource=%s lastUpload=%zu "
+                "lastSrc=%p lastHash=0x%016" PRIx64 "\n",
+                warning_id,
+                tex ? tex->name : 0u,
+                face,
+                level,
+                lvl->complete,
+                lvl->width,
+                lvl->height,
+                lvl->depth,
+                lvl->pitch,
+                lvl->data_size,
+                (void *)(uintptr_t)lvl->data,
+                lvl->ever_written,
+                lvl->has_initialized_data,
+                lvl->suspicious_zero_upload,
+                mglTextureInitSourceName(lvl->last_init_source),
+                lvl->last_upload_size,
+                lvl->last_src_ptr,
+                lvl->last_src_hash);
+    }
+
+    if (ctx && tex) {
+        unsigned printed = 0u;
+        for (GLuint unit = 0; unit < TEXTURE_UNITS; unit++) {
+            Texture *unit_active = ctx->state.active_textures[unit];
+            Texture *unit_2d = ctx->state.texture_units[unit].textures[_TEXTURE_2D];
+            Texture *unit_cube = ctx->state.texture_units[unit].textures[_TEXTURE_CUBE_MAP];
+            Texture *unit_2d_array = ctx->state.texture_units[unit].textures[_TEXTURE_2D_ARRAY];
+            if (unit_active == tex || unit_2d == tex || unit_cube == tex || unit_2d_array == tex) {
+                fprintf(stderr,
+                        "MGL ZERO CPU UPLOAD boundUnit warn=%" PRIu64 " unit=%u active=%u tex2D=%u cube=%u tex2DArray=%u sampler=%u\n",
+                        warning_id,
+                        unit,
+                        unit_active ? unit_active->name : 0u,
+                        unit_2d ? unit_2d->name : 0u,
+                        unit_cube ? unit_cube->name : 0u,
+                        unit_2d_array ? unit_2d_array->name : 0u,
+                        ctx->state.texture_samplers[unit] ? ctx->state.texture_samplers[unit]->name : 0u);
+                printed++;
+                if (printed >= 8u) {
+                    fprintf(stderr,
+                            "MGL ZERO CPU UPLOAD boundUnit warn=%" PRIu64 " truncated after %u matching units\n",
+                            warning_id,
+                            printed);
+                    break;
+                }
+            }
+        }
+    }
+}
+
 static uint64_t mglHashBytesSampled(const void *data, size_t len)
 {
     if (!data || len == 0) {
@@ -145,6 +649,66 @@ static bool mglLooksAllZero(const uint8_t *bytes, size_t len)
         }
     }
     return true;
+}
+
+static bool mglLooksAllZeroSampled(const uint8_t *bytes, size_t len)
+{
+    size_t probe;
+    size_t mid;
+    size_t tail;
+
+    if (!bytes || len == 0) {
+        return false;
+    }
+
+    probe = len < 256u ? len : 256u;
+    if (probe < 64u) {
+        return false;
+    }
+
+    if (!mglLooksAllZero(bytes, probe)) {
+        return false;
+    }
+
+    if (len <= probe) {
+        return true;
+    }
+
+    mid = len / 2u;
+    if (mid + probe > len) {
+        mid = len - probe;
+    }
+    if (!mglLooksAllZero(bytes + mid, probe)) {
+        return false;
+    }
+
+    tail = len - probe;
+    if (tail != 0u && tail != mid && !mglLooksAllZero(bytes + tail, probe)) {
+        return false;
+    }
+
+    return true;
+}
+
+static bool mglFindFirstNonZeroByte(const uint8_t *bytes, size_t len, size_t *offset_out, uint8_t *value_out)
+{
+    if (!bytes || len == 0) {
+        return false;
+    }
+
+    for (size_t i = 0; i < len; i++) {
+        if (bytes[i] != 0u) {
+            if (offset_out) {
+                *offset_out = i;
+            }
+            if (value_out) {
+                *value_out = bytes[i];
+            }
+            return true;
+        }
+    }
+
+    return false;
 }
 
 static bool mglShouldTraceTextureUpload(Texture *tex,
@@ -249,7 +813,7 @@ static void mglHandleProxyTexImageQuery(GLMContext ctx,
     proxy_state->depth = ok ? depth : 0;
     proxy_state->internalformat = ok ? internalformat : 0;
 
-    if (MGL_VERBOSE_TEXTURE_UPLOAD_LOGS) {
+    if (MGL_VERBOSE_TEXTURE_UPLOAD_LOGS || target == GL_PROXY_TEXTURE_2D) {
         fprintf(stderr,
                 "MGL PROXY TEX query target=0x%x ok=%d req=%dx%dx%d level=%d border=%d max=%d\n",
                 target,
@@ -291,6 +855,7 @@ static bool mglResolveTexSubImageSource(GLMContext ctx,
     const uint8_t *resolved_src = NULL;
     uintptr_t raw_value = (uintptr_t)pixels_raw;
     uint64_t src_hash = 0ull;
+    bool source_range_is_bounded = false;
 
     if (unpack_buf) {
         if (unpack_buf->mapped) {
@@ -350,8 +915,16 @@ static bool mglResolveTexSubImageSource(GLMContext ctx,
         }
 
         resolved_src = pbo_data + effective_off;
+        source_range_is_bounded = true;
     } else {
         if (pixels_raw) {
+            if (raw_value < 4096u) {
+                fprintf(stderr,
+                        "MGL ERROR: texSubImage source resolve: CPU source pointer looks like offset/raw integer raw=%p skipOff=%zu\n",
+                        pixels_raw,
+                        skip_offset_bytes);
+                ERROR_RETURN_VALUE(GL_INVALID_OPERATION, false);
+            }
             uintptr_t effective_raw = raw_value + (uintptr_t)skip_offset_bytes;
             if (effective_raw < raw_value) {
                 fprintf(stderr,
@@ -366,14 +939,20 @@ static bool mglResolveTexSubImageSource(GLMContext ctx,
         }
     }
 
-    if (resolved_src) {
+    /*
+     * Only PBO-backed uploads give us a known readable range.  For CPU pointers
+     * we cannot prove the mapped allocation is at least required_bytes long;
+     * probing head/mid/tail for diagnostics can SIGBUS before the real upload
+     * path gets a chance to validate/copy row-by-row.
+     */
+    if (resolved_src && source_range_is_bounded) {
         src_hash = mglHashBytesSampled(resolved_src, required_bytes);
     }
 
     if (trace_upload) {
         fprintf(stderr,
                 "MGL TRACE TexSubImage.source tex=%u target=0x%x face=%u level=%d fmt=0x%x type=0x%x "
-                "dims=%dx%dx%d off=(%d,%d,%d) unpackBufferName=%u pixelsRaw=%p resolvedSrcPtr=%p "
+                "label=\"%s\" dims=%dx%dx%d off=(%d,%d,%d) unpackBufferName=%u pixelsRaw=%p resolvedSrcPtr=%p "
                 "sourceClass=%s rowLength=%d alignment=%d skipPixels=%d skipRows=%d skipImages=%d skipOffsetBytes=%zu requiredBytes=%zu srcHash=0x%016" PRIx64 "\n",
                 tex ? tex->name : 0u,
                 tex ? tex->target : 0u,
@@ -381,6 +960,7 @@ static bool mglResolveTexSubImageSource(GLMContext ctx,
                 level,
                 format,
                 type,
+                (tex && tex->debug_label[0] != '\0') ? tex->debug_label : "(none)",
                 width,
                 height,
                 depth,
@@ -401,7 +981,7 @@ static bool mglResolveTexSubImageSource(GLMContext ctx,
                 src_hash);
     }
 
-    if (resolved_src) {
+    if (resolved_src && source_range_is_bounded) {
         size_t dump_len = required_bytes;
         if (dump_len > 32u) {
             dump_len = 32u;
@@ -414,20 +994,30 @@ static bool mglResolveTexSubImageSource(GLMContext ctx,
             mglDumpBytesToStderr("TexSubImage.source.head32", resolved_src, dump_len, 0u);
         }
 
-        size_t zero_probe_len = required_bytes;
-        if (zero_probe_len > 256u) {
-            zero_probe_len = 256u;
-        }
-        if (trace_upload && zero_probe_len >= 64u && mglLooksAllZero(resolved_src, zero_probe_len)) {
+        if (trace_upload && mglLooksAllZeroSampled(resolved_src, required_bytes)) {
+            size_t first_nonzero = 0u;
+            uint8_t first_value = 0u;
+            bool has_nonzero = mglFindFirstNonZeroByte(resolved_src, required_bytes, &first_nonzero, &first_value);
             fprintf(stderr,
-                    "MGL WARNING: TexSubImage source resolved but first %zu bytes are all zero "
-                    "(tex=%u target=0x%x unpack=%u raw=%p resolved=%p)\n",
-                    zero_probe_len,
+                    "MGL WARNING: TexSubImage source sampled head/mid/tail chunks are all zero "
+                    "(tex=%u target=0x%x unpack=%u raw=%p resolved=%p required=%zu fullZero=%d firstNonZero=0x%zx value=0x%02x)\n",
                     tex ? tex->name : 0u,
                     tex ? tex->target : 0u,
                     unpack_name,
                     pixels_raw,
-                    resolved_src);
+                    resolved_src,
+                    required_bytes,
+                    has_nonzero ? 0 : 1,
+                    has_nonzero ? first_nonzero : 0u,
+                    has_nonzero ? first_value : 0u);
+            if (has_nonzero) {
+                size_t dump_offset = first_nonzero;
+                size_t dump_available = required_bytes - first_nonzero;
+                if (dump_available > 64u) {
+                    dump_available = 64u;
+                }
+                mglDumpBytesToStderr("TexSubImage.source.firstNonZero", resolved_src + dump_offset, dump_available, dump_offset);
+            }
         }
     }
 
@@ -620,6 +1210,63 @@ Texture *findTexture(GLMContext ctx, GLuint texture)
     return ptr;
 }
 
+static inline GLuint mglTraceTextureNameC(Texture *tex)
+{
+    return tex ? tex->name : 0u;
+}
+
+static void mglTraceTextureUnitState(GLMContext ctx,
+                                     const char *api,
+                                     GLuint unit,
+                                     GLenum target,
+                                     GLuint texture,
+                                     Texture *bound)
+{
+    static uint64_t s_texture_unit_trace_count = 0;
+
+    if (!ctx || unit >= TEXTURE_UNITS) {
+        return;
+    }
+
+    Texture *unit_active = STATE(active_textures[unit]);
+    Texture *unit_2d = STATE(texture_units[unit].textures[_TEXTURE_2D]);
+    Texture *unit_cube = STATE(texture_units[unit].textures[_TEXTURE_CUBE_MAP]);
+
+    bool interesting =
+        unit == 0 ||
+        texture == 0 ||
+        texture == 10 ||
+        texture == 13 ||
+        texture == 4231 ||
+        mglTraceTextureNameC(unit_active) == 4231 ||
+        mglTraceTextureNameC(unit_2d) == 4231 ||
+        mglTraceTextureNameC(unit_cube) == 10;
+
+    if (!interesting) {
+        return;
+    }
+
+    uint64_t hit = ++s_texture_unit_trace_count;
+    if (hit > 512 && (hit % 512) != 0) {
+        return;
+    }
+
+    fprintf(stderr,
+            "MGL TRACE TexUnit.%s hit=%llu unit=%u activeUnit=%u target=0x%x texture=%u bound=%u "
+            "state(active=%u tex2D=%u cube=%u maskWord=0x%x)\n",
+            api ? api : "?",
+            (unsigned long long)hit,
+            unit,
+            STATE(active_texture),
+            target,
+            texture,
+            mglTraceTextureNameC(bound),
+            mglTraceTextureNameC(unit_active),
+            mglTraceTextureNameC(unit_2d),
+            mglTraceTextureNameC(unit_cube),
+            STATE(active_texture_mask[unit / 32]));
+}
+
 Texture *getTex(GLMContext ctx, GLuint name, GLenum target)
 {
     GLuint index;
@@ -805,9 +1452,18 @@ void mglBindTexture(GLMContext ctx, GLenum target, GLuint texture)
     }
 
     active_texture = STATE(active_texture);
+    if (active_texture >= TEXTURE_UNITS) {
+        fprintf(stderr,
+                "MGL ERROR: mglBindTexture active unit out of range unit=%u target=0x%x texture=%u\n",
+                active_texture,
+                target,
+                texture);
+        ERROR_RETURN(GL_INVALID_OPERATION);
+        return;
+    }
 
     GLuint mask_index = active_texture / 32;
-    GLuint mask = (0x1 << active_texture);
+    GLuint mask = (1u << (active_texture % 32u));
 
     if (ptr)
     {
@@ -821,6 +1477,8 @@ void mglBindTexture(GLMContext ctx, GLenum target, GLuint texture)
     STATE(active_textures[active_texture]) = ptr;
     STATE(texture_units[active_texture].textures[index]) = ptr;
     STATE(dirty_bits) |= DIRTY_TEX;
+
+    mglTraceTextureUnitState(ctx, "BindTexture", active_texture, target, texture, ptr);
 }
 
 void mglBindImageTexture(GLMContext ctx, GLuint unit, GLuint texture, GLint level, GLboolean layered, GLint layer, GLenum access, GLenum internalformat)
@@ -1009,13 +1667,28 @@ void mglActiveTexture(GLMContext ctx, GLenum texture)
 
     STATE(active_texture) = unit;
     ctx->state.dirty_bits |= DIRTY_TEX_BINDING;
+    mglTraceTextureUnitState(ctx, "ActiveTexture", unit, 0, 0, STATE(active_textures[unit]));
 }
 
 void mglBindTextures(GLMContext ctx, GLuint first, GLsizei count, const GLuint *textures)
 {
+    GLuint old_active_texture;
+
+    if (!ctx || count <= 0) {
+        return;
+    }
+
+    if (first >= TEXTURE_UNITS || (GLuint)count > TEXTURE_UNITS - first) {
+        ERROR_RETURN(GL_INVALID_VALUE);
+        return;
+    }
+
+    old_active_texture = STATE(active_texture);
+
     for (int i=0; i < count; i++)
     {
         GLuint texture;
+        GLuint unit = first + (GLuint)i;
 
         if (textures == NULL)
         {
@@ -1026,48 +1699,98 @@ void mglBindTextures(GLMContext ctx, GLuint first, GLsizei count, const GLuint *
             texture = textures[i];
         }
 
-        STATE(active_texture) = first + i - GL_TEXTURE0;
-
         if (texture != 0)
         {
             Texture *ptr;
-            GLenum target;
+            GLuint index;
 
-            ptr = findTexture(ctx, textures[i]);
-            assert(ptr);
+            ptr = findTexture(ctx, texture);
+            if (!ptr) {
+                fprintf(stderr,
+                        "MGL ERROR: mglBindTextures unknown texture=%u unit=%u first=%u count=%d\n",
+                        texture,
+                        unit,
+                        first,
+                        count);
+                ERROR_RETURN(GL_INVALID_OPERATION);
+                STATE(active_texture) = old_active_texture;
+                return;
+            }
 
-            target = ptr->target;
+            index = ptr->index;
+            if (index >= _MAX_TEXTURE_TYPES) {
+                ERROR_RETURN(GL_INVALID_OPERATION);
+                STATE(active_texture) = old_active_texture;
+                return;
+            }
 
-            mglBindTexture(ctx, target, textures[i]);
+            STATE(texture_units[unit].textures[index]) = ptr;
+            STATE(active_textures[unit]) = ptr;
+            STATE(active_texture_mask[unit / 32]) |= (1u << (unit % 32u));
+            mglTraceTextureUnitState(ctx, "BindTextures", unit, ptr->target, texture, ptr);
         }
         else
         {
-            for(GLenum target=0; target<_MAX_TEXTURE_TYPES; target++)
+            for(GLuint index=0; index<_MAX_TEXTURE_TYPES; index++)
             {
-                mglBindTexture(ctx, target, 0);
+                STATE(texture_units[unit].textures[index]) = NULL;
             }
+            STATE(active_textures[unit]) = NULL;
+            STATE(active_texture_mask[unit / 32]) &= ~(1u << (unit % 32u));
+            mglTraceTextureUnitState(ctx, "BindTextures.unbind", unit, 0, 0, NULL);
         }
     }
 
+    STATE(active_texture) = old_active_texture;
+    STATE(dirty_bits) |= DIRTY_TEX | DIRTY_TEX_BINDING;
 }
 
 void mglBindTextureUnit(GLMContext ctx, GLuint unit, GLuint texture)
 {
-    // bind texture without changing the current active unit
-    // my guess
-
     Texture *ptr;
-    GLenum target;
+    GLuint index;
+
+    if (!ctx) {
+        return;
+    }
+
+    if (unit >= TEXTURE_UNITS) {
+        ERROR_RETURN(GL_INVALID_VALUE);
+        return;
+    }
+
+    if (texture == 0) {
+        for (index = 0; index < _MAX_TEXTURE_TYPES; index++) {
+            STATE(texture_units[unit].textures[index]) = NULL;
+        }
+        STATE(active_textures[unit]) = NULL;
+        STATE(active_texture_mask[unit / 32]) &= ~(1u << (unit % 32u));
+        STATE(dirty_bits) |= DIRTY_TEX | DIRTY_TEX_BINDING;
+        mglTraceTextureUnitState(ctx, "BindTextureUnit.unbind", unit, 0, 0, NULL);
+        return;
+    }
 
     ptr = findTexture(ctx, texture);
-    assert(ptr);
+    if (!ptr) {
+        fprintf(stderr,
+                "MGL ERROR: mglBindTextureUnit unknown texture=%u unit=%u\n",
+                texture,
+                unit);
+        ERROR_RETURN(GL_INVALID_OPERATION);
+        return;
+    }
 
-    unit = unit - GL_TEXTURE0;
-    assert(unit < TEXTURE_UNITS);
+    index = ptr->index;
+    if (index >= _MAX_TEXTURE_TYPES) {
+        ERROR_RETURN(GL_INVALID_OPERATION);
+        return;
+    }
 
-    target = ptr->target;
-
-    STATE(texture_units[unit].textures[target]) = ptr;
+    STATE(texture_units[unit].textures[index]) = ptr;
+    STATE(active_textures[unit]) = ptr;
+    STATE(active_texture_mask[unit / 32]) |= (1u << (unit % 32u));
+    STATE(dirty_bits) |= DIRTY_TEX | DIRTY_TEX_BINDING;
+    mglTraceTextureUnitState(ctx, "BindTextureUnit", unit, ptr->target, texture, ptr);
 }
 
 void generateMipmaps(GLMContext ctx, GLuint texture, GLenum target)
@@ -1166,7 +1889,7 @@ void initBaseTexLevel(GLMContext ctx, Texture *tex, GLint internalformat, GLsize
     for(int face=0; face<_CUBE_MAP_MAX_FACE; face++)
     {
         // CRITICAL SECURITY FIX: Prevent integer overflow in mipmap allocation
-        if (tex->mipmap_levels > SIZE_MAX / sizeof(TextureLevel)) {
+        if ((size_t)tex->mipmap_levels > SIZE_MAX / sizeof(TextureLevel)) {
             fprintf(stderr, "MGL SECURITY ERROR: Mipmap levels %d would cause allocation overflow\n", tex->mipmap_levels);
             // CRITICAL FIX: Handle gracefully instead of crashing
             STATE(error) = GL_OUT_OF_MEMORY;
@@ -1200,12 +1923,85 @@ void initBaseTexLevel(GLMContext ctx, Texture *tex, GLint internalformat, GLsize
     }
 }
 
+static bool ensureTextureLevelCapacity(GLMContext ctx, Texture *tex, GLuint required_levels)
+{
+    TextureLevel *new_levels[_CUBE_MAP_MAX_FACE] = {0};
+    GLuint new_capacity;
+
+    if (!ctx || !tex || required_levels == 0)
+        return false;
+
+    if (required_levels <= tex->mipmap_levels) {
+        for (int face = 0; face < _CUBE_MAP_MAX_FACE; face++) {
+            if (!tex->faces[face].levels) {
+                break;
+            }
+            if (face == _CUBE_MAP_MAX_FACE - 1) {
+                return true;
+            }
+        }
+    }
+
+    new_capacity = MAX(required_levels, tex->mipmap_levels);
+
+    if ((size_t)new_capacity > SIZE_MAX / sizeof(TextureLevel)) {
+        fprintf(stderr,
+                "MGL ERROR: texture level grow overflow tex=%u required=%u old=%u\n",
+                tex->name,
+                new_capacity,
+                tex->mipmap_levels);
+        STATE(error) = GL_OUT_OF_MEMORY;
+        return false;
+    }
+
+    for (int face = 0; face < _CUBE_MAP_MAX_FACE; face++) {
+        new_levels[face] = (TextureLevel *)calloc(new_capacity, sizeof(TextureLevel));
+        if (!new_levels[face]) {
+            for (int i = 0; i < face; i++) {
+                free(new_levels[i]);
+            }
+            STATE(error) = GL_OUT_OF_MEMORY;
+            return false;
+        }
+
+        if (tex->faces[face].levels && tex->mipmap_levels > 0) {
+            memcpy(new_levels[face],
+                   tex->faces[face].levels,
+                   tex->mipmap_levels * sizeof(TextureLevel));
+        }
+    }
+
+    for (int face = 0; face < _CUBE_MAP_MAX_FACE; face++) {
+        free(tex->faces[face].levels);
+        tex->faces[face].levels = new_levels[face];
+    }
+
+    fprintf(stderr,
+            "MGL TRACE texture level capacity grow tex=%u old=%u new=%u base=%ux%u target=0x%x\n",
+            tex->name,
+            tex->mipmap_levels,
+            new_capacity,
+            tex->width,
+            tex->height,
+            tex->target);
+
+    tex->mipmap_levels = new_capacity;
+    return true;
+}
+
 bool checkTexLevelParams(GLMContext ctx, Texture *tex, GLint level, GLuint internalformat, GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type)
 {
     GLuint base_width, base_height;
 
-    if (level >= tex->mipmap_levels)
+    if (!tex || tex->mipmap_levels == 0)
     {
+        fprintf(stderr,
+                "MGL ERROR: checkTexLevelParams before base level tex=%p level=%d size=%dx%dx%d\n",
+                (void *)tex,
+                level,
+                width,
+                height,
+                depth);
         return false;
     }
 
@@ -1213,17 +2009,28 @@ bool checkTexLevelParams(GLMContext ctx, Texture *tex, GLint level, GLuint inter
     {
         if (level != 0)
         {
+            GLint check_level = level;
             base_width = tex->width;
             base_height = tex->height;
 
-            while(level--)
+            while(check_level--)
             {
-                base_width >>= 1;
-                base_height >>= 1;
+                base_width = MAX(base_width >> 1, 1u);
+                base_height = MAX(base_height >> 1, 1u);
             }
 
             if (width != base_width || height != base_height)
             {
+                fprintf(stderr,
+                        "MGL ERROR: checkTexLevelParams size mismatch tex=%u level=%d got=%dx%d expected=%ux%u base=%ux%u\n",
+                        tex->name,
+                        level,
+                        width,
+                        height,
+                        base_width,
+                        base_height,
+                        tex->width,
+                        tex->height);
                 return false;
             }
         }
@@ -1234,6 +2041,12 @@ bool checkTexLevelParams(GLMContext ctx, Texture *tex, GLint level, GLuint inter
         // internal formats don't jive
         if (internalformat != tex->internalformat)
         {
+            fprintf(stderr,
+                    "MGL ERROR: checkTexLevelParams internalformat mismatch tex=%u level=%d got=0x%x expected=0x%x\n",
+                    tex->name,
+                    level,
+                    internalformat,
+                    tex->internalformat);
             return false;
         }
     }
@@ -1246,12 +2059,27 @@ bool checkTexLevelParams(GLMContext ctx, Texture *tex, GLint level, GLuint inter
 
         if (temp_internalformat != tex->internalformat)
         {
+            fprintf(stderr,
+                    "MGL ERROR: checkTexLevelParams format/type mismatch tex=%u level=%d derived=0x%x expected=0x%x format=0x%x type=0x%x\n",
+                    tex->name,
+                    level,
+                    temp_internalformat,
+                    tex->internalformat,
+                    format,
+                    type);
             return false;
         }
     }
 
-    if (checkInternalFormatForMetal(ctx, internalformat))
+    if (checkInternalFormatForMetal(ctx, tex->internalformat) == false)
     {
+        fprintf(stderr,
+                "MGL ERROR: checkTexLevelParams unsupported internalformat=0x%x level=%d size=%dx%dx%d\n",
+                tex->internalformat,
+                level,
+                width,
+                height,
+                depth);
         return false;
     }
 
@@ -1645,6 +2473,40 @@ bool createTextureLevel(GLMContext ctx, Texture *tex, GLuint face, GLint level, 
         }
         return texSubImage(ctx, tex, face, level, 0, 0, 0, width, height, depth, format, type, pixels);
     }
+
+    /*
+     * Minecraft/LWJGL can submit a zero-sized tail mip (for example 16x16
+     * level 5 -> 0x0) while walking a mip chain. GL accepts non-negative
+     * dimensions, but there is no Metal/CPU storage to create for a zero-sized
+     * image. Treat this as a successful no-op instead of turning it into a
+     * repeated INVALID_OPERATION from checkTexLevelParams().
+     */
+    if (level > 0 && (width == 0 || height == 0 || depth == 0))
+    {
+        static uint64_t s_zero_tail_mip_logs = 0;
+        uint64_t hit = ++s_zero_tail_mip_logs;
+
+        if (hit <= 64ull || (hit % 1024ull) == 0ull)
+        {
+            fprintf(stderr,
+                    "MGL TRACE createTextureLevel skip zero-sized tail mip tex=%u target=0x%x face=%u level=%d size=%dx%dx%d base=%ux%ux%u numLevels=%u mipmapLevels=%u hit=%llu\n",
+                    tex ? tex->name : 0u,
+                    tex ? tex->target : 0u,
+                    face,
+                    level,
+                    width,
+                    height,
+                    depth,
+                    tex ? tex->width : 0u,
+                    tex ? tex->height : 0u,
+                    tex ? tex->depth : 0u,
+                    tex ? tex->num_levels : 0u,
+                    tex ? tex->mipmap_levels : 0u,
+                    (unsigned long long)hit);
+        }
+
+        return true;
+    }
     
     if (level == 0)
     {
@@ -1694,6 +2556,20 @@ bool createTextureLevel(GLMContext ctx, Texture *tex, GLuint face, GLint level, 
     else if (checkTexLevelParams(ctx, tex, level, internalformat, width, height, depth, format, type) == false)
     {
         ERROR_RETURN_VALUE(GL_INVALID_OPERATION, false);
+    }
+
+    if (!ensureTextureLevelCapacity(ctx, tex, (GLuint)level + 1u))
+    {
+        fprintf(stderr,
+                "MGL ERROR: createTextureLevel failed to grow levels tex=%u face=%u level=%d currentLevels=%u size=%dx%dx%d\n",
+                tex ? tex->name : 0u,
+                face,
+                level,
+                tex ? tex->mipmap_levels : 0u,
+                width,
+                height,
+                depth);
+        ERROR_RETURN_VALUE(GL_OUT_OF_MEMORY, false);
     }
 
     tex->num_levels = MAX(tex->num_levels, level + 1);
@@ -1946,7 +2822,6 @@ bool createTextureLevel(GLMContext ctx, Texture *tex, GLuint face, GLint level, 
             size_t level_upload_bytes = 0u;
             size_t level_image_bytes = 0u;
             size_t upload_depth = (size_t)MAX(depth, 1);
-            size_t zero_probe_len = 0u;
             if (mglMulSizeT(src_pitch, (size_t)MAX(height, 1), &level_image_bytes) &&
                 mglMulSizeT(level_image_bytes, upload_depth, &level_upload_bytes)) {
                 tex->faces[face].levels[level].last_upload_size = level_upload_bytes;
@@ -1962,17 +2837,27 @@ bool createTextureLevel(GLMContext ctx, Texture *tex, GLuint face, GLint level, 
             tex->faces[face].levels[level].suspicious_zero_upload = GL_FALSE;
 
             if (level_upload_bytes > 0u && pixels) {
-                zero_probe_len = level_upload_bytes > 256u ? 256u : level_upload_bytes;
-                if (zero_probe_len >= 64u && mglLooksAllZero((const uint8_t *)pixels, zero_probe_len)) {
-                    tex->faces[face].levels[level].suspicious_zero_upload = GL_TRUE;
-                    tex->faces[face].levels[level].has_initialized_data = GL_FALSE;
+                if (mglLooksAllZeroSampled((const uint8_t *)pixels, level_upload_bytes)) {
+                    size_t first_nonzero = 0u;
+                    uint8_t first_value = 0u;
+                    bool has_nonzero = mglFindFirstNonZeroByte((const uint8_t *)pixels,
+                                                               level_upload_bytes,
+                                                               &first_nonzero,
+                                                               &first_value);
+                    if (!has_nonzero) {
+                        tex->faces[face].levels[level].suspicious_zero_upload = GL_TRUE;
+                        tex->faces[face].levels[level].has_initialized_data = GL_FALSE;
+                    }
                     fprintf(stderr,
-                            "MGL WARNING: createTextureLevel upload looks all-zero tex=%u face=%u level=%d probe=%zu bytes src=%p\n",
+                            "MGL WARNING: createTextureLevel upload sampled head/mid/tail all-zero tex=%u face=%u level=%d bytes=%zu src=%p fullZero=%d firstNonZero=0x%zx value=0x%02x\n",
                             tex->name,
                             face,
                             level,
-                            zero_probe_len,
-                            pixels);
+                            level_upload_bytes,
+                            pixels,
+                            has_nonzero ? 0 : 1,
+                            has_nonzero ? first_nonzero : 0u,
+                            has_nonzero ? first_value : 0u);
                 }
             }
 
@@ -2098,19 +2983,24 @@ void mglTexImage2D(GLMContext ctx, GLenum target, GLint level, GLint internalfor
 
     ERROR_CHECK_RETURN(level >= 0, GL_INVALID_VALUE);
 
-    // verifyFormatType sets the error
-    ERROR_CHECK_RETURN(verifyInternalFormatAndFormatType(ctx, internalformat, format, type), 0);
-
     ERROR_CHECK_RETURN(width >= 0, GL_INVALID_VALUE);
     ERROR_CHECK_RETURN(height >= 0, GL_INVALID_VALUE);
 
-    ERROR_CHECK_RETURN(border == 0, GL_INVALID_VALUE);
-
     if (proxy)
     {
+        if (border != 0) {
+            STATE(error) = GL_INVALID_VALUE;
+            mglHandleProxyTexImageQuery(ctx, target, level, internalformat, 0, 0, 0, border);
+            return;
+        }
         mglHandleProxyTexImageQuery(ctx, target, level, internalformat, width, height, 1, border);
         return;
     }
+
+    // verifyFormatType sets the error
+    ERROR_CHECK_RETURN(verifyInternalFormatAndFormatType(ctx, internalformat, format, type), 0);
+
+    ERROR_CHECK_RETURN(border == 0, GL_INVALID_VALUE);
 
     tex = getTex(ctx, 0, target);
 
@@ -2236,7 +3126,6 @@ bool texSubImage(GLMContext ctx, Texture *tex, GLuint face, GLint level, GLint x
     Buffer *resolved_unpack_buf = NULL;
     uint64_t resolved_src_hash = 0ull;
     bool suspicious_zero_upload = false;
-    size_t suspicious_probe_len = 0u;
     Buffer *initial_unpack_buf = STATE(buffers[_PIXEL_UNPACK_BUFFER]);
     GLuint initial_unpack_name = initial_unpack_buf ? initial_unpack_buf->name : 0u;
     bool trace_upload = mglShouldTraceTextureUpload(tex,
@@ -2482,28 +3371,52 @@ bool texSubImage(GLMContext ctx, Texture *tex, GLuint face, GLint level, GLint x
         return true;
     }
 
-    resolved_src_hash = mglHashBytesSampled(resolved_src, required_bytes);
-    if (required_bytes > 0u) {
-        suspicious_probe_len = required_bytes > 256u ? 256u : required_bytes;
+    if (resolved_unpack_buf) {
+        resolved_src_hash = mglHashBytesSampled(resolved_src, required_bytes);
+    } else {
+        /*
+         * CPU uploads can point at a direct/native buffer whose exact mapped
+         * extent is unknown to us. Avoid diagnostic scans here; the actual
+         * row-wise unpack below is the first safe consumer, and the destination
+         * texture backing store can be inspected after that.
+         */
+        resolved_src_hash = 0u;
     }
-    if (suspicious_probe_len >= 64u && mglLooksAllZero(resolved_src, suspicious_probe_len)) {
+
+    if (resolved_unpack_buf && mglLooksAllZeroSampled(resolved_src, required_bytes)) {
         static uint64_t s_zero_upload_warning_count = 0u;
         uint64_t zero_warning_id = ++s_zero_upload_warning_count;
-        suspicious_zero_upload = true;
+        size_t first_nonzero = 0u;
+        uint8_t first_value = 0u;
+        bool has_nonzero = mglFindFirstNonZeroByte(resolved_src,
+                                                   required_bytes,
+                                                   &first_nonzero,
+                                                   &first_value);
+        suspicious_zero_upload = !has_nonzero;
         if (trace_upload || zero_warning_id <= 32u || (zero_warning_id % 512u) == 0u) {
             fprintf(stderr,
-                    "MGL WARNING: texSubImage source appears all-zero tex=%u face=%u level=%d probe=%zu bytes required=%zu src=%p warn=%" PRIu64 "\n",
+                    "MGL WARNING: texSubImage source sampled head/mid/tail all-zero tex=%u face=%u level=%d required=%zu src=%p fullZero=%d firstNonZero=0x%zx value=0x%02x warn=%" PRIu64 "\n",
                     tex->name,
                     face,
                     level,
-                    suspicious_probe_len,
                     required_bytes,
                     resolved_src,
+                    has_nonzero ? 0 : 1,
+                    has_nonzero ? first_nonzero : 0u,
+                    has_nonzero ? first_value : 0u,
                     zero_warning_id);
+            if (has_nonzero && trace_upload) {
+                size_t dump_offset = first_nonzero;
+                size_t dump_available = required_bytes - first_nonzero;
+                if (dump_available > 64u) {
+                    dump_available = 64u;
+                }
+                mglDumpBytesToStderr("texSubImage.source.firstNonZero", resolved_src + dump_offset, dump_available, dump_offset);
+            }
         }
     }
 
-    if (tex->name == 13u && s_dumped_tex13_upload_source == 0 && resolved_src) {
+    if (tex->name == 13u && s_dumped_tex13_upload_source == 0 && resolved_src && resolved_unpack_buf) {
         size_t row_bytes = src_pitch > 0 ? src_pitch : (size_t)(width * pixel_size);
         size_t level_image_bytes = row_bytes * (size_t)MAX(height, 1);
         size_t dump_len = level_image_bytes;
@@ -2538,6 +3451,8 @@ bool texSubImage(GLMContext ctx, Texture *tex, GLuint face, GLint level, GLint x
 
     void *texture_data;
     TextureLevel *lvl = &tex->faces[face].levels[level];
+    size_t compact_upload_bytes = 0u;
+    size_t compact_upload_row_bytes = 0u;
     bool full_level_write = (!suspicious_zero_upload &&
                              xoffset == 0 &&
                              yoffset == 0 &&
@@ -2545,6 +3460,19 @@ bool texSubImage(GLMContext ctx, Texture *tex, GLuint face, GLint level, GLint x
                              width >= (GLsizei)lvl->width &&
                              height >= (GLsizei)lvl->height &&
                              depth >= (GLsizei)lvl->depth);
+
+    if (!mglMulSizeT((size_t)width, pixel_size, &compact_upload_row_bytes) ||
+        !mglMulSizeT(compact_upload_row_bytes, (size_t)MAX(height, 1), &compact_upload_bytes) ||
+        !mglMulSizeT(compact_upload_bytes, (size_t)MAX(depth, 1), &compact_upload_bytes)) {
+        fprintf(stderr,
+                "MGL ERROR: texSubImage compact byte computation overflow tex=%u dims=%dx%dx%d pixelSize=%zu\n",
+                tex->name,
+                width,
+                height,
+                depth,
+                pixel_size);
+        ERROR_RETURN_VALUE(GL_INVALID_VALUE, false);
+    }
 
     texture_data = (void *)tex->faces[face].levels[level].data;
     if (!texture_data) {
@@ -2559,7 +3487,121 @@ bool texSubImage(GLMContext ctx, Texture *tex, GLuint face, GLint level, GLint x
     
     unpackTexture(ctx, tex, face, level, (void *)resolved_src, texture_data, src_pitch, pixel_size, xoffset, yoffset, zoffset, width, height, depth);
 
-    uint64_t dst_hash = mglHashBytesSampled(texture_data, required_bytes);
+    uint64_t dst_hash = mglHashBytesSampled(texture_data, compact_upload_bytes);
+    if (!resolved_unpack_buf && mglLooksAllZeroSampled((const uint8_t *)texture_data, compact_upload_bytes)) {
+        static uint64_t s_cpu_zero_upload_warning_count = 0u;
+        uint64_t zero_warning_id = ++s_cpu_zero_upload_warning_count;
+        suspicious_zero_upload = true;
+        if (trace_upload || zero_warning_id <= 32u || (zero_warning_id % 512u) == 0u) {
+            fprintf(stderr,
+                    "MGL WARNING: texSubImage CPU upload produced sampled all-zero destination tex=%u label=\"%s\" face=%u level=%d required=%zu src=%p dst=%p warn=%" PRIu64 "\n",
+                    tex->name,
+                    tex->debug_label[0] != '\0' ? tex->debug_label : "(none)",
+                    face,
+                    level,
+                    compact_upload_bytes,
+                    resolved_src,
+                    texture_data,
+                    zero_warning_id);
+
+            mglDumpTexSubImageZeroCpuResourceTag(ctx,
+                                                 tex,
+                                                 lvl,
+                                                 face,
+                                                 level,
+                                                 xoffset,
+                                                 yoffset,
+                                                 zoffset,
+                                                 width,
+                                                 height,
+                                                 depth,
+                                                 format,
+                                                 type,
+                                                 pixels_raw,
+                                                 resolved_src,
+                                                 resolved_unpack_buf,
+                                                 required_bytes,
+                                                 compact_upload_bytes,
+                                                 src_pitch,
+                                                 compact_upload_row_bytes,
+                                                 pixel_size,
+                                                 zero_warning_id);
+
+            if (trace_upload || zero_warning_id <= 8u) {
+                mglDumpNativeBacktraceToStderr("texSubImage.zeroCPU", 32u);
+            }
+
+            mglRequestJavaThreadDumpForZeroCpuUpload(tex,
+                                                     face,
+                                                     level,
+                                                     width,
+                                                     height,
+                                                     depth,
+                                                     zero_warning_id);
+
+            /*
+             * At this point unpackTexture has already consumed the CPU pointer
+             * row-by-row without faulting.  Dump only three small windows from
+             * source and destination so the next log can prove whether the
+             * incoming CPU image is really zero or our unpack path zeroed it.
+             */
+            size_t dst_total = lvl->data_size;
+            size_t dst_pitch = lvl->pitch;
+            if (dst_total == 0u) {
+                dst_total = compact_upload_bytes;
+            }
+            if (dst_pitch == 0u) {
+                dst_pitch = compact_upload_row_bytes;
+            }
+            mglDumpTextureUploadSamples(tex,
+                                        face,
+                                        level,
+                                        (const uint8_t *)resolved_src,
+                                        required_bytes,
+                                        src_pitch,
+                                        (const uint8_t *)texture_data,
+                                        dst_total,
+                                        dst_pitch,
+                                        pixel_size,
+                                        width,
+                                        height,
+                                        depth);
+        }
+    }
+
+    if (tex->name == 13u && s_dumped_tex13_upload_source == 0) {
+        size_t dump_len = compact_upload_bytes;
+        if (dump_len > 256u) {
+            dump_len = 256u;
+        }
+
+        fprintf(stderr,
+                "MGL DUMP tex13.texSubImage.dst.begin tex=%u face=%u level=%d target=0x%x fmt=0x%x type=0x%x "
+                "dims=%dx%dx%d off=(%d,%d,%d) pixelSize=%zu srcPitch=%zu dumpLen=%zu src=%p dst=%p srcClass=%s\n",
+                tex->name,
+                face,
+                level,
+                tex->target,
+                format,
+                type,
+                width,
+                height,
+                depth,
+                xoffset,
+                yoffset,
+                zoffset,
+                pixel_size,
+                src_pitch,
+                dump_len,
+                resolved_src,
+                texture_data,
+                resolved_unpack_buf ? "PBO" : "CPU");
+
+        mglDumpBytesToStderr("tex13.texSubImage.dst", (const uint8_t *)texture_data, dump_len, 0u);
+        fprintf(stderr, "MGL DUMP tex13.texSubImage.dst.end tex=%u\n", tex->name);
+        s_dumped_tex13_upload_source = 1;
+    }
+
     if (trace_upload) {
         fprintf(stderr,
                 "MGL TRACE texSubImage.afterUnpack call=%" PRIu64 " tex=%u face=%u level=%d requiredBytes=%zu srcHash=0x%016" PRIx64 " dstHash=0x%016" PRIx64 " elapsed=%.3fms\n",
@@ -2926,6 +3968,18 @@ void texStorage(GLMContext ctx, Texture *tex, GLuint faces, GLsizei levels, GLbo
             if (level_width == 0) level_width = 1;
             if (level_height == 0) level_height = 1;
         }
+    }
+
+    /*
+     * TexStorage declares the exact immutable mip count. initBaseTexLevel()
+     * derives a full chain from the base size, which is correct for legacy
+     * TexImage completeness but too strict for Minecraft atlases such as
+     * 2048x2048x4. Keep the allocated level arrays, but make completeness and
+     * the Metal descriptor use the GL-declared storage level count.
+     */
+    if (levels > 0) {
+        tex->mipmap_levels = (GLuint)levels;
+        tex->num_levels = MAX(tex->num_levels, (GLuint)levels);
     }
 
     // mark it immutable

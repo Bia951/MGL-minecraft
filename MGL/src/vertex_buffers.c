@@ -24,6 +24,7 @@
 #include "glm_context.h"
 
 extern Buffer *findBuffer(GLMContext ctx, GLuint buffer);
+extern Buffer *getBuffer(GLMContext ctx, GLenum target, GLuint buffer);
 extern int isVAO(GLMContext ctx, GLuint vao);
 extern VertexArray *getVAO(GLMContext ctx, GLuint vao);
 extern void mglGenVertexArrays(GLMContext ctx, GLsizei n, GLuint *arrays);
@@ -45,9 +46,19 @@ bool bindVertexBuffer(GLMContext ctx, GLuint vaobj, GLuint bindingindex, GLuint 
         ERROR_CHECK_RETURN_VALUE(vao, GL_INVALID_VALUE, false);
     }
 
-    Buffer *buf;
-    buf = findBuffer(ctx, buffer);
-    ERROR_CHECK_RETURN_VALUE(buf, GL_INVALID_VALUE, false);
+    ERROR_CHECK_RETURN_VALUE(offset >= 0, GL_INVALID_VALUE, false);
+    ERROR_CHECK_RETURN_VALUE(stride >= 0, GL_INVALID_VALUE, false);
+
+    Buffer *buf = NULL;
+    if (buffer != 0)
+    {
+        buf = findBuffer(ctx, buffer);
+        if (!buf)
+        {
+            buf = getBuffer(ctx, GL_ARRAY_BUFFER, buffer);
+        }
+        ERROR_CHECK_RETURN_VALUE(buf, GL_INVALID_VALUE, false);
+    }
 
     // AGX Driver Compatibility: Store buffer binding information
     // Find all attributes that use this binding index and update their buffer pointer and stride
@@ -57,6 +68,7 @@ bool bindVertexBuffer(GLMContext ctx, GLuint vaobj, GLuint bindingindex, GLuint 
         {
             vao->attrib[i].buffer = buf;
             vao->attrib[i].stride = stride;
+            vao->attrib[i].binding_offset = offset;
         }
     }
 
@@ -76,20 +88,30 @@ void mglBindVertexBuffer(GLMContext ctx, GLuint bindingindex, GLuint buffer, GLi
 void mglBindVertexBuffers(GLMContext ctx, GLuint first, GLsizei count, const GLuint *buffers, const GLintptr *offsets, const GLsizei *strides)
 {
     ERROR_CHECK_RETURN(ctx->state.vao, GL_INVALID_OPERATION);
-    ERROR_CHECK_RETURN(first + count < MAX_BINDABLE_BUFFERS, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(buffers, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(offsets, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(strides, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(count >= 0, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(first + count <= MAX_BINDABLE_BUFFERS, GL_INVALID_VALUE);
+    if (buffers)
+    {
+        ERROR_CHECK_RETURN(offsets, GL_INVALID_VALUE);
+        ERROR_CHECK_RETURN(strides, GL_INVALID_VALUE);
+    }
 
     for(int i=0; i<count; i++)
     {
         GLuint bindingindex;
         GLuint buffer;
+        GLintptr offset = 0;
+        GLsizei stride = 0;
 
         bindingindex = first + i;
-        buffer = buffers[i];
+        buffer = buffers ? buffers[i] : 0;
+        if (buffers)
+        {
+            offset = offsets[i];
+            stride = strides[i];
+        }
 
-        bindVertexBuffer(ctx, 0, bindingindex, buffer, offsets[i], strides[i]);
+        bindVertexBuffer(ctx, 0, bindingindex, buffer, offset, stride);
     }
 }
 
@@ -132,21 +154,30 @@ void mglVertexArrayVertexBuffer(GLMContext ctx, GLuint vaobj, GLuint bindinginde
 void mglVertexArrayVertexBuffers(GLMContext ctx, GLuint vaobj, GLuint first, GLsizei count, const GLuint *buffers, const GLintptr *offsets, const GLsizei *strides)
 {
     ERROR_CHECK_RETURN(ctx->state.vao, GL_INVALID_OPERATION);
-    ERROR_CHECK_RETURN(first + count < MAX_BINDABLE_BUFFERS, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(buffers, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(offsets, GL_INVALID_VALUE);
-    ERROR_CHECK_RETURN(strides, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(count >= 0, GL_INVALID_VALUE);
+    ERROR_CHECK_RETURN(first + count <= MAX_BINDABLE_BUFFERS, GL_INVALID_VALUE);
+    if (buffers)
+    {
+        ERROR_CHECK_RETURN(offsets, GL_INVALID_VALUE);
+        ERROR_CHECK_RETURN(strides, GL_INVALID_VALUE);
+    }
 
     for(int i=0; i<count; i++)
     {
         GLuint bindingindex;
         GLuint buffer;
+        GLintptr offset = 0;
+        GLsizei stride = 0;
 
         bindingindex = first + i;
-        buffer = buffers[i];
+        buffer = buffers ? buffers[i] : 0;
+        if (buffers)
+        {
+            offset = offsets[i];
+            stride = strides[i];
+        }
 
-        bindVertexBuffer(ctx, vaobj, bindingindex, buffer, offsets[i], strides[i]);
+        bindVertexBuffer(ctx, vaobj, bindingindex, buffer, offset, stride);
     }
 }
-
 
