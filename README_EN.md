@@ -92,9 +92,9 @@ After building, add the following JVM arguments in your launcher:
 ```
 Point them to the built libraries so they can take over rendering.
 
-##Current Status
+## Current Status
 
-- UI renders incorrectly (black blocks)
+- UI renders incorrectly
 - Text rendering works correctly
 - Loading animation renders correctly
 - World is not rendered
@@ -202,4 +202,4 @@ Implemented in Objective-C, responsible for:
 
 ## License
 
-This project is licensed under the Apache License 2.0 – see the LICENSE￼ file for details.
+This project is licensed under the Apache License 2.0 – see the LICENSE file for details.

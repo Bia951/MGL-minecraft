@@ -715,11 +715,49 @@ void mglGetActiveUniformBlockName(GLMContext ctx, GLuint program, GLuint uniform
 
 void mglUniformBlockBinding(GLMContext ctx, GLuint program, GLuint uniformBlockIndex, GLuint uniformBlockBinding)
 {
-    // Accept as no-op for now; bindings are auto-mapped during shader compilation.
-    (void)ctx;
-    (void)program;
-    (void)uniformBlockIndex;
-    (void)uniformBlockBinding;
+    if (!ctx) {
+        return;
+    }
+
+    if (uniformBlockBinding >= MAX_BINDABLE_BUFFERS) {
+        ERROR_RETURN(GL_INVALID_VALUE);
+    }
+
+    if (isProgram(ctx, program) == GL_FALSE) {
+        ERROR_RETURN(GL_INVALID_VALUE);
+    }
+
+    Program *ptr = getProgram(ctx, program);
+    if (!ptr || ptr->linked_glsl_program == NULL) {
+        ERROR_RETURN(GL_INVALID_OPERATION);
+    }
+
+    int block_stage = -1;
+    SpirvResource *block = mglFindUniformBlockByIndex(ptr, uniformBlockIndex, &block_stage);
+    if (!block) {
+        ERROR_RETURN(GL_INVALID_VALUE);
+    }
+
+    const char *block_name = block->name;
+    GLuint old_binding = block->gl_binding;
+
+    /*
+     * `binding` is the Metal argument slot after MSL reflection/repair.
+     * `gl_binding` is the client-side UBO binding point used to find
+     * glBindBufferRange state. glUniformBlockBinding changes only the latter.
+     */
+    for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++) {
+        SpirvResourceList *resources = &ptr->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_UNIFORM_BUFFER];
+        for (GLuint i = 0; i < resources->count; i++) {
+            SpirvResource *res = &resources->list[i];
+            if ((block_name && res->name && !strcmp(block_name, res->name)) ||
+                res->gl_binding == old_binding) {
+                res->gl_binding = uniformBlockBinding;
+            }
+        }
+    }
+
+    ctx->state.dirty_bits |= DIRTY_BUFFER_BASE_STATE | DIRTY_PROGRAM;
 }
 
 bool checkUniformParams(GLMContext ctx, GLint location)

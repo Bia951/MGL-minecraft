@@ -203,13 +203,83 @@ static GLint mglDefaultSamplerUnitForName(const char *name)
     return -1;
 }
 
+static bool mglProgramHasResourceNamed(Program *program, int res_type, const char *name)
+{
+    if (!program || !name) {
+        return false;
+    }
+
+    if (res_type < 0 || res_type >= _MAX_SPIRV_RES) {
+        return false;
+    }
+
+    for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++) {
+        SpirvResourceList *resources = &program->spirv_resources_list[stage][res_type];
+        for (GLuint i = 0; resources->list && i < resources->count; i++) {
+            if (resources->list[i].name && strcmp(resources->list[i].name, name) == 0) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static bool mglProgramHasSamplerNamed(Program *program, const char *name)
+{
+    if (!program || !name) {
+        return false;
+    }
+
+    static const int sampler_resource_types[] = {
+        SPVC_RESOURCE_TYPE_SAMPLED_IMAGE,
+        SPVC_RESOURCE_TYPE_SEPARATE_IMAGE,
+        SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS
+    };
+
+    for (size_t rt = 0; rt < sizeof(sampler_resource_types) / sizeof(sampler_resource_types[0]); rt++) {
+        if (mglProgramHasResourceNamed(program, sampler_resource_types[rt], name)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool mglProgramLooksLikeModernRenderPipeline(Program *program)
+{
+    return mglProgramHasResourceNamed(program, SPVC_RESOURCE_TYPE_UNIFORM_BUFFER, "Projection") ||
+           mglProgramHasResourceNamed(program, SPVC_RESOURCE_TYPE_UNIFORM_BUFFER, "ChunkSection") ||
+           mglProgramHasResourceNamed(program, SPVC_RESOURCE_TYPE_UNIFORM_BUFFER, "DynamicTransforms") ||
+           mglProgramHasResourceNamed(program, SPVC_RESOURCE_TYPE_UNIFORM_BUFFER, "Globals");
+}
+
+static GLint mglDefaultSamplerUnitForProgramResource(Program *program, const SpirvResource *res)
+{
+    GLint named_unit = mglDefaultSamplerUnitForName(res ? res->name : NULL);
+
+    /*
+     * Newer Mojang RenderPipeline code assigns sampler units from the pipeline
+     * sampler list, not from the numeric suffix. Classic ShaderInstance
+     * pipelines, including 1.21.1 terrain, still use Sampler2 as unit 2.
+     */
+    if (res && res->name && strcmp(res->name, "Sampler2") == 0 &&
+        mglProgramLooksLikeModernRenderPipeline(program) &&
+        mglProgramHasSamplerNamed(program, "Sampler0") &&
+        !mglProgramHasSamplerNamed(program, "Sampler1")) {
+        return 1;
+    }
+
+    return named_unit;
+}
+
 static void mglApplyDefaultSamplerUnit(Program *program, int stage, const SpirvResource *res)
 {
     if (!program || !res || stage < 0 || stage >= _MAX_SHADER_TYPES || res->binding >= TEXTURE_UNITS) {
         return;
     }
 
-    GLint unit = mglDefaultSamplerUnitForName(res->name);
+    GLint unit = mglDefaultSamplerUnitForProgramResource(program, res);
     if (unit < 0 || unit >= TEXTURE_UNITS) {
         return;
     }

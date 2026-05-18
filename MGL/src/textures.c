@@ -141,6 +141,8 @@ static void mglDumpByteWindowToStderr(const char *label,
 }
 
 static uint64_t mglHashBytesSampled(const void *data, size_t len);
+static bool mglMulSizeT(size_t a, size_t b, size_t *out);
+static bool mglAddSizeT(size_t a, size_t b, size_t *out);
 
 static void mglDumpTextureUploadRowSamples(const char *prefix,
                                            const uint8_t *bytes,
@@ -693,6 +695,118 @@ static bool mglLooksAllZeroSampled(const uint8_t *bytes, size_t len)
     return true;
 }
 
+static bool mglTextureRectByteRange(TextureLevel *level,
+                                    size_t pixel_size,
+                                    size_t xoffset,
+                                    size_t yoffset,
+                                    size_t zoffset,
+                                    size_t width,
+                                    size_t height,
+                                    size_t depth,
+                                    size_t *byte_offset_out,
+                                    size_t *byte_span_out)
+{
+    if (!level || !level->data || pixel_size == 0u ||
+        width == 0u || height == 0u || depth == 0u ||
+        level->pitch == 0u || level->height == 0u) {
+        return false;
+    }
+
+    size_t row_bytes = 0u;
+    size_t x_bytes = 0u;
+    size_t y_bytes = 0u;
+    size_t image_pitch = 0u;
+    size_t z_bytes = 0u;
+    size_t xy_bytes = 0u;
+    size_t base_offset = 0u;
+    size_t trailing_rows = height - 1u;
+    size_t trailing_slices = depth - 1u;
+    size_t trailing_row_bytes = 0u;
+    size_t trailing_slice_bytes = 0u;
+    size_t trailing_bytes = 0u;
+
+    if (!mglMulSizeT(width, pixel_size, &row_bytes) ||
+        !mglMulSizeT(xoffset, pixel_size, &x_bytes) ||
+        !mglMulSizeT(yoffset, level->pitch, &y_bytes) ||
+        !mglMulSizeT(level->pitch, (size_t)level->height, &image_pitch) ||
+        !mglMulSizeT(zoffset, image_pitch, &z_bytes) ||
+        !mglAddSizeT(x_bytes, y_bytes, &xy_bytes) ||
+        !mglAddSizeT(xy_bytes, z_bytes, &base_offset) ||
+        !mglMulSizeT(trailing_rows, level->pitch, &trailing_row_bytes) ||
+        !mglMulSizeT(trailing_slices, image_pitch, &trailing_slice_bytes) ||
+        !mglAddSizeT(trailing_row_bytes, trailing_slice_bytes, &trailing_bytes) ||
+        !mglAddSizeT(trailing_bytes, row_bytes, &trailing_bytes)) {
+        return false;
+    }
+
+    if (base_offset > level->data_size || trailing_bytes > level->data_size - base_offset) {
+        return false;
+    }
+
+    if (byte_offset_out) {
+        *byte_offset_out = base_offset;
+    }
+    if (byte_span_out) {
+        *byte_span_out = trailing_bytes;
+    }
+    return true;
+}
+
+static uint64_t mglHashTextureRect(const uint8_t *base,
+                                   size_t dst_pitch,
+                                   size_t dst_image_pitch,
+                                   size_t row_bytes,
+                                   size_t height,
+                                   size_t depth)
+{
+    if (!base || row_bytes == 0u || height == 0u || depth == 0u) {
+        return 0ull;
+    }
+
+    uint64_t hash = 1469598103934665603ull;
+    size_t total = 0u;
+
+    for (size_t z = 0u; z < depth; z++) {
+        const uint8_t *slice = base + z * dst_image_pitch;
+        for (size_t y = 0u; y < height; y++) {
+            const uint8_t *row = slice + y * dst_pitch;
+            for (size_t i = 0u; i < row_bytes; i++) {
+                hash ^= (uint64_t)row[i];
+                hash *= 1099511628211ull;
+            }
+            total += row_bytes;
+        }
+    }
+
+    hash ^= (uint64_t)total;
+    hash *= 1099511628211ull;
+    return hash;
+}
+
+static bool mglTextureRectLooksAllZero(const uint8_t *base,
+                                       size_t dst_pitch,
+                                       size_t dst_image_pitch,
+                                       size_t row_bytes,
+                                       size_t height,
+                                       size_t depth)
+{
+    if (!base || row_bytes == 0u || height == 0u || depth == 0u) {
+        return false;
+    }
+
+    for (size_t z = 0u; z < depth; z++) {
+        const uint8_t *slice = base + z * dst_image_pitch;
+        for (size_t y = 0u; y < height; y++) {
+            const uint8_t *row = slice + y * dst_pitch;
+            if (!mglLooksAllZero(row, row_bytes)) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
 static bool mglFindFirstNonZeroByte(const uint8_t *bytes, size_t len, size_t *offset_out, uint8_t *value_out)
 {
     if (!bytes || len == 0) {
@@ -722,10 +836,6 @@ static bool mglShouldTraceTextureUpload(Texture *tex,
                                         size_t required_bytes)
 {
     if (MGL_VERBOSE_TEXTURE_UPLOAD_LOGS) {
-        return true;
-    }
-
-    if (tex && tex->name == 13u) {
         return true;
     }
 
@@ -1459,13 +1569,15 @@ void mglGenTextures(GLMContext ctx, GLsizei n, GLuint *textures)
     {
         GLuint name = getNewName(&STATE(texture_table));
         *textures++ = name;
-        fprintf(stderr,
-                "MGL TRACE GenTextures call=%llu generated=%u currentName=%u tableCount=%zu tableCap=%zu\n",
-                (unsigned long long)call_id,
-                name,
-                STATE(texture_table).current_name,
-                STATE(texture_table).count,
-                STATE(texture_table).size);
+        if (MGL_VERBOSE_TEXTURE_BIND_LOGS || call_id <= 32ull || (call_id % 4096ull) == 0ull) {
+            fprintf(stderr,
+                    "MGL TRACE GenTextures call=%llu generated=%u currentName=%u tableCount=%zu tableCap=%zu\n",
+                    (unsigned long long)call_id,
+                    name,
+                    STATE(texture_table).current_name,
+                    STATE(texture_table).count,
+                    STATE(texture_table).size);
+        }
 
         // TEX_OBJ_RES_NAME has special name.. skip it
         if (STATE(texture_table.current_name) == TEX_OBJ_RES_NAME)
@@ -2920,7 +3032,7 @@ bool createTextureLevel(GLMContext ctx, Texture *tex, GLuint face, GLint level, 
 
                 ptr = STATE(buffers[_PIXEL_UNPACK_BUFFER]);
 
-                ERROR_CHECK_RETURN(ptr->mapped == false, GL_INVALID_OPERATION);
+                ERROR_CHECK_RETURN_VALUE(ptr->mapped == false, GL_INVALID_OPERATION, false);
 
                 GLubyte *buffer_data;
                 buffer_data = getBufferData(ctx, ptr);
@@ -3669,20 +3781,65 @@ bool texSubImage(GLMContext ctx, Texture *tex, GLuint face, GLint level, GLint x
     
     unpackTexture(ctx, tex, face, level, (void *)resolved_src, texture_data, src_pitch, pixel_size, xoffset, yoffset, zoffset, width, height, depth);
 
-    uint64_t dst_hash = mglHashBytesSampled(texture_data, compact_upload_bytes);
-    if (!resolved_unpack_buf && mglLooksAllZeroSampled((const uint8_t *)texture_data, compact_upload_bytes)) {
+    size_t upload_dst_offset = 0u;
+    size_t upload_dst_span = 0u;
+    const uint8_t *upload_dst = (const uint8_t *)texture_data;
+    size_t dst_pitch = lvl->pitch;
+    size_t dst_image_pitch = dst_pitch * (size_t)MAX(lvl->height, 1);
+    bool upload_rect_valid = mglTextureRectByteRange(lvl,
+                                                     pixel_size,
+                                                     (size_t)xoffset,
+                                                     (size_t)yoffset,
+                                                     (size_t)zoffset,
+                                                     (size_t)width,
+                                                     (size_t)height,
+                                                     (size_t)depth,
+                                                     &upload_dst_offset,
+                                                     &upload_dst_span);
+    if (upload_rect_valid) {
+        upload_dst = (const uint8_t *)texture_data + upload_dst_offset;
+    }
+
+    uint64_t dst_hash = upload_rect_valid
+        ? mglHashTextureRect(upload_dst,
+                             dst_pitch,
+                             dst_image_pitch,
+                             compact_upload_row_bytes,
+                             (size_t)MAX(height, 1),
+                             (size_t)MAX(depth, 1))
+        : mglHashBytesSampled(texture_data, compact_upload_bytes);
+    bool upload_rect_zero = upload_rect_valid
+        ? mglTextureRectLooksAllZero(upload_dst,
+                                     dst_pitch,
+                                     dst_image_pitch,
+                                     compact_upload_row_bytes,
+                                     (size_t)MAX(height, 1),
+                                     (size_t)MAX(depth, 1))
+        : mglLooksAllZeroSampled((const uint8_t *)texture_data, compact_upload_bytes);
+    /*
+     * Tiny transparent updates are normal for atlases and mip tails. Keep the
+     * zero-upload probe for large CPU uploads where an all-zero rectangle would
+     * indicate a real unpack/source lifetime problem.
+     */
+    bool suspicious_zero_cpu_upload =
+        !resolved_unpack_buf &&
+        upload_rect_zero &&
+        (trace_upload || compact_upload_bytes >= (256u * 1024u));
+    if (suspicious_zero_cpu_upload) {
         static uint64_t s_cpu_zero_upload_warning_count = 0u;
         uint64_t zero_warning_id = ++s_cpu_zero_upload_warning_count;
         if (trace_upload || zero_warning_id <= 32u || (zero_warning_id % 512u) == 0u) {
             fprintf(stderr,
-                    "MGL WARNING: texSubImage CPU upload produced sampled all-zero destination tex=%u label=\"%s\" face=%u level=%d required=%zu src=%p dst=%p warn=%" PRIu64 "\n",
+                    "MGL WARNING: texSubImage CPU upload produced all-zero uploaded rect tex=%u label=\"%s\" face=%u level=%d required=%zu src=%p dst=%p rectOffset=%zu rectSpan=%zu warn=%" PRIu64 "\n",
                     tex->name,
                     tex->debug_label[0] != '\0' ? tex->debug_label : "(none)",
                     face,
                     level,
                     compact_upload_bytes,
                     resolved_src,
-                    texture_data,
+                    upload_dst,
+                    upload_dst_offset,
+                    upload_dst_span,
                     zero_warning_id);
 
             mglDumpTexSubImageZeroCpuResourceTag(ctx,
@@ -3726,13 +3883,13 @@ bool texSubImage(GLMContext ctx, Texture *tex, GLuint face, GLint level, GLint x
              * source and destination so the next log can prove whether the
              * incoming CPU image is really zero or our unpack path zeroed it.
              */
-            size_t dst_total = lvl->data_size;
-            size_t dst_pitch = lvl->pitch;
+            size_t dst_total = upload_rect_valid ? upload_dst_span : lvl->data_size;
+            size_t dump_dst_pitch = lvl->pitch;
             if (dst_total == 0u) {
                 dst_total = compact_upload_bytes;
             }
-            if (dst_pitch == 0u) {
-                dst_pitch = compact_upload_row_bytes;
+            if (dump_dst_pitch == 0u) {
+                dump_dst_pitch = compact_upload_row_bytes;
             }
             mglDumpTextureUploadSamples(tex,
                                         face,
@@ -3740,9 +3897,9 @@ bool texSubImage(GLMContext ctx, Texture *tex, GLuint face, GLint level, GLint x
                                         (const uint8_t *)resolved_src,
                                         required_bytes,
                                         src_pitch,
-                                        (const uint8_t *)texture_data,
+                                        upload_rect_valid ? upload_dst : (const uint8_t *)texture_data,
                                         dst_total,
-                                        dst_pitch,
+                                        dump_dst_pitch,
                                         pixel_size,
                                         width,
                                         height,

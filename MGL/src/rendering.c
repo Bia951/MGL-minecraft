@@ -121,12 +121,29 @@ void mglClear(GLMContext ctx, GLbitfield mask)
 
 void mglClearColor(GLMContext ctx, GLfloat red, GLfloat green, GLfloat blue, GLfloat alpha)
 {
+    static uint64_t s_mglClearColorCallCount = 0;
+    uint64_t callCount = ++s_mglClearColorCallCount;
+
     ctx->state.color_clear_value[0] = red;
     ctx->state.color_clear_value[1] = green;
     ctx->state.color_clear_value[2] = blue;
     ctx->state.color_clear_value[3] = alpha;
 
     ctx->state.dirty_bits |= DIRTY_STATE;
+
+    if (mglShouldTraceClearCall(callCount)) {
+        fprintf(stderr,
+                "MGL TRACE clearColor call=%llu value=(%.3f,%.3f,%.3f,%.3f) fbo=%p(%u) drawBuf=0x%x dirty=0x%x\n",
+                (unsigned long long)callCount,
+                red,
+                green,
+                blue,
+                alpha,
+                (void *)ctx->state.framebuffer,
+                (unsigned)(ctx->state.framebuffer ? ctx->state.framebuffer->name : 0),
+                (unsigned)ctx->state.draw_buffer,
+                (unsigned)ctx->state.dirty_bits);
+    }
 }
 
 void mglClearStencil(GLMContext ctx, GLint s)

@@ -879,6 +879,7 @@ void mglGenBuffers(GLMContext ctx, GLsizei n, GLuint *buffers)
         *buffers++ = name;
         if (call_id <= 64u || (call_id % 512u) == 0u)
         {
+        if (MGL_VERBOSE_BUFFER_MAP_LOGS || call_id <= 32ull || (call_id % 4096ull) == 0ull) {
             fprintf(stderr,
                     "MGL TRACE GenBuffers call=%llu generated=%u currentName=%u tableCount=%zu tableCap=%zu\n",
                     (unsigned long long)call_id,
@@ -886,6 +887,7 @@ void mglGenBuffers(GLMContext ctx, GLsizei n, GLuint *buffers)
                     STATE(buffer_table).current_name,
                     STATE(buffer_table).count,
                     STATE(buffer_table).size);
+        }
         }
     }
 }

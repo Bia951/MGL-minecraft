@@ -19,6 +19,7 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "glm_context.h"
@@ -35,7 +36,173 @@ extern GLuint textureIndexFromTarget(GLMContext ctx, GLenum target);
 extern Texture *newTexObj(GLMContext ctx, GLenum target);
 extern Texture *findTexture(GLMContext ctx, GLuint texture);
 extern Texture *newTexture(GLMContext ctx, GLenum target, GLuint texture);
+bool isCubeMapTarget(GLMContext ctx, GLuint textarget);
 
+static GLubyte mglClampClearComponentToByte(GLfloat value)
+{
+    if (value != value || value <= 0.0f) {
+        return 0;
+    }
+    if (value >= 1.0f) {
+        return 255;
+    }
+    return (GLubyte)(value * 255.0f + 0.5f);
+}
+
+static GLboolean mglAttachmentChangeNeedsPendingClearFlush(FBOAttachment *att,
+                                                           GLuint texture,
+                                                           GLenum textarget,
+                                                           GLint level,
+                                                           GLint layer)
+{
+    if (!att || !(att->clear_bitmask & GL_COLOR_BUFFER_BIT) || !att->buf.tex) {
+        return GL_FALSE;
+    }
+
+    return att->texture != texture ||
+           att->textarget != textarget ||
+           att->level != (GLuint)level ||
+           att->layer != (GLuint)layer;
+}
+
+static GLboolean mglEnsureTextureLevelStorage(TextureLevel *level, size_t required_size, size_t row_pitch)
+{
+    if (!level || required_size == 0u || row_pitch == 0u) {
+        return GL_FALSE;
+    }
+
+    if (level->data && level->data_size >= required_size && level->pitch >= row_pitch) {
+        return GL_TRUE;
+    }
+
+    void *storage = calloc(1u, required_size);
+    if (!storage) {
+        return GL_FALSE;
+    }
+
+    if (level->data) {
+        free((void *)level->data);
+    }
+
+    level->data = (vm_address_t)storage;
+    level->data_size = required_size;
+    level->pitch = row_pitch;
+    return GL_TRUE;
+}
+
+static GLboolean mglFlushPendingColorClearToTexture(GLMContext ctx, FBOAttachment *att, const char *reason)
+{
+    Texture *tex;
+    TextureLevel *level;
+    GLuint face;
+    size_t row_bytes;
+    size_t row_pitch;
+    size_t required_size;
+    MTLPixelFormat mtl_format;
+    GLubyte r, g, b, a;
+    GLubyte pixel[4];
+    GLboolean bgra;
+
+    if (!ctx || !att || !(att->clear_bitmask & GL_COLOR_BUFFER_BIT) || !att->buf.tex) {
+        return GL_FALSE;
+    }
+
+    tex = att->buf.tex;
+    face = isCubeMapTarget(ctx, att->textarget) ? textureIndexFromTarget(ctx, att->textarget) : 0u;
+    if (face >= _CUBE_MAP_MAX_FACE ||
+        att->level >= tex->mipmap_levels ||
+        !tex->faces[face].levels) {
+        fprintf(stderr,
+                "MGL WARNING: fbo.clear.flush skipped invalid target tex=%u face=%u level=%u mipLevels=%u reason=%s\n",
+                tex->name,
+                face,
+                att->level,
+                tex->mipmap_levels,
+                reason ? reason : "unknown");
+        return GL_FALSE;
+    }
+
+    level = &tex->faces[face].levels[att->level];
+    if (!level->complete || level->width == 0u || level->height == 0u) {
+        fprintf(stderr,
+                "MGL WARNING: fbo.clear.flush skipped incomplete level tex=%u face=%u level=%u complete=%d size=%ux%u reason=%s\n",
+                tex->name,
+                face,
+                att->level,
+                level->complete,
+                level->width,
+                level->height,
+                reason ? reason : "unknown");
+        return GL_FALSE;
+    }
+
+    row_bytes = (size_t)level->width * 4u;
+    row_pitch = level->pitch >= row_bytes ? level->pitch : row_bytes;
+    required_size = row_pitch * (size_t)level->height;
+    if (!mglEnsureTextureLevelStorage(level, required_size, row_pitch)) {
+        fprintf(stderr,
+                "MGL WARNING: fbo.clear.flush could not allocate tex=%u face=%u level=%u bytes=%zu reason=%s\n",
+                tex->name,
+                face,
+                att->level,
+                required_size,
+                reason ? reason : "unknown");
+        return GL_FALSE;
+    }
+
+    r = mglClampClearComponentToByte(att->clear_color[0]);
+    g = mglClampClearComponentToByte(att->clear_color[1]);
+    b = mglClampClearComponentToByte(att->clear_color[2]);
+    a = mglClampClearComponentToByte(att->clear_color[3]);
+
+    mtl_format = mtlFormatForGLInternalFormat(tex->internalformat);
+    bgra = (mtl_format == MTLPixelFormatBGRA8Unorm ||
+            mtl_format == MTLPixelFormatBGRA8Unorm_sRGB);
+
+    pixel[0] = bgra ? b : r;
+    pixel[1] = g;
+    pixel[2] = bgra ? r : b;
+    pixel[3] = a;
+
+    for (GLuint y = 0; y < level->height; y++) {
+        GLubyte *row = (GLubyte *)level->data + ((size_t)y * level->pitch);
+        for (GLuint x = 0; x < level->width; x++) {
+            memcpy(row + ((size_t)x * 4u), pixel, sizeof(pixel));
+        }
+    }
+
+    level->has_initialized_data = GL_TRUE;
+    level->ever_written = GL_TRUE;
+    level->suspicious_zero_upload = GL_FALSE;
+    level->last_init_source = kTexMetalFill;
+    level->last_upload_size = required_size;
+    level->last_src_ptr = NULL;
+    level->last_src_hash = 0ull;
+
+    tex->dirty_bits |= DIRTY_TEXTURE_DATA;
+    STATE(dirty_bits) |= DIRTY_TEX | DIRTY_FBO;
+    att->clear_bitmask &= ~GL_COLOR_BUFFER_BIT;
+
+    static unsigned s_flush_logs = 0u;
+    if (s_flush_logs < 64u) {
+        fprintf(stderr,
+                "MGL TRACE fbo.clear.flush tex=%u face=%u level=%u size=%ux%u rgba=(%.3f,%.3f,%.3f,%.3f) byteOrder=%s reason=%s\n",
+                tex->name,
+                face,
+                att->level,
+                level->width,
+                level->height,
+                att->clear_color[0],
+                att->clear_color[1],
+                att->clear_color[2],
+                att->clear_color[3],
+                bgra ? "BGRA" : "RGBA",
+                reason ? reason : "unknown");
+        s_flush_logs++;
+    }
+
+    return GL_TRUE;
+}
 
 #pragma mark renderbuffer logic
 
@@ -685,6 +852,10 @@ void framebufferTexture(GLMContext ctx, GLenum target, GLenum attachment_type, G
                 fbo);
         ERROR_RETURN(GL_INVALID_OPERATION);
         return;
+    }
+
+    if (mglAttachmentChangeNeedsPendingClearFlush(fbo_attachment_ptr, texture, textarget, level, layer)) {
+        mglFlushPendingColorClearToTexture(ctx, fbo_attachment_ptr, "framebufferTexture attachment change");
     }
 
     fbo_attachment_ptr->texture = texture;
