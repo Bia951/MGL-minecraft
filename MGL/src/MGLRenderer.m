@@ -1662,6 +1662,38 @@ static BOOL mglRendererProgramUsesVertexAttrib(Program *program, GLuint attribut
     return NO;
 }
 
+static SpirvResource *mglRendererProgramVertexAttribResource(Program *program, GLuint attribute)
+{
+    if (!program || attribute >= MAX_ATTRIBS) {
+        return NULL;
+    }
+
+    SpirvResourceList *inputs =
+        &program->spirv_resources_list[_VERTEX_SHADER][SPVC_RESOURCE_TYPE_STAGE_INPUT];
+    if (!inputs->list || inputs->count == 0) {
+        return NULL;
+    }
+
+    for (GLuint i = 0; i < inputs->count; i++) {
+        GLuint location = inputs->list[i].location;
+        if (location == attribute || (location == 0xffffffffu && i == attribute)) {
+            return &inputs->list[i];
+        }
+    }
+
+    return NULL;
+}
+
+static bool mglRendererVertexAttribIsColorInput(Program *program, GLuint attribute)
+{
+    SpirvResource *resource = mglRendererProgramVertexAttribResource(program, attribute);
+    const char *name = resource ? resource->name : NULL;
+    return name &&
+           (strcasecmp(name, "Color") == 0 ||
+            strcasecmp(name, "vertexColor") == 0 ||
+            strcasecmp(name, "VertColor") == 0);
+}
+
 static int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
                                                         VertexArray *vao,
                                                         GLuint attribute,
@@ -7832,7 +7864,7 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
         id<MTLTexture> expectedDepth = nil;
         id<MTLTexture> expectedStencil = nil;
         if (mgl_drawbuffer < _MAX_DRAW_BUFFERS) {
-            BOOL defaultPassNeedsDepth = ctx->state.caps.depth_test || ctx->state.var.depth_writemask;
+            BOOL defaultPassNeedsDepth = ctx->state.caps.depth_test;
             BOOL defaultPassNeedsStencil = ctx->state.caps.stencil_test || ctx->stencil_format.format;
             expectedDepth = defaultPassNeedsDepth ? _drawBuffers[mgl_drawbuffer].depthbuffer : nil;
             expectedStencil = defaultPassNeedsStencil ? _drawBuffers[mgl_drawbuffer].stencilbuffer : nil;
@@ -7975,14 +8007,24 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
 
     if (tex->dirty_bits)
     {
-        // release mtl data
+        bool textureNeedsRebuild =
+            (tex->dirty_bits & (DIRTY_TEXTURE_LEVEL | DIRTY_TEXTURE_DATA | DIRTY_TEXTURE_ACCESS)) != 0;
+        bool samplerNeedsRebuild =
+            textureNeedsRebuild || ((tex->dirty_bits & DIRTY_TEXTURE_PARAM) != 0);
+
+        // Texture parameter changes only affect the Metal sampler object. Do
+        // not throw away texture storage for wrap/filter/lod updates; doing so
+        // can turn Minecraft's frequent sampler changes into render-pass and
+        // upload storms.
         if (tex->mtl_data)
         {
-            CFBridgingRelease(tex->mtl_data);
-            tex->mtl_data = NULL;
+            if (textureNeedsRebuild) {
+                CFBridgingRelease(tex->mtl_data);
+                tex->mtl_data = NULL;
+            }
         }
 
-        if (tex->params.mtl_data)
+        if (samplerNeedsRebuild && tex->params.mtl_data)
         {
             CFBridgingRelease(tex->params.mtl_data);
             tex->params.mtl_data = NULL;
@@ -8010,6 +8052,10 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
             NSLog(@"MGL SUCCESS: Primary texture created successfully");
         }
 
+    }
+
+    if (tex->params.mtl_data == NULL)
+    {
         tex->params.mtl_data = (void *)CFBridgingRetain([self createMTLSamplerForTexParam:&tex->params target:tex->target]);
         // Sampler creation should not fail even in recovery mode
         if (!tex->params.mtl_data) {
@@ -9461,7 +9507,7 @@ void mtlBlitFramebuffer(GLMContext glm_ctx, GLint srcX0, GLint srcY0, GLint srcX
         // attach depth. The default framebuffer must have a usable depth
         // attachment whenever GL depth testing is active, even if the legacy
         // context format fields were left unset by the window/bootstrap path.
-        BOOL defaultPassNeedsDepth = ctx->state.caps.depth_test || ctx->state.var.depth_writemask;
+        BOOL defaultPassNeedsDepth = ctx->state.caps.depth_test;
         if (defaultPassNeedsDepth)
         {
             MTLPixelFormat depthFormat = ctx->depth_format.mtl_pixel_format;
@@ -10802,9 +10848,17 @@ create_new_command_buffer:
                 return NULL;
             }
 
+            GLboolean normalized = vao->attrib[i].normalized;
+            if (!normalized &&
+                vao->attrib[i].type == GL_UNSIGNED_BYTE &&
+                vao->attrib[i].size == 4 &&
+                mglRendererVertexAttribIsColorInput(activeProgram, i)) {
+                normalized = GL_TRUE;
+            }
+
             format = glTypeSizeToMtlType(vao->attrib[i].type,
                                          vao->attrib[i].size,
-                                         vao->attrib[i].normalized);
+                                         normalized);
 
             if (format == MTLVertexFormatInvalid)
             {
@@ -10849,7 +10903,7 @@ create_new_command_buffer:
                       (unsigned)vao->attrib[i].stride,
                       (unsigned)vao->attrib[i].size,
                       (unsigned)vao->attrib[i].type,
-                      (unsigned)vao->attrib[i].normalized,
+                      (unsigned)normalized,
                       (unsigned)vao->attrib[i].divisor,
                       (unsigned long)format,
                       mglVertexFormatName(format));
@@ -10857,7 +10911,8 @@ create_new_command_buffer:
 
             if (vao->attrib[i].type == GL_UNSIGNED_BYTE &&
                 vao->attrib[i].size == 4 &&
-                vao->attrib[i].normalized == GL_FALSE) {
+                vao->attrib[i].normalized == GL_FALSE &&
+                !normalized) {
                 if (kMGLVerbosePipelineLogs) {
                     NSLog(@"MGL VERTEX DESC note: attrib %u uses UBYTE4 non-normalized (format=%lu)",
                           i, (unsigned long)format);
@@ -11464,35 +11519,29 @@ create_new_command_buffer:
         }
 
         // dirty tex covers all texture modifications
-        if (ctx->state.dirty_bits & (DIRTY_PROGRAM | DIRTY_TEX | DIRTY_TEX_BINDING | DIRTY_SAMPLER))
+        if (ctx->state.dirty_bits & (DIRTY_PROGRAM | DIRTY_TEX | DIRTY_TEX_PARAM | DIRTY_TEX_BINDING | DIRTY_SAMPLER))
         {
             RETURN_FALSE_ON_FAILURE([self bindActiveTexturesToMTL]);
             RETURN_FALSE_ON_FAILURE([self bindTexturesToCurrentRenderEncoder]);
 
             // textures / active textures and samplers are all handled in bindActiveTexturesToMTL
-            ctx->state.dirty_bits &= ~(DIRTY_TEX | DIRTY_TEX_BINDING | DIRTY_SAMPLER);
+            ctx->state.dirty_bits &= ~(DIRTY_TEX | DIRTY_TEX_PARAM | DIRTY_TEX_BINDING | DIRTY_SAMPLER);
         }
 
-        // a dirty vao needs to update the render encoder and buffer list
+        // A dirty VAO changes vertex buffer bindings and may require a new
+        // pipeline descriptor, but it does not change the render-pass
+        // attachments. Keep the current encoder alive so GL draw ordering and
+        // depth/load-store continuity are preserved across HUD/hand/UI passes.
         if (ctx->state.dirty_bits & DIRTY_VAO)
         {
             // updateDirtyBaseBufferList binds new mtl buffers or updates old ones
             RETURN_FALSE_ON_FAILURE([self updateDirtyBaseBufferList: &ctx->state.vertex_buffer_map_list]);
             RETURN_FALSE_ON_FAILURE([self updateDirtyBaseBufferList: &ctx->state.fragment_buffer_map_list]);
 
-            // A DIRTY_FBO rebuild already ended and recreated the render encoder in
-            // this state pass. Avoid immediately closing that fresh encoder just
-            // because VAO is also dirty; resources are rebound again before draw.
-            if (!rebuiltRenderPassForFBO || !_currentRenderEncoder)
-            {
-                [self endRenderEncoding];
+            if (!_currentRenderEncoder) {
                 RETURN_FALSE_ON_FAILURE([self newRenderEncoder]);
             }
 
-            // VAO changes can coincide with GL state changes such as disabling
-            // depth for UI draws. newRenderEncoder applies this for fresh
-            // encoders, but the FBO-rebuild path may have already created one;
-            // apply dynamic state here before clearing the dirty bit.
             [self updateCurrentRenderEncoder];
 
             // clear dirty render state

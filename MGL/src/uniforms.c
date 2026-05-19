@@ -262,6 +262,7 @@ static GLboolean mglFindSamplerUniformBinding(Program *program, GLint location, 
 
 static GLboolean mglSetSamplerUniformUnit(GLMContext ctx, GLint location, GLint unit)
 {
+    ctx = mglUniformResolveContext(ctx, __FUNCTION__);
     if (!ctx || location < 0) {
         return GL_FALSE;
     }
@@ -281,9 +282,23 @@ static GLboolean mglSetSamplerUniformUnit(GLMContext ctx, GLint location, GLint 
         ERROR_RETURN_VALUE(GL_INVALID_VALUE, GL_TRUE);
     }
 
+    GLboolean changed = (program->sampler_units[binding] != unit);
     program->sampler_units[binding] = unit;
     if (stage >= 0 && stage < _MAX_SHADER_TYPES) {
+        changed = changed || (program->sampler_units_by_stage[stage][binding] != unit);
         program->sampler_units_by_stage[stage][binding] = unit;
+    } else {
+        for (int shader_stage = 0; shader_stage < _MAX_SHADER_TYPES; shader_stage++) {
+            if (program->sampler_units_by_stage[shader_stage][binding] >= 0 &&
+                program->sampler_units_by_stage[shader_stage][binding] != unit) {
+                changed = GL_TRUE;
+                program->sampler_units_by_stage[shader_stage][binding] = unit;
+            }
+        }
+    }
+
+    if (changed) {
+        ctx->state.dirty_bits |= DIRTY_TEX_BINDING | DIRTY_SAMPLER;
     }
     return GL_TRUE;
 }
