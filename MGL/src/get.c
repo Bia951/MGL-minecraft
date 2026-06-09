@@ -47,6 +47,7 @@ static const char *kMglExtensions[] = {
     "GL_ARB_draw_instanced",
     "GL_ARB_shading_language_420pack",
     "GL_ARB_separate_shader_objects",
+    "GL_EXT_texture_filter_anisotropic",
 };
 static_assert((sizeof(kMglExtensions) / sizeof(kMglExtensions[0])) == MGL_NUM_EXTENSIONS,
               "MGL_NUM_EXTENSIONS must match kMglExtensions");
@@ -484,6 +485,15 @@ static void mglGet(GLMContext ctx, GLenum pname, GLuint type, void *data)
         case 0x80CB: RET_TYPE_VAR(type, blend_src_alpha[0]); break; // GL_BLEND_SRC_ALPHA
 
         case 0x84FD: RET_TYPE_VAR(type, max_texture_lod_bias); break; // GL_MAX_TEXTURE_LOD_BIAS
+        case 0x84FF: { // GL_MAX_TEXTURE_MAX_ANISOTROPY
+            switch(type) {
+                case kFloat: *(GLfloat *)data = 16.0f; break;
+                case kDouble: *(GLdouble *)data = 16.0; break;
+                case kInt: *(GLint *)data = 16; break;
+                case kBool: *(GLboolean *)data = GL_TRUE; break;
+            }
+            break;
+        }
 
         case 0x8005: RET_TYPE_VAR_COUNT(type, blend_color,4); break; // GL_BLEND_COLOR
 

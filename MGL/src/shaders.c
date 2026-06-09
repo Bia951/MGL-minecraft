@@ -18,6 +18,7 @@
  *
  */
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -171,13 +172,15 @@ static size_t mgl_normalize_layout_qualifiers(char *dst, size_t dst_capacity,
 /* Scan GLSL source for "layout(...) uniform BlockName" declarations and ensure
  * each one carries a binding = N qualifier required for SPIR-V / Metal.
  * Unsupported packing modes (packed, shared) are normalized to std140.
+ * Returns true if any bindings were injected (requiring version upgrade).
  */
-static void mgl_patch_uniform_block_bindings(char *src, size_t src_capacity)
+static bool mgl_patch_uniform_block_bindings(char *src, size_t src_capacity)
 {
     char *cursor = src;
+    bool patched = false;
 
     if (!src || src_capacity == 0) {
-        return;
+        return false;
     }
 
     while (*cursor) {
@@ -261,6 +264,7 @@ static void mgl_patch_uniform_block_bindings(char *src, size_t src_capacity)
                 memset(layout + repl_len, ' ', old_len - repl_len);
             }
             cursor = layout + old_len;
+            patched = true;
         } else {
             /* New text is longer: shift the tail right. */
             size_t tail_len = strlen(layout + old_len);
@@ -274,8 +278,10 @@ static void mgl_patch_uniform_block_bindings(char *src, size_t src_capacity)
             memmove(layout + repl_len, layout + old_len, tail_len + 1);
             memcpy(layout, replacement, repl_len);
             cursor = layout + repl_len;
+            patched = true;
         }
     }
+    return patched;
 }
 
 static void mgl_ensure_420pack_extension(char *src, size_t src_capacity)
@@ -559,9 +565,11 @@ void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t
 
         /* Inject explicit UBO bindings for desktop GLSL sources that omit them.
          * Newer glslang/SPIR-V paths may require these at parse time. */
-        mgl_patch_uniform_block_bindings(modified_src, modified_src_size);
-        mgl_upgrade_version_for_bindings(modified_src);
-        mgl_ensure_420pack_extension(modified_src, modified_src_size);
+        bool ubo_patched = mgl_patch_uniform_block_bindings(modified_src, modified_src_size);
+        if (ubo_patched) {
+            mgl_upgrade_version_for_bindings(modified_src);
+            mgl_ensure_420pack_extension(modified_src, modified_src_size);
+        }
         mgl_downgrade_derivative_control_intrinsics(modified_src);
 
         if (strstr(modified_src, "#version 420") != NULL && glsl_version < 420) {

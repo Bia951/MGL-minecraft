@@ -1693,6 +1693,36 @@ void mglGetActiveUniformBlockiv(GLMContext ctx, GLuint program, GLuint uniformBl
         case GL_UNIFORM_BLOCK_REFERENCED_BY_FRAGMENT_SHADER:
             *params = mglUniformBlockReferencedByStage(ptr, block, _FRAGMENT_SHADER);
             break;
+        case GL_UNIFORM_BLOCK_REFERENCED_BY_TESS_CONTROL_SHADER:
+            *params = GL_FALSE;
+            break;
+        case GL_UNIFORM_BLOCK_REFERENCED_BY_TESS_EVALUATION_SHADER:
+            *params = GL_FALSE;
+            break;
+        case GL_UNIFORM_BLOCK_REFERENCED_BY_COMPUTE_SHADER:
+            *params = GL_FALSE;
+            break;
+        case GL_UNIFORM_BLOCK_ACTIVE_UNIFORM_INDICES:
+            /* Compute global active-uniform indices for each UBO member.
+             * The caller provides a buffer sized for
+             * GL_UNIFORM_BLOCK_ACTIVE_UNIFORMS entries. */
+            if (block->ubo_members && block->ubo_member_count > 0) {
+                GLint total = mglProgramActiveUniformCount(ptr);
+                GLuint member_idx = 0;
+                for (GLint ui = 0; ui < total && member_idx < block->ubo_member_count; ui++) {
+                    SpirvResource *res = mglProgramActiveUniformAt(ptr, (GLuint)ui, NULL, NULL);
+                    if (res && res->ubo_member) {
+                        /* Check this member belongs to our block. */
+                        for (GLuint m = 0; m < block->ubo_member_count; m++) {
+                            if (res->ubo_member == &block->ubo_members[m]) {
+                                params[member_idx++] = ui;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            break;
         default:
             ERROR_RETURN(GL_INVALID_ENUM);
             break;

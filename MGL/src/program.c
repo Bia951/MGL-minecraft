@@ -1621,104 +1621,115 @@ static void applyMSLUniformBufferPacking(Program *pptr, int stage)
     }
 
     /*
-     * Uniform buffers use GL/std140 layout. A vec3 member still occupies a
-     * 16-byte slot there, and Metal's float3 struct alignment matches that
-     * requirement. Rewriting uniform float3 fields to packed_float3 shifts
-     * subsequent members, e.g. CloudInfo.CellSize moves from offset 32 to 28.
+     * Minecraft writes UBO data in GLSL std140 layout (confirmed via apitrace
+     * blob dump: 56-byte Globals UBO data has 4-byte padding after ivec3 and
+     * vec3 members). SPIRV-Cross emits Metal structs with natural C alignment
+     * where float3 is 4-byte aligned.  Insert explicit padding fields so the
+     * Metal struct layout matches the std140 data in the buffer.
      */
-    return;
-
     const char *src = pptr->spirv[stage].msl_str;
-    size_t len = strlen(src);
-    size_t cap = len + 1;
+    size_t src_len = strlen(src);
+    size_t cap = src_len + src_len / 2 + 4096;
     char *out = (char *)malloc(cap);
-    if (!out) {
-        return;
-    }
+    if (!out) return;
 
-    size_t out_len = 0;
-    bool in_struct = false;
-    bool patch_struct = false;
-    unsigned patched = 0;
+        size_t out_len = 0;
+        bool in_struct = false;
+        bool patch_struct = false;
+        unsigned pad_count = 0;
+        size_t metal_offset = 0; /* actual Metal C-layout byte position */
 
-    const char *p = src;
-    while (*p) {
-        const char *line_start = p;
-        const char *line_end = strchr(p, '\n');
-        size_t line_len = line_end ? (size_t)(line_end - line_start + 1) : strlen(line_start);
-        size_t content_len = line_end ? line_len - 1 : line_len;
+        const char *p = src;
+        while (*p) {
+            const char *line_start = p;
+            const char *line_end = strchr(p, '\n');
+            size_t line_len = line_end ? (size_t)(line_end - line_start + 1) : strlen(line_start);
 
-        if (!in_struct) {
-            char struct_name[128] = {0};
-            if (sscanf(line_start, "struct %127s", struct_name) == 1) {
-                char *brace = strchr(struct_name, '{');
-                if (brace) {
-                    *brace = '\0';
+            /* Detect struct entry/exit. */
+            if (!in_struct) {
+                char st[128] = {0};
+                if (sscanf(line_start, "struct %127s", st) == 1) {
+                    char *brace = strchr(st, '{');
+                    if (brace) *brace = '\0';
+                    in_struct = true;
+                    patch_struct = mglUniformStructName(st);
+                    metal_offset = 0;
                 }
-                in_struct = true;
-                patch_struct = mglUniformStructName(struct_name);
             }
-        }
 
-        const char *needle = "float3 ";
-        const char *match = NULL;
-        if (in_struct && patch_struct) {
-            match = strstr(line_start, needle);
-            if (match && match >= line_start + content_len) {
-                match = NULL;
+            /* Ensure output capacity. */
+            if (out_len + line_len + 128 > cap) {
+                cap = out_len + line_len + 4096;
+                char *grown = (char *)realloc(out, cap);
+                if (!grown) { free(out); return; }
+                out = grown;
             }
-        }
 
-        size_t replacement_len = strlen("packed_float3 ");
-        size_t needle_len = strlen(needle);
-        size_t extra = match ? replacement_len - needle_len : 0;
-        if (out_len + line_len + extra + 1 > cap) {
-            while (out_len + line_len + extra + 1 > cap) {
-                cap *= 2;
-            }
-            char *grown = (char *)realloc(out, cap);
-            if (!grown) {
-                free(out);
-                return;
-            }
-            out = grown;
-        }
+            if (in_struct && patch_struct) {
+                const char *trimmed = line_start;
+                while (*trimmed == ' ' || *trimmed == '\t') trimmed++;
 
-        if (match) {
-            size_t prefix_len = (size_t)(match - line_start);
-            memcpy(out + out_len, line_start, prefix_len);
-            out_len += prefix_len;
-            memcpy(out + out_len, "packed_float3 ", replacement_len);
-            out_len += replacement_len;
-            size_t suffix_off = prefix_len + needle_len;
-            memcpy(out + out_len, line_start + suffix_off, line_len - suffix_off);
-            out_len += line_len - suffix_off;
-            patched++;
-        } else {
+                /* Map Metal type to: (C_size, std140_align). */
+                size_t c_size = 0, std140_align = 0;
+                if (strncmp(trimmed, "float3 ", 7) == 0)   { c_size = 12; std140_align = 16; }
+                else if (strncmp(trimmed, "int3 ", 5) == 0) { c_size = 12; std140_align = 16; }
+                else if (strncmp(trimmed, "uint3 ", 6) == 0){ c_size = 12; std140_align = 16; }
+                else if (strncmp(trimmed, "float4 ", 7) == 0) { c_size = 16; std140_align = 16; }
+                else if (strncmp(trimmed, "int4 ", 5) == 0)   { c_size = 16; std140_align = 16; }
+                else if (strncmp(trimmed, "uint4 ", 6) == 0)  { c_size = 16; std140_align = 16; }
+                else if (strncmp(trimmed, "float4x4 ", 9) == 0) { c_size = 64; std140_align = 16; }
+                else if (strncmp(trimmed, "float3x3 ", 9) == 0) { c_size = 48; std140_align = 16; }
+                else if (strncmp(trimmed, "float2x2 ", 9) == 0) { c_size = 16; std140_align = 8; }
+                else if (strncmp(trimmed, "float2 ", 7) == 0) { c_size = 8; std140_align = 8; }
+                else if (strncmp(trimmed, "int2 ", 5) == 0)   { c_size = 8; std140_align = 8; }
+                else if (strncmp(trimmed, "uint2 ", 6) == 0)  { c_size = 8; std140_align = 8; }
+                else if (strncmp(trimmed, "float ", 6) == 0)  { c_size = 4; std140_align = 4; }
+                else if (strncmp(trimmed, "int ", 4) == 0)    { c_size = 4; std140_align = 4; }
+                else if (strncmp(trimmed, "uint ", 5) == 0)   { c_size = 4; std140_align = 4; }
+
+                if (std140_align > 0) {
+                    /* Insert pad if current Metal offset doesn't meet std140 alignment. */
+                    size_t misalign = metal_offset % std140_align;
+                    if (misalign != 0) {
+                        size_t pad = std140_align - misalign;
+                        while (pad >= 4) {
+                            int n = snprintf(out + out_len, cap - out_len,
+                                             "    int _mgl_pad%u;\n", pad_count++);
+                            if (n > 0) { out_len += (size_t)n; metal_offset += 4; pad -= 4; }
+                            else break;
+                        }
+                    }
+                    /* Copy member as-is. */
+                    memcpy(out + out_len, line_start, line_len);
+                    out_len += line_len;
+                    metal_offset += c_size; /* natural C size */
+                    p = line_end ? line_end + 1 : line_start + line_len;
+                    continue;
+                }
+            }
+
+            /* Copy line as-is. */
             memcpy(out + out_len, line_start, line_len);
             out_len += line_len;
+
+            if (in_struct && memchr(line_start, '}', line_len - (line_end ? 1 : 0))) {
+                in_struct = false;
+                patch_struct = false;
+                metal_offset = 0;
+            }
+
+            p = line_end ? line_end + 1 : line_start + line_len;
         }
 
-        if (in_struct && memchr(line_start, '}', content_len)) {
-            in_struct = false;
-            patch_struct = false;
+        out[out_len] = '\0';
+        if (pad_count > 0) {
+            fprintf(stderr, "MGL MSL STd140 PAD: program=%u stage=%d %u pad(s)\n",
+                    pptr->name, stage, pad_count);
+            free(pptr->spirv[stage].msl_str);
+            pptr->spirv[stage].msl_str = out;
+        } else {
+            free(out);
         }
-
-        p = line_end ? line_end + 1 : line_start + line_len;
-    }
-
-    out[out_len] = '\0';
-    if (patched > 0) {
-        fprintf(stderr,
-                "MGL MSL PACKING FIX: program=%u stage=%d converted %u uniform float3 field(s) to packed_float3\n",
-                pptr->name,
-                stage,
-                patched);
-        free(pptr->spirv[stage].msl_str);
-        pptr->spirv[stage].msl_str = out;
-    } else {
-        free(out);
-    }
 }
 
 char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
@@ -2139,7 +2150,77 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
 
                 const char *member_name =
                     spvc_compiler_get_member_name(compiler_msl, ubo->type_id, mem_idx);
-                member->name = member_name ? strdup(member_name) : NULL;
+                /* SPIR-V may emit the GLSL *type* as a member name (e.g. "float",
+                 * "int", "mat3") when debug info is stripped.  Check if the name
+                 * looks like a type keyword; if so, fall through to GLSL recovery. */
+                bool name_looks_like_type = false;
+                if (member_name && member_name[0]) {
+                    static const char *glsl_types[] = {
+                        "float","int","uint","bool","double",
+                        "vec2","vec3","vec4","ivec2","ivec3","ivec4",
+                        "uvec2","uvec3","uvec4","bvec2","bvec3","bvec4",
+                        "dvec2","dvec3","dvec4",
+                        "mat2","mat3","mat4","mat2x2","mat2x3","mat2x4",
+                        "mat3x2","mat3x3","mat3x4","mat4x2","mat4x3","mat4x4",
+                        "dmat2","dmat3","dmat4",
+                        "sampler2D","samplerCube","sampler3D",
+                        "isampler2D","usampler2D",
+                        NULL
+                    };
+                    for (int ti = 0; glsl_types[ti]; ti++) {
+                        if (strcmp(member_name, glsl_types[ti]) == 0) {
+                            name_looks_like_type = true;
+                            break;
+                        }
+                    }
+                }
+                if (member_name && member_name[0] && !name_looks_like_type) {
+                    member->name = strdup(member_name);
+                } else {
+                    /* Recover member name from GLSL source when SPIR-V lacks OpMemberName. */
+                    member->name = NULL;
+                    const char *glsl_src = ptr->shader_slots[stage]
+                        ? ptr->shader_slots[stage]->src : NULL;
+                    if (glsl_src && ubo->name && ubo->name[0]) {
+                        const char *pos = glsl_src;
+                        size_t blen = strlen(ubo->name);
+                        while ((pos = strstr(pos, ubo->name)) != NULL) {
+                            const char *brace = pos + blen;
+                            while (*brace && isspace((unsigned char)*brace)) brace++;
+                            if (*brace == '{') {
+                                const char *p = brace + 1;
+                                unsigned nth = 0;
+                                while (*p && nth <= mem_idx) {
+                                    while (*p && (isspace((unsigned char)*p) || *p == ';')) p++;
+                                    if (!*p || *p == '}') break;
+                                    const char *te = p;
+                                    while (*te && !isspace((unsigned char)*te) && *te != '{' && *te != '}') te++;
+                                    while (*te && isspace((unsigned char)*te)) te++;
+                                    if (isalpha((unsigned char)*te) || *te == '_') {
+                                        const char *ne = te;
+                                        while (*ne && (isalnum((unsigned char)*ne) || *ne == '_')) ne++;
+                                        if (nth == mem_idx) {
+                                            size_t nlen = (size_t)(ne - te);
+                                            char *rec = malloc(nlen + 1);
+                                            if (rec) { memcpy(rec, te, nlen); rec[nlen] = '\0'; member->name = rec; }
+                                            break;
+                                        }
+                                        nth++; p = ne;
+                                    } else { p = te; }
+                                    while (*p && *p != ';' && *p != '}') p++;
+                                    if (*p == ';') p++;
+                                }
+                            }
+                            if (member->name) break;
+                            pos += blen;
+                        }
+                    }
+                    if (!member->name) {
+                        char synthetic[32];
+                        snprintf(synthetic, sizeof(synthetic), "_ubo_m%u", mem_idx);
+                        member->name = strdup(synthetic);
+                    }
+                }
 
                 spvc_type_id member_type_id = spvc_type_get_member_type(struct_type, mem_idx);
                 spvc_type member_type = spvc_compiler_get_type_handle(compiler_msl, member_type_id);
@@ -2149,15 +2230,11 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
 
                 member->matrix_stride = (GLint)spvc_compiler_get_member_decoration(
                     compiler_msl, ubo->type_id, mem_idx, SpvDecorationMatrixStride);
-                if (member->matrix_stride == 0) {
-                    member->matrix_stride = -1;
-                }
+                if (member->matrix_stride == 0) member->matrix_stride = 0;
 
                 member->array_stride = (GLint)spvc_compiler_get_member_decoration(
                     compiler_msl, ubo->type_id, mem_idx, SpvDecorationArrayStride);
-                if (member->array_stride == 0) {
-                    member->array_stride = -1;
-                }
+                if (member->array_stride == 0) member->array_stride = 0;
 
                 unsigned row_major_raw = spvc_compiler_get_member_decoration(
                     compiler_msl, ubo->type_id, mem_idx, SpvDecorationRowMajor);
@@ -2166,79 +2243,78 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
                 member->is_row_major = (row_major_raw != 0) ? GL_TRUE : GL_FALSE;
                 (void)col_major_raw;
 
-                /* Determine GL type enum from the SPIR-V member type. */
+                /* Determine GL type. SPIR-V represents GLSL bool as uint32 for UBO
+                 * layout, so check GLSL source when SPIR-V basetype is ambiguous. */
+                member->gl_type = GL_FLOAT;
                 if (member_type) {
                     spvc_basetype base = spvc_type_get_basetype(member_type);
-                    unsigned vec_size = spvc_type_get_vector_size(member_type);
+                    unsigned raw_vec = spvc_type_get_vector_size(member_type);
+                    unsigned vec_size = raw_vec > 0 ? raw_vec : 1;
                     unsigned cols = spvc_type_get_columns(member_type);
-                    member->gl_type = GL_FLOAT; /* safe default */
 
                     switch (base) {
                         case SPVC_BASETYPE_FP32:
                             if (cols > 1) {
-                                static const GLuint fp32_mat_types[] = {
-                                    0, GL_FLOAT_MAT2, GL_FLOAT_MAT2x3, GL_FLOAT_MAT2x4,
-                                    GL_FLOAT_MAT3x2, GL_FLOAT_MAT3, GL_FLOAT_MAT3x4,
-                                    GL_FLOAT_MAT4x2, GL_FLOAT_MAT4x3, GL_FLOAT_MAT4
-                                };
+                                static const GLuint mats[] = {0, GL_FLOAT_MAT2, GL_FLOAT_MAT2x3, GL_FLOAT_MAT2x4, GL_FLOAT_MAT3x2, GL_FLOAT_MAT3, GL_FLOAT_MAT3x4, GL_FLOAT_MAT4x2, GL_FLOAT_MAT4x3, GL_FLOAT_MAT4};
                                 unsigned key = (cols - 2) * 3 + (vec_size - 2) + 1;
-                                if (key < sizeof(fp32_mat_types) / sizeof(fp32_mat_types[0])) {
-                                    member->gl_type = fp32_mat_types[key];
-                                }
-                            } else {
-                                static const GLuint fp32_vec_types[] = {
-                                    0, GL_FLOAT, GL_FLOAT_VEC2, GL_FLOAT_VEC3, GL_FLOAT_VEC4
-                                };
-                                if (vec_size < sizeof(fp32_vec_types) / sizeof(fp32_vec_types[0])) {
-                                    member->gl_type = fp32_vec_types[vec_size];
-                                }
+                                if (key < sizeof(mats)/sizeof(mats[0])) member->gl_type = mats[key];
+                            } else if (vec_size >= 1 && vec_size <= 4) {
+                                static const GLuint v[] = {GL_FLOAT, GL_FLOAT_VEC2, GL_FLOAT_VEC3, GL_FLOAT_VEC4};
+                                member->gl_type = v[vec_size - 1];
                             }
                             break;
                         case SPVC_BASETYPE_INT32:
-                            static const GLuint int32_vec_types[] = {
-                                0, GL_INT, GL_INT_VEC2, GL_INT_VEC3, GL_INT_VEC4
-                            };
-                            if (vec_size < sizeof(int32_vec_types) / sizeof(int32_vec_types[0])) {
-                                member->gl_type = int32_vec_types[vec_size];
+                            if (vec_size >= 1 && vec_size <= 4) {
+                                static const GLuint v[] = {GL_INT, GL_INT_VEC2, GL_INT_VEC3, GL_INT_VEC4};
+                                member->gl_type = v[vec_size - 1];
                             }
                             break;
                         case SPVC_BASETYPE_UINT32:
-                            static const GLuint uint32_vec_types[] = {
-                                0, GL_UNSIGNED_INT, GL_UNSIGNED_INT_VEC2,
-                                GL_UNSIGNED_INT_VEC3, GL_UNSIGNED_INT_VEC4
-                            };
-                            if (vec_size < sizeof(uint32_vec_types) / sizeof(uint32_vec_types[0])) {
-                                member->gl_type = uint32_vec_types[vec_size];
+                            /* GLSL bool has same SPIR-V layout as uint (both scalar uint32).
+                             * Check original GLSL source to distinguish bool from uint. */
+                            {
+                                const char *glsl_src = ptr->shader_slots[stage] ? ptr->shader_slots[stage]->src : NULL;
+                                if (glsl_src && member->name) {
+                                    const char *pos = glsl_src; size_t nlen = strlen(member->name);
+                                    while ((pos = strstr(pos, member->name)) != NULL) {
+                                        /* Skip whitespace between type keyword and name. */
+                                        const char *te = pos; while (te > glsl_src && isspace((unsigned char)te[-1])) te--;
+                                        const char *ts = te;   while (ts > glsl_src && !isspace((unsigned char)ts[-1]) && ts[-1] != '\n') ts--;
+                                        size_t tl = (size_t)(te - ts);
+                                        if (tl == 4 && memcmp(ts, "bool", 4) == 0) { member->gl_type = GL_BOOL; break; }
+                                        if (tl == 5 && memcmp(ts, "bvec2", 5) == 0) { member->gl_type = GL_BOOL_VEC2; break; }
+                                        if (tl == 5 && memcmp(ts, "bvec3", 5) == 0) { member->gl_type = GL_BOOL_VEC3; break; }
+                                        if (tl == 5 && memcmp(ts, "bvec4", 5) == 0) { member->gl_type = GL_BOOL_VEC4; break; }
+                                        /* Non-bool UINT32 types just keep the SPIR-V derived type below. */
+                                        pos += nlen;
+                                    }
+                                }
+                            }
+                            if (member->gl_type == GL_FLOAT && vec_size >= 1 && vec_size <= 4) {
+                                static const GLuint v[] = {GL_UNSIGNED_INT, GL_UNSIGNED_INT_VEC2, GL_UNSIGNED_INT_VEC3, GL_UNSIGNED_INT_VEC4};
+                                member->gl_type = v[vec_size - 1];
                             }
                             break;
                         case SPVC_BASETYPE_BOOLEAN:
-                            static const GLuint bool_vec_types[] = {
-                                0, GL_BOOL, GL_BOOL_VEC2, GL_BOOL_VEC3, GL_BOOL_VEC4
-                            };
-                            if (vec_size < sizeof(bool_vec_types) / sizeof(bool_vec_types[0])) {
-                                member->gl_type = bool_vec_types[vec_size];
+                            if (vec_size >= 1 && vec_size <= 4) {
+                                static const GLuint v[] = {GL_BOOL, GL_BOOL_VEC2, GL_BOOL_VEC3, GL_BOOL_VEC4};
+                                member->gl_type = v[vec_size - 1];
                             }
                             break;
                         case SPVC_BASETYPE_FP64:
-                            if (vec_size == 1) member->gl_type = GL_DOUBLE;
-                            else if (vec_size == 2) member->gl_type = GL_DOUBLE_VEC2;
-                            else if (vec_size == 3) member->gl_type = GL_DOUBLE_VEC3;
-                            else if (vec_size == 4) member->gl_type = GL_DOUBLE_VEC4;
+                            if (raw_vec <= 1) member->gl_type = GL_DOUBLE;
+                            else if (raw_vec == 2) member->gl_type = GL_DOUBLE_VEC2;
+                            else if (raw_vec == 3) member->gl_type = GL_DOUBLE_VEC3;
+                            else if (raw_vec == 4) member->gl_type = GL_DOUBLE_VEC4;
                             break;
-                        default:
-                            member->gl_type = GL_FLOAT;
-                            break;
+                        default: break;
                     }
                 }
 
-                /* Determine array size: if the member type is itself an array,
-                 * SPIRV-Cross reports the element count via the type. */
                 member->size = 1;
                 if (member_type) {
                     unsigned array_dims = spvc_type_get_num_array_dimensions(member_type);
-                    if (array_dims > 0) {
-                        member->size = (GLint)spvc_type_get_array_dimension(member_type, 0);
-                    }
+                    if (array_dims > 0) member->size = (GLint)spvc_type_get_array_dimension(member_type, 0);
                 }
             }
         }
@@ -3030,10 +3106,12 @@ void mglGetActiveUniform(GLMContext ctx, GLuint program, GLuint index, GLsizei b
     }
 
     if (size) {
-        *size = mglProgramActiveUniformSize(res, res_type);
+        *size = res->ubo_member ? res->ubo_member->size
+                                : mglProgramActiveUniformSize(res, res_type);
     }
     if (type) {
-        *type = (GLenum)mglProgramActiveUniformGLType(res, res_type);
+        *type = res->ubo_member ? (GLenum)res->ubo_member->gl_type
+                                : (GLenum)mglProgramActiveUniformGLType(res, res_type);
     }
     mglProgramCopyActiveUniformName(res, bufSize, length, name);
 }

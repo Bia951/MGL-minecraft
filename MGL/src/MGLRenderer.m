@@ -7932,12 +7932,17 @@ void logDirtyBits(GLMContext ctx)
             }
         }
         NSUInteger availableBytes = metalLen - bindOffset;
-        // Honor the GL buffer-range size. Metal validation may require a larger
-        // reflected argument length, but bytes outside the GL range must not be
-        // exposed to the shader; they are zero-filled by the padding path below.
+        // When the Metal buffer is larger than the GL binding range, use the
+        // full Metal buffer size for validation.  Minecraft 1.21.11 commonly
+        // writes a full UBO struct (e.g. 64-byte Globals) but binds a slightly
+        // smaller range (56 bytes) due to padding differences.  Clamping here
+        // would force a zero-padded copy that truncates real shader data.
+        //
+        // Only clamp when the GL range is *larger* than the Metal buffer
+        // (emulated via setVertexBytes), not the other way around.
         if (isBaseBinding &&
             map->size > 0 &&
-            (NSUInteger)map->size < availableBytes) {
+            (NSUInteger)map->size > availableBytes) {
             availableBytes = (NSUInteger)map->size;
         }
 
@@ -8600,11 +8605,12 @@ void logDirtyBits(GLMContext ctx)
                 }
             }
             NSUInteger availableBytes = metalLen - bindOffset;
-            // Match the vertex path: reflected Metal argument sizes can include
-            // backend padding, but GL buffer-range bounds remain authoritative.
+            // Match the vertex path: use full Metal buffer size when the GL
+            // range is smaller, so UBO padding (e.g. Globals 56→64) does not
+            // create zero-filled copies that truncate shader data.
             if (isBaseBinding &&
                 map->size > 0 &&
-                (NSUInteger)map->size < availableBytes) {
+                (NSUInteger)map->size > availableBytes) {
                 availableBytes = (NSUInteger)map->size;
             }
 
