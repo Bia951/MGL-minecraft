@@ -866,7 +866,7 @@ __attribute__((constructor))
 static void mglRendererDiagnosticBuildMarker(void)
 {
     mglInitTraceLogIfNeeded();
-    mglTraceLog("MGL DIAG BUILD marker=screen-effect-cull-v6-20260608 built=%s %s renderer-loaded",
+    mglTraceLog("MGL DIAG BUILD marker=gui-rt-cull-v8-20260608 built=%s %s renderer-loaded",
                 __DATE__,
                 __TIME__);
 }
@@ -2421,6 +2421,32 @@ static inline bool mglTextureCanUseGLSampledRenderTargetCopy(Texture *tex)
            mglTextureLooksLikeGLSampledCopyTarget(tex);
 }
 
+static inline bool mglTextureLooksLikeMinecraftGuiOrPipRenderTarget(Texture *tex)
+{
+    if (!mglTextureCanUseGLSampledRenderTargetCopy(tex) ||
+        mglTextureLooksLikeMinecraftLightmapTargetTexture(tex) ||
+        tex->width < 64u ||
+        tex->height < 64u) {
+        return false;
+    }
+
+    /*
+     * Minecraft 1.21.8 writes GUI item atlases as square 512/1024/2048 render
+     * targets and PIP previews as compact offscreen targets. Fullscreen
+     * post-chain targets are usually wide 16:9-ish surfaces, so keep this
+     * strictly shaped around atlas/PIP textures.
+     */
+    if (tex->width == tex->height && tex->width <= 2048u) {
+        return true;
+    }
+
+    GLuint maxDim = tex->width > tex->height ? tex->width : tex->height;
+    GLuint minDim = tex->width < tex->height ? tex->width : tex->height;
+    return maxDim <= 1024u &&
+           minDim <= 768u &&
+           maxDim <= minDim * 3u / 2u;
+}
+
 static bool mglFramebufferLooksLikeGLSampledCopyRenderTarget(GLMContext glctx,
                                                              Framebuffer *fbo,
                                                              Texture **outColor,
@@ -2573,6 +2599,7 @@ static void mglApplyMinecraftRenderPipelineStateFallback(GLMContext glctx)
     bool defaultTarget = (fbo == NULL);
     bool guiAtlasTarget = mglTextureLooksLikeMinecraftGuiAtlas(targetColor);
     bool lightmapTarget = mglTextureLooksLikeMinecraftLightmapTargetTexture(targetColor);
+    bool guiOrPipRTTarget = mglTextureLooksLikeMinecraftGuiOrPipRenderTarget(targetColor);
     bool targetHasDepthAttachment = mglFramebufferHasDepthAttachmentObject(fbo);
     bool screenEffectProgram =
         mglProgramLooksLikeMinecraftScreenEffectProgram(vertexProgram) ||
@@ -2618,6 +2645,13 @@ static void mglApplyMinecraftRenderPipelineStateFallback(GLMContext glctx)
         if (glctx->state.caps.blend) {
             mglSetAllBlendEnablesForPipelineFallback(glctx, GL_FALSE);
             dirty |= DIRTY_ALPHA_STATE | DIRTY_RENDER_STATE;
+        }
+    } else if (guiOrPipRTTarget &&
+               targetHasDepthAttachment) {
+        reason = "gui-rt-cull";
+        if (glctx->state.caps.cull_face) {
+            glctx->state.caps.cull_face = GL_FALSE;
+            dirty |= DIRTY_RENDER_STATE;
         }
     } else if (overlayProgram &&
                (defaultTarget ||
@@ -2706,9 +2740,12 @@ static void mglApplyMinecraftRenderPipelineStateFallback(GLMContext glctx)
         GLuint programKey = mglCurrentRenderProgramKey(glctx);
         const char *targetKind = lightmapTarget
             ? "lightmap"
-            : (guiAtlasTarget ? "gui-atlas" : (defaultTarget ? "default" : "other"));
+            : (guiAtlasTarget
+                ? "gui-atlas"
+                : (guiOrPipRTTarget ? "gui-rt" : (defaultTarget ? "default" : "other")));
         if (hit <= 96ull || (hit % 512ull) == 0ull) {
             NSLog(@"MGL MC PIPELINE FALLBACK hit=%llu reason=%s program=%u target=%s tex=%u depthTex=%u "
+                  "targetSize=%ux%u "
                   "class(screen=%d overlay=%d depth3d=%d targetDepth=%d) "
                   "state depth(test=%d write=%d func=0x%x) blend=%d cull=%d dirty=0x%x",
                   (unsigned long long)hit,
@@ -2717,6 +2754,8 @@ static void mglApplyMinecraftRenderPipelineStateFallback(GLMContext glctx)
                   targetKind,
                   (unsigned)mglTraceTextureName(targetColor),
                   (unsigned)mglTraceTextureName(targetDepth),
+                  (unsigned)(targetColor ? targetColor->width : 0u),
+                  (unsigned)(targetColor ? targetColor->height : 0u),
                   screenEffectProgram ? 1 : 0,
                   overlayProgram ? 1 : 0,
                   depth3DProgram ? 1 : 0,
@@ -2730,6 +2769,7 @@ static void mglApplyMinecraftRenderPipelineStateFallback(GLMContext glctx)
         }
         if (mglTraceLogIsEnabled()) {
             mglTraceLog("MC_PIPELINE_FALLBACK hit=%llu reason=%s program=%u target=%s tex=%u depthTex=%u "
+                        "targetSize=%ux%u "
                         "class(screen=%d overlay=%d depth3d=%d targetDepth=%d) "
                         "state depth(test=%d write=%d func=0x%x) blend=%d cull=%d dirty=0x%x",
                         (unsigned long long)hit,
@@ -2738,6 +2778,8 @@ static void mglApplyMinecraftRenderPipelineStateFallback(GLMContext glctx)
                         targetKind,
                         (unsigned)mglTraceTextureName(targetColor),
                         (unsigned)mglTraceTextureName(targetDepth),
+                        (unsigned)(targetColor ? targetColor->width : 0u),
+                        (unsigned)(targetColor ? targetColor->height : 0u),
                         screenEffectProgram ? 1 : 0,
                         overlayProgram ? 1 : 0,
                         depth3DProgram ? 1 : 0,
@@ -29352,3 +29394,4 @@ void* CppCreateMGLRendererAndBindToContext (void *glm_ctx)
 }
 
 @end
+

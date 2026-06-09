@@ -487,6 +487,10 @@ static GLboolean mglActiveUniformNameSeenBefore(Program *program,
     return GL_FALSE;
 }
 
+/* Forward declaration — defined later in this file. */
+static GLboolean mglUniformBlockNameSeenBefore(Program *program, int block_stage,
+                                                GLuint block_index, const char *name);
+
 SpirvResource *mglProgramActiveUniformAt(Program *program, GLuint index, int *stage_out, int *res_type_out)
 {
     if (stage_out) {
@@ -500,6 +504,8 @@ SpirvResource *mglProgramActiveUniformAt(Program *program, GLuint index, int *st
     }
 
     GLuint ordinal = 0u;
+
+    /* Pass 1: Enumerate visible uniforms from non-UBO resource lists. */
     const size_t type_count = sizeof(mglActiveUniformResourceTypes) / sizeof(mglActiveUniformResourceTypes[0]);
     for (size_t type_ordinal = 0; type_ordinal < type_count; type_ordinal++) {
         int res_type = mglActiveUniformResourceTypes[type_ordinal];
@@ -510,6 +516,8 @@ SpirvResource *mglProgramActiveUniformAt(Program *program, GLuint index, int *st
             }
             for (GLuint i = 0; i < resources->count; i++) {
                 SpirvResource *res = &resources->list[i];
+                /* Clear any stale ubo_member from a previous lookup. */
+                res->ubo_member = NULL;
                 if (!mglActiveUniformResourceHasName(res) ||
                     mglActiveUniformNameSeenBefore(program, (GLint)type_ordinal, stage, i, res->name)) {
                     continue;
@@ -525,6 +533,50 @@ SpirvResource *mglProgramActiveUniformAt(Program *program, GLuint index, int *st
                 }
                 ordinal++;
             }
+        }
+    }
+
+    /* Pass 2: Enumerate UBO member uniforms.
+     * Members are visible through glGetActiveUniform and friends.  The owning
+     * UBO resource is returned with ubo_member set so that callers can
+     * retrieve member-specific properties (type, offset, strides, block index). */
+    GLuint ubo_block_idx = 0;
+    for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++) {
+        SpirvResourceList *ubo_list = mglUniformSafeResourceList(
+            program, stage, SPVC_RESOURCE_TYPE_UNIFORM_BUFFER, __FUNCTION__);
+        if (!ubo_list) {
+            continue;
+        }
+        for (GLuint ubo_i = 0; ubo_i < ubo_list->count; ubo_i++) {
+            SpirvResource *ubo = &ubo_list->list[ubo_i];
+            /* De-duplicate across stages (same block name seen before). */
+            if (mglUniformBlockNameSeenBefore(program, stage, ubo_i, ubo->name)) {
+                ubo_block_idx++;
+                continue;
+            }
+            if (!ubo->ubo_members) {
+                ubo_block_idx++;
+                continue;
+            }
+            for (GLuint mem_i = 0; mem_i < ubo->ubo_member_count; mem_i++) {
+                if (!ubo->ubo_members[mem_i].name) {
+                    continue;
+                }
+                if (ordinal == index) {
+                    if (stage_out) {
+                        *stage_out = stage;
+                    }
+                    if (res_type_out) {
+                        *res_type_out = SPVC_RESOURCE_TYPE_UNIFORM_BUFFER;
+                    }
+                    /* Return the owning UBO resource with ubo_member set
+                     * so the caller can retrieve per-member properties. */
+                    ubo->ubo_member = &ubo->ubo_members[mem_i];
+                    return ubo;
+                }
+                ordinal++;
+            }
+            ubo_block_idx++;
         }
     }
 
@@ -553,7 +605,8 @@ GLint mglProgramActiveUniformIndexByName(Program *program, const GLchar *name)
     GLint count = mglProgramActiveUniformCount(program);
     for (GLint i = 0; i < count; i++) {
         SpirvResource *res = mglProgramActiveUniformAt(program, (GLuint)i, NULL, NULL);
-        if (res && mglActiveUniformNamesMatch(res->name, name)) {
+        const char *uniform_name = res ? (res->ubo_member ? res->ubo_member->name : res->name) : NULL;
+        if (res && mglActiveUniformNamesMatch(uniform_name, name)) {
             return i;
         }
     }
@@ -648,7 +701,20 @@ GLint mglProgramActiveUniformSize(const SpirvResource *res, int res_type)
 GLsizei mglProgramActiveUniformNameLength(const SpirvResource *res)
 {
     size_t len = 0u;
-    if (!res || !mglSafeCStringLength(res->name, &len)) {
+    const char *name = NULL;
+
+    if (!res) {
+        return 0;
+    }
+
+    /* UBO member uniforms carry their name on the ubo_member sub-struct. */
+    if (res->ubo_member) {
+        name = res->ubo_member->name;
+    } else {
+        name = res->name;
+    }
+
+    if (!name || !mglSafeCStringLength(name, &len)) {
         return 0;
     }
     return (GLsizei)len;
@@ -671,7 +737,15 @@ GLint mglProgramActiveUniformMaxNameLength(Program *program)
 void mglProgramCopyActiveUniformName(const SpirvResource *res, GLsizei bufSize, GLsizei *length, GLchar *name)
 {
     GLsizei src_len = mglProgramActiveUniformNameLength(res);
-    const char *src = (src_len > 0 && res) ? res->name : "";
+    const char *src = "";
+
+    if (src_len > 0 && res) {
+        if (res->ubo_member) {
+            src = res->ubo_member->name ? res->ubo_member->name : "";
+        } else {
+            src = res->name ? res->name : "";
+        }
+    }
 
     if (length) {
         *length = src_len;
@@ -683,6 +757,43 @@ void mglProgramCopyActiveUniformName(const SpirvResource *res, GLsizei bufSize, 
         }
         name[copy_len] = '\0';
     }
+}
+
+/* Return the block index for the UBO that owns the given member uniform,
+ * or -1 if the uniform is not inside a UBO. */
+GLint mglProgramActiveUniformBlockIndex(Program *program, const SpirvResource *res)
+{
+    if (!program || !res || !res->ubo_member) {
+        return -1;
+    }
+
+    GLuint block_idx = 0;
+    for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++) {
+        SpirvResourceList *ubo_list = mglUniformSafeResourceList(
+            program, stage, SPVC_RESOURCE_TYPE_UNIFORM_BUFFER, __FUNCTION__);
+        if (!ubo_list) {
+            continue;
+        }
+        for (GLuint i = 0; i < ubo_list->count; i++) {
+            SpirvResource *ubo = &ubo_list->list[i];
+            if (mglUniformBlockNameSeenBefore(program, stage, i, ubo->name)) {
+                continue;
+            }
+            /* Check if 'res' points to this UBO (the owning block). */
+            if (ubo == res || ubo->ubo_members == res->ubo_member) {
+                /* Quick check: if res->ubo_member points into ubo->ubo_members array. */
+                return (GLint)block_idx;
+            }
+            /* More robust: check if the member pointer is within the array. */
+            if (ubo->ubo_members && res->ubo_member >= ubo->ubo_members &&
+                res->ubo_member < ubo->ubo_members + ubo->ubo_member_count) {
+                return (GLint)block_idx;
+            }
+            block_idx++;
+        }
+    }
+
+    return -1;
 }
 
 static GLint mglPlainUniformResourceLocation(const SpirvResource *res)
@@ -1373,23 +1484,64 @@ void mglGetActiveUniformsiv(GLMContext ctx, GLuint program, GLsizei uniformCount
 
         switch (pname) {
             case GL_UNIFORM_TYPE:
-                params[i] = mglProgramActiveUniformGLType(res, res_type);
+                if (res->ubo_member) {
+                    params[i] = (GLint)res->ubo_member->gl_type;
+                } else {
+                    params[i] = mglProgramActiveUniformGLType(res, res_type);
+                }
                 break;
             case GL_UNIFORM_SIZE:
-                params[i] = mglProgramActiveUniformSize(res, res_type);
+                if (res->ubo_member) {
+                    params[i] = res->ubo_member->size;
+                } else {
+                    params[i] = mglProgramActiveUniformSize(res, res_type);
+                }
                 break;
             case GL_UNIFORM_NAME_LENGTH:
-                params[i] = (GLint)mglProgramActiveUniformNameLength(res) + 1;
+                if (res->ubo_member) {
+                    size_t len = 0u;
+                    params[i] = (GLint)(mglSafeCStringLength(res->ubo_member->name, &len) ? len + 1u : 1u);
+                } else {
+                    params[i] = (GLint)mglProgramActiveUniformNameLength(res) + 1;
+                }
                 break;
             case GL_UNIFORM_BLOCK_INDEX:
+                if (res->ubo_member) {
+                    params[i] = mglProgramActiveUniformBlockIndex(ptr, res);
+                } else {
+                    params[i] = -1;
+                }
+                break;
             case GL_UNIFORM_OFFSET:
+                if (res->ubo_member) {
+                    params[i] = (GLint)res->ubo_member->offset;
+                } else {
+                    params[i] = -1;
+                }
+                break;
             case GL_UNIFORM_ARRAY_STRIDE:
+                if (res->ubo_member) {
+                    params[i] = res->ubo_member->array_stride;
+                } else {
+                    params[i] = -1;
+                }
+                break;
             case GL_UNIFORM_MATRIX_STRIDE:
+                if (res->ubo_member) {
+                    params[i] = res->ubo_member->matrix_stride;
+                } else {
+                    params[i] = -1;
+                }
+                break;
             case GL_UNIFORM_ATOMIC_COUNTER_BUFFER_INDEX:
                 params[i] = -1;
                 break;
             case GL_UNIFORM_IS_ROW_MAJOR:
-                params[i] = GL_FALSE;
+                if (res->ubo_member) {
+                    params[i] = res->ubo_member->is_row_major;
+                } else {
+                    params[i] = GL_FALSE;
+                }
                 break;
             default:
                 ERROR_RETURN(GL_INVALID_ENUM);
@@ -1530,7 +1682,7 @@ void mglGetActiveUniformBlockiv(GLMContext ctx, GLuint program, GLuint uniformBl
             }
             break;
         case GL_UNIFORM_BLOCK_ACTIVE_UNIFORMS:
-            *params = 0;
+            *params = (block->ubo_members ? (GLint)block->ubo_member_count : 0);
             break;
         case GL_UNIFORM_BLOCK_REFERENCED_BY_VERTEX_SHADER:
             *params = mglUniformBlockReferencedByStage(ptr, block, _VERTEX_SHADER);

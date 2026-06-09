@@ -68,12 +68,112 @@ static int mgl_get_or_assign_ubo_binding(const char *block_name)
     return s_ubo_binding_entries[s_ubo_binding_count - 1].binding;
 }
 
+/* Parse a GLSL layout qualifier list (the content between "layout(" and ")")
+ * and normalize it for SPIR-V / Metal compatibility.
+ *
+ * - Replaces "packed" and "shared" with "std140" (SPIR-V only supports std140 / std430).
+ * - Strips leading / trailing whitespace from individual qualifiers.
+ * - Returns the number of characters needed to represent the normalized qualifier
+ *   list (not including a NUL terminator).
+ */
+static size_t mgl_normalize_layout_qualifiers(char *dst, size_t dst_capacity,
+                                               const char *qualifier_src, size_t qualifier_len,
+                                               int binding)
+{
+    char work[256];
+    size_t work_len = 0;
+    char binding_str[32];
+    int binding_written = 0;
+
+    if (qualifier_len >= sizeof(work)) {
+        return 0;
+    }
+    memcpy(work, qualifier_src, qualifier_len);
+    work[qualifier_len] = '\0';
+
+    /* Build normalized qualifier list in dst. */
+    size_t out = 0;
+    const char *cursor = work;
+    int first = 1;
+
+    while (*cursor) {
+        /* Skip whitespace and commas between qualifiers. */
+        while (*cursor && (isspace((unsigned char)*cursor) || *cursor == ',')) {
+            cursor++;
+        }
+        if (!*cursor) {
+            break;
+        }
+
+        /* Find the end of this qualifier token. */
+        const char *start = cursor;
+        while (*cursor && !isspace((unsigned char)*cursor) && *cursor != ',') {
+            cursor++;
+        }
+        size_t tok_len = (size_t)(cursor - start);
+
+        /* Skip "packed" and "shared" — replace them with "std140" later. */
+        if ((tok_len == 6 && memcmp(start, "packed", 6) == 0) ||
+            (tok_len == 6 && memcmp(start, "shared", 6) == 0)) {
+            continue;
+        }
+
+        /* Skip any existing "binding" qualifier — we'll append our own. */
+        if (tok_len >= 7 && memcmp(start, "binding", 7) == 0) {
+            binding_written = 1;
+            /* Keep the original binding value — do NOT overwrite it. */
+            if (!first && out < dst_capacity) {
+                dst[out++] = ',';
+                dst[out++] = ' ';
+            }
+            if (out + tok_len < dst_capacity) {
+                memcpy(dst + out, start, tok_len);
+                out += tok_len;
+            }
+            first = 0;
+            continue;
+        }
+
+        if (!first && out + 2 < dst_capacity) {
+            dst[out++] = ',';
+            dst[out++] = ' ';
+        }
+
+        if (out + tok_len < dst_capacity) {
+            memcpy(dst + out, start, tok_len);
+            out += tok_len;
+        }
+        first = 0;
+    }
+
+    /* Always emit "std140" as the packing qualifier. */
+    if (!first && out + 2 < dst_capacity) {
+        dst[out++] = ',';
+        dst[out++] = ' ';
+    }
+    if (out + 6 < dst_capacity) {
+        memcpy(dst + out, "std140", 6);
+        out += 6;
+    }
+
+    /* Append our binding unless the source already had one. */
+    if (!binding_written && binding >= 0) {
+        int needed = snprintf(binding_str, sizeof(binding_str), ", binding = %d", binding);
+        if (needed > 0 && out + (size_t)needed < dst_capacity) {
+            memcpy(dst + out, binding_str, (size_t)needed);
+            out += (size_t)needed;
+        }
+    }
+
+    return out;
+}
+
+/* Scan GLSL source for "layout(...) uniform BlockName" declarations and ensure
+ * each one carries a binding = N qualifier required for SPIR-V / Metal.
+ * Unsupported packing modes (packed, shared) are normalized to std140.
+ */
 static void mgl_patch_uniform_block_bindings(char *src, size_t src_capacity)
 {
-    static const char *patterns[] = {
-        "layout(std140) uniform ",
-        "layout(std430) uniform "
-    };
     char *cursor = src;
 
     if (!src || src_capacity == 0) {
@@ -81,28 +181,37 @@ static void mgl_patch_uniform_block_bindings(char *src, size_t src_capacity)
     }
 
     while (*cursor) {
-        char *match = NULL;
-        const char *pat = NULL;
-        size_t pat_len = 0;
-        for (int i = 0; i < 2; i++) {
-            char *p = strstr(cursor, patterns[i]);
-            if (p && (!match || p < match)) {
-                match = p;
-                pat = patterns[i];
-                pat_len = strlen(patterns[i]);
-            }
-        }
-
-        if (!match) {
+        /* 1. Find "layout(". */
+        char *layout = strstr(cursor, "layout(");
+        if (!layout) {
             break;
         }
 
-        char *name_start = match + pat_len;
+        /* 2. Find matching ")". */
+        char *paren_open = layout + 7; /* skip "layout(" */
+        char *paren_close = strchr(paren_open, ')');
+        if (!paren_close) {
+            cursor = layout + 7;
+            continue;
+        }
+
+        /* 3. Skip whitespace after ")" and check for "uniform". */
+        char *after_paren = paren_close + 1;
+        while (*after_paren && isspace((unsigned char)*after_paren)) {
+            after_paren++;
+        }
+        if (strncmp(after_paren, "uniform", 7) != 0) {
+            cursor = paren_close + 1;
+            continue;
+        }
+
+        /* 4. Extract block name. */
+        char *name_start = after_paren + 7; /* skip "uniform" */
         while (*name_start && isspace((unsigned char)*name_start)) {
             name_start++;
         }
         if (!isalpha((unsigned char)*name_start) && *name_start != '_') {
-            cursor = match + pat_len;
+            cursor = paren_close + 1;
             continue;
         }
 
@@ -113,39 +222,58 @@ static void mgl_patch_uniform_block_bindings(char *src, size_t src_capacity)
             block_name[bn++] = *p++;
         }
         block_name[bn] = '\0';
-
         if (bn == 0) {
-            cursor = match + pat_len;
+            cursor = paren_close + 1;
             continue;
         }
 
         int binding = mgl_get_or_assign_ubo_binding(block_name);
-        char replacement[96];
-        if (strncmp(pat, "layout(std140)", 14) == 0) {
-            snprintf(replacement, sizeof(replacement), "layout(std140, binding = %d) uniform ", binding);
-        } else {
-            snprintf(replacement, sizeof(replacement), "layout(std430, binding = %d) uniform ", binding);
+
+        /* 5. Normalize the layout qualifier. */
+        char normalized[256];
+        size_t qualifier_len = (size_t)(paren_close - paren_open);
+        size_t norm_len = mgl_normalize_layout_qualifiers(
+            normalized, sizeof(normalized),
+            paren_open, qualifier_len, binding);
+        if (norm_len == 0 || norm_len >= sizeof(normalized)) {
+            cursor = paren_close + 1;
+            continue;
         }
 
-        size_t repl_len = strlen(replacement);
-        if (repl_len <= pat_len) {
-            memcpy(match, replacement, repl_len);
-            if (repl_len < pat_len) {
-                memset(match + repl_len, ' ', pat_len - repl_len);
+        /* 6. Build the replacement: "layout(NORM) uniform " */
+        char replacement[320];
+        int repl_total = snprintf(replacement, sizeof(replacement),
+                                  "layout(%.*s) uniform ",
+                                  (int)norm_len, normalized);
+        if (repl_total < 0 || (size_t)repl_total >= sizeof(replacement)) {
+            cursor = paren_close + 1;
+            continue;
+        }
+        size_t repl_len = (size_t)repl_total;
+
+        /* 7. Compute old span length and perform the replacement. */
+        size_t old_len = (size_t)(after_paren + 7 - layout); /* "layout(...) uniform " */
+
+        if (repl_len <= old_len) {
+            /* New text is shorter or equal: in-place overwrite + space-pad. */
+            memcpy(layout, replacement, repl_len);
+            if (repl_len < old_len) {
+                memset(layout + repl_len, ' ', old_len - repl_len);
             }
-            cursor = match + pat_len;
+            cursor = layout + old_len;
         } else {
-            size_t tail_len = strlen(match + pat_len);
+            /* New text is longer: shift the tail right. */
+            size_t tail_len = strlen(layout + old_len);
             size_t used = strlen(src);
-            size_t grow = repl_len - pat_len;
+            size_t grow = repl_len - old_len;
             if (used + grow + 1 >= src_capacity) {
-                /* No room to grow safely; skip this block */
-                cursor = match + pat_len;
+                /* No room to grow safely; skip this block. */
+                cursor = layout + old_len;
                 continue;
             }
-            memmove(match + repl_len, match + pat_len, tail_len + 1);
-            memcpy(match, replacement, repl_len);
-            cursor = match + repl_len;
+            memmove(layout + repl_len, layout + old_len, tail_len + 1);
+            memcpy(layout, replacement, repl_len);
+            cursor = layout + repl_len;
         }
     }
 }

@@ -40,7 +40,13 @@ static const char *kMglExtensions[] = {
     "GL_ARB_texture_buffer_object",
     "GL_ARB_texture_buffer_range",
     "GL_ARB_buffer_storage",
-    "GL_ARB_direct_state_access"
+    "GL_ARB_direct_state_access",
+    "GL_ARB_draw_elements_base_vertex",
+    "GL_ARB_vertex_attrib_binding",
+    "GL_ARB_instanced_arrays",
+    "GL_ARB_draw_instanced",
+    "GL_ARB_shading_language_420pack",
+    "GL_ARB_separate_shader_objects",
 };
 static_assert((sizeof(kMglExtensions) / sizeof(kMglExtensions[0])) == MGL_NUM_EXTENSIONS,
               "MGL_NUM_EXTENSIONS must match kMglExtensions");
@@ -756,6 +762,11 @@ const GLubyte *mglGetString(GLMContext ctx, GLenum name)
 
         case GL_SHADING_LANGUAGE_VERSION:
             return (const GLubyte *)"4.6";
+
+        case GL_EXTENSIONS:
+            /* Core profile returns NULL for glGetString(GL_EXTENSIONS).
+             * Applications must use glGetStringi(GL_EXTENSIONS, index) instead. */
+            return NULL;
 
         default:
             ERROR_RETURN_VALUE(GL_INVALID_ENUM, NULL);

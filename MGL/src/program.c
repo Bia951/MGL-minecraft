@@ -1111,9 +1111,24 @@ void mglFreeProgram(GLMContext ctx, Program *ptr)
         for(int j=0; j<_MAX_SPIRV_RES; j++)
         {
             // CRITICAL FIX: Add NULL checks and clear pointers to prevent double-frees
-            if (ptr->spirv_resources_list[i][j].list) {
-                free(ptr->spirv_resources_list[i][j].list);
-                ptr->spirv_resources_list[i][j].list = NULL;
+            SpirvResourceList *rl = &ptr->spirv_resources_list[i][j];
+            if (rl->list) {
+                /* Free UBO member data before freeing the resource list. */
+                if (j == SPVC_RESOURCE_TYPE_UNIFORM_BUFFER) {
+                    for (GLuint k = 0; k < rl->count; k++) {
+                        SpirvResource *res = &rl->list[k];
+                        if (res->ubo_members) {
+                            for (GLuint m = 0; m < res->ubo_member_count; m++) {
+                                free((void *)res->ubo_members[m].name);
+                            }
+                            free(res->ubo_members);
+                            res->ubo_members = NULL;
+                        }
+                        res->ubo_member_count = 0;
+                    }
+                }
+                free(rl->list);
+                rl->list = NULL;
             }
         }
         
@@ -1470,6 +1485,44 @@ static GLboolean mglProgramStageHasResourceName(Program *program, int stage, int
     for (GLuint i = 0; resources->list && i < resources->count; i++) {
         if (resources->list[i].name && strcmp(resources->list[i].name, name) == 0) {
             return GL_TRUE;
+        }
+    }
+
+    return GL_FALSE;
+}
+
+static GLboolean mglProgramHasResourceName(Program *program, int stage, int res_type, const char *name)
+{
+    return mglProgramStageHasResourceName(program, stage, res_type, name);
+}
+
+static GLboolean mglProgramHasAnyResourceName(Program *program, const char *name)
+{
+    if (!program || !name) {
+        return GL_FALSE;
+    }
+
+    for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++) {
+        for (int res_type = 0; res_type < _MAX_SPIRV_RES; res_type++) {
+            if (mglProgramStageHasResourceName(program, stage, res_type, name)) {
+                return GL_TRUE;
+            }
+        }
+    }
+
+    /* Also check UBO member names. */
+    for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++) {
+        SpirvResourceList *ubo_list = &program->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_UNIFORM_BUFFER];
+        for (GLuint i = 0; ubo_list->list && i < ubo_list->count; i++) {
+            SpirvResource *ubo = &ubo_list->list[i];
+            if (ubo->ubo_members) {
+                for (GLuint m = 0; m < ubo->ubo_member_count; m++) {
+                    if (ubo->ubo_members[m].name &&
+                        strcmp(ubo->ubo_members[m].name, name) == 0) {
+                        return GL_TRUE;
+                    }
+                }
+            }
         }
     }
 
@@ -2043,6 +2096,154 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
         }
     }
 
+    /* Reflect UBO member uniforms.
+     * Each SPVC_RESOURCE_TYPE_UNIFORM_BUFFER resource corresponds to a struct
+     * whose members need to be exposed via glGetActiveUniform / glGetActiveUniformsiv
+     * so that CTS and applications can query offsets, strides, and types. */
+    for (int res_type = SPVC_RESOURCE_TYPE_UNIFORM_BUFFER;
+         res_type <= SPVC_RESOURCE_TYPE_UNIFORM_BUFFER; res_type++) {
+        SpirvResourceList *ubo_list = &ptr->spirv_resources_list[stage][res_type];
+        for (GLuint ubo_idx = 0; ubo_list->list && ubo_idx < ubo_list->count; ubo_idx++) {
+            SpirvResource *ubo = &ubo_list->list[ubo_idx];
+            spvc_type struct_type = NULL;
+
+            if (ubo->type_id) {
+                struct_type = spvc_compiler_get_type_handle(compiler_msl, ubo->type_id);
+            }
+            if (!struct_type && ubo->base_type_id) {
+                struct_type = spvc_compiler_get_type_handle(compiler_msl, ubo->base_type_id);
+            }
+            if (!struct_type ||
+                spvc_type_get_basetype(struct_type) != SPVC_BASETYPE_STRUCT) {
+                ubo->ubo_members = NULL;
+                ubo->ubo_member_count = 0;
+                continue;
+            }
+
+            unsigned member_count = spvc_type_get_num_member_types(struct_type);
+            if (member_count == 0) {
+                ubo->ubo_members = NULL;
+                ubo->ubo_member_count = 0;
+                continue;
+            }
+
+            ubo->ubo_members = (SpirvUBOMember *)calloc(member_count, sizeof(SpirvUBOMember));
+            if (!ubo->ubo_members) {
+                ubo->ubo_member_count = 0;
+                continue;
+            }
+            ubo->ubo_member_count = (GLuint)member_count;
+
+            for (unsigned mem_idx = 0; mem_idx < member_count; mem_idx++) {
+                SpirvUBOMember *member = &ubo->ubo_members[mem_idx];
+
+                const char *member_name =
+                    spvc_compiler_get_member_name(compiler_msl, ubo->type_id, mem_idx);
+                member->name = member_name ? strdup(member_name) : NULL;
+
+                spvc_type_id member_type_id = spvc_type_get_member_type(struct_type, mem_idx);
+                spvc_type member_type = spvc_compiler_get_type_handle(compiler_msl, member_type_id);
+
+                member->offset = spvc_compiler_get_member_decoration(
+                    compiler_msl, ubo->type_id, mem_idx, SpvDecorationOffset);
+
+                member->matrix_stride = (GLint)spvc_compiler_get_member_decoration(
+                    compiler_msl, ubo->type_id, mem_idx, SpvDecorationMatrixStride);
+                if (member->matrix_stride == 0) {
+                    member->matrix_stride = -1;
+                }
+
+                member->array_stride = (GLint)spvc_compiler_get_member_decoration(
+                    compiler_msl, ubo->type_id, mem_idx, SpvDecorationArrayStride);
+                if (member->array_stride == 0) {
+                    member->array_stride = -1;
+                }
+
+                unsigned row_major_raw = spvc_compiler_get_member_decoration(
+                    compiler_msl, ubo->type_id, mem_idx, SpvDecorationRowMajor);
+                unsigned col_major_raw = spvc_compiler_get_member_decoration(
+                    compiler_msl, ubo->type_id, mem_idx, SpvDecorationColMajor);
+                member->is_row_major = (row_major_raw != 0) ? GL_TRUE : GL_FALSE;
+                (void)col_major_raw;
+
+                /* Determine GL type enum from the SPIR-V member type. */
+                if (member_type) {
+                    spvc_basetype base = spvc_type_get_basetype(member_type);
+                    unsigned vec_size = spvc_type_get_vector_size(member_type);
+                    unsigned cols = spvc_type_get_columns(member_type);
+                    member->gl_type = GL_FLOAT; /* safe default */
+
+                    switch (base) {
+                        case SPVC_BASETYPE_FP32:
+                            if (cols > 1) {
+                                static const GLuint fp32_mat_types[] = {
+                                    0, GL_FLOAT_MAT2, GL_FLOAT_MAT2x3, GL_FLOAT_MAT2x4,
+                                    GL_FLOAT_MAT3x2, GL_FLOAT_MAT3, GL_FLOAT_MAT3x4,
+                                    GL_FLOAT_MAT4x2, GL_FLOAT_MAT4x3, GL_FLOAT_MAT4
+                                };
+                                unsigned key = (cols - 2) * 3 + (vec_size - 2) + 1;
+                                if (key < sizeof(fp32_mat_types) / sizeof(fp32_mat_types[0])) {
+                                    member->gl_type = fp32_mat_types[key];
+                                }
+                            } else {
+                                static const GLuint fp32_vec_types[] = {
+                                    0, GL_FLOAT, GL_FLOAT_VEC2, GL_FLOAT_VEC3, GL_FLOAT_VEC4
+                                };
+                                if (vec_size < sizeof(fp32_vec_types) / sizeof(fp32_vec_types[0])) {
+                                    member->gl_type = fp32_vec_types[vec_size];
+                                }
+                            }
+                            break;
+                        case SPVC_BASETYPE_INT32:
+                            static const GLuint int32_vec_types[] = {
+                                0, GL_INT, GL_INT_VEC2, GL_INT_VEC3, GL_INT_VEC4
+                            };
+                            if (vec_size < sizeof(int32_vec_types) / sizeof(int32_vec_types[0])) {
+                                member->gl_type = int32_vec_types[vec_size];
+                            }
+                            break;
+                        case SPVC_BASETYPE_UINT32:
+                            static const GLuint uint32_vec_types[] = {
+                                0, GL_UNSIGNED_INT, GL_UNSIGNED_INT_VEC2,
+                                GL_UNSIGNED_INT_VEC3, GL_UNSIGNED_INT_VEC4
+                            };
+                            if (vec_size < sizeof(uint32_vec_types) / sizeof(uint32_vec_types[0])) {
+                                member->gl_type = uint32_vec_types[vec_size];
+                            }
+                            break;
+                        case SPVC_BASETYPE_BOOLEAN:
+                            static const GLuint bool_vec_types[] = {
+                                0, GL_BOOL, GL_BOOL_VEC2, GL_BOOL_VEC3, GL_BOOL_VEC4
+                            };
+                            if (vec_size < sizeof(bool_vec_types) / sizeof(bool_vec_types[0])) {
+                                member->gl_type = bool_vec_types[vec_size];
+                            }
+                            break;
+                        case SPVC_BASETYPE_FP64:
+                            if (vec_size == 1) member->gl_type = GL_DOUBLE;
+                            else if (vec_size == 2) member->gl_type = GL_DOUBLE_VEC2;
+                            else if (vec_size == 3) member->gl_type = GL_DOUBLE_VEC3;
+                            else if (vec_size == 4) member->gl_type = GL_DOUBLE_VEC4;
+                            break;
+                        default:
+                            member->gl_type = GL_FLOAT;
+                            break;
+                    }
+                }
+
+                /* Determine array size: if the member type is itself an array,
+                 * SPIRV-Cross reports the element count via the type. */
+                member->size = 1;
+                if (member_type) {
+                    unsigned array_dims = spvc_type_get_num_array_dimensions(member_type);
+                    if (array_dims > 0) {
+                        member->size = (GLint)spvc_type_get_array_dimension(member_type, 0);
+                    }
+                }
+            }
+        }
+    }
+
     if (spvc_compiler_compile(compiler_msl, &result) != SPVC_SUCCESS || !result) {
         fprintf(stderr,
                 "MGL ERROR: spvc_compiler_compile failed program=%u stage=%d\n",
@@ -2176,11 +2377,26 @@ static void clearStageCompileState(Program *pptr, int stage)
     }
 
     for (int res_type = 0; res_type < _MAX_SPIRV_RES; res_type++) {
-        if (pptr->spirv_resources_list[stage][res_type].list) {
-            free(pptr->spirv_resources_list[stage][res_type].list);
-            pptr->spirv_resources_list[stage][res_type].list = NULL;
+        SpirvResourceList *rl = &pptr->spirv_resources_list[stage][res_type];
+        if (rl->list) {
+            /* Free UBO member data before freeing the resource list. */
+            if (res_type == SPVC_RESOURCE_TYPE_UNIFORM_BUFFER) {
+                for (GLuint i = 0; i < rl->count; i++) {
+                    SpirvResource *res = &rl->list[i];
+                    if (res->ubo_members) {
+                        for (GLuint m = 0; m < res->ubo_member_count; m++) {
+                            free((void *)res->ubo_members[m].name);
+                        }
+                        free(res->ubo_members);
+                        res->ubo_members = NULL;
+                    }
+                    res->ubo_member_count = 0;
+                }
+            }
+            free(rl->list);
+            rl->list = NULL;
         }
-        pptr->spirv_resources_list[stage][res_type].count = 0;
+        rl->count = 0;
     }
 }
 

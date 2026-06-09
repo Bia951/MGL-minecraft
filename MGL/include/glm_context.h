@@ -450,6 +450,16 @@ typedef struct Spirv_t {
     void *mtl_library;
 } Spirv;
 
+typedef struct SpirvUBOMember_t {
+    const char *name;        /* e.g. "var" inside Block { bool var; }            */
+    GLuint      gl_type;     /* GL_BOOL, GL_FLOAT_VEC4, etc.                    */
+    GLuint      offset;      /* byte offset within the UBO (GL_UNIFORM_OFFSET)  */
+    GLint       array_stride;  /* GL_UNIFORM_ARRAY_STRIDE, -1 if not an array   */
+    GLint       matrix_stride; /* GL_UNIFORM_MATRIX_STRIDE, -1 if not a matrix  */
+    GLboolean   is_row_major;  /* GL_UNIFORM_IS_ROW_MAJOR                       */
+    GLint       size;        /* GL_UNIFORM_SIZE (array element count, 1 for scalar) */
+} SpirvUBOMember;
+
 typedef struct SpirvResource_t {
     GLuint  _id;
     GLuint  base_type_id;
@@ -468,6 +478,12 @@ typedef struct SpirvResource_t {
     GLuint  image_dim;
     GLuint  image_arrayed;
     GLuint  image_multisampled;
+    /* UBO member uniforms (only valid for SPVC_RESOURCE_TYPE_UNIFORM_BUFFER). */
+    SpirvUBOMember       *ubo_members;
+    GLuint                ubo_member_count;
+    /* When this resource is used as a placeholder during active-uniform
+     * enumeration of UBO members, this points to the specific member. */
+    const SpirvUBOMember *ubo_member;
 } SpirvResource;
 
 typedef struct SpirvResourceList_t {
