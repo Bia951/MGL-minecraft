@@ -1099,6 +1099,201 @@ static void mgl_inject_after_version(char *src, size_t src_capacity,
     memcpy(insert_point, text, text_len);
 }
 
+/* ── Loose uniform aggregation ────────────────────────────────────────
+ *
+ * Iris shaderpacks declare 40+ loose uniforms (uniform float sunAngle; etc.).
+ * SPIRV-Cross translates each to an individual [[buffer(N)]] argument, but
+ * Metal only supports 31 buffer slots per stage.  This function rewrites
+ * GLSL source to pack all loose uniforms into a single struct:
+ *
+ *   struct _MGLLooseUniforms { float sunAngle; int worldDay; ... };
+ *   uniform _MGLLooseUniforms _mgl_loose;
+ *   #define sunAngle _mgl_loose.sunAngle
+ *   #define worldDay _mgl_loose.worldDay
+ *
+ * The #define macros redirect all references in user code so the function
+ * body needs no changes.  glGetUniformLocation is patched (in uniforms.c)
+ * to try "_mgl_loose." + name as a fallback.
+ *
+ * Only non-sampler, non-UBO, scalar/vector/matrix uniforms are aggregated.
+ * Samplers, images, and UBO blocks are left untouched. */
+static int mglIsLooseUniformLine(const char *line_start, const char *line_end,
+                                  char *out_type, size_t type_cap,
+                                  char *out_name, size_t name_cap)
+{
+    /* Skip leading whitespace */
+    const char *p = line_start;
+    while (p < line_end && (*p == ' ' || *p == '\t' || *p == '\r')) p++;
+
+    /* Skip preprocessor / comments */
+    if (p >= line_end || *p == '#' || *p == '/' || *p == '\n') return 0;
+
+    /* Skip optional layout(...) qualifier */
+    if (strncmp(p, "layout", 6) == 0) {
+        const char *paren = strchr(p, '(');
+        if (paren && paren < line_end) {
+            const char *close = strchr(paren, ')');
+            if (close && close < line_end) {
+                p = close + 1;
+                while (p < line_end && (*p == ' ' || *p == '\t')) p++;
+            }
+        }
+    }
+
+    /* Must start with "uniform" */
+    if (strncmp(p, "uniform", 7) != 0) return 0;
+    p += 7;
+    if (p < line_end && (p[0] != ' ' && p[0] != '\t')) return 0;
+    while (p < line_end && (*p == ' ' || *p == '\t')) p++;
+    if (p >= line_end) return 0;
+
+    /* Exclude UBO blocks (uniform Name {) */
+    if (memchr(p, '{', line_end - p)) return 0;
+
+    /* Exclude samplers and images */
+    static const char *excluded_prefixes[] = {
+        "sampler", "image", "atomic", NULL
+    };
+    for (int i = 0; excluded_prefixes[i]; i++) {
+        size_t plen = strlen(excluded_prefixes[i]);
+        if ((size_t)(line_end - p) > plen &&
+            strncmp(p, excluded_prefixes[i], plen) == 0) return 0;
+    }
+
+    /* Read type */
+    const char *type_start = p;
+    while (p < line_end && (*p != ' ' && *p != '\t' && *p != ';')) p++;
+    if (p >= line_end || p == type_start) return 0;
+    size_t type_len = p - type_start;
+    if (type_len >= type_cap) return 0;
+    memcpy(out_type, type_start, type_len);
+    out_type[type_len] = '\0';
+
+    while (p < line_end && (*p == ' ' || *p == '\t')) p++;
+    if (p >= line_end) return 0;
+
+    /* Read name */
+    const char *name_start = p;
+    while (p < line_end && *p != ';' && *p != ' ' && *p != '\t' &&
+           *p != '[' && *p != '\r' && *p != '\n') p++;
+    if (p == name_start) return 0;
+    size_t name_len = p - name_start;
+    if (name_len >= name_cap) return 0;
+    memcpy(out_name, name_start, name_len);
+    out_name[name_len] = '\0';
+
+    /* Must end with ; (possibly after array spec or trailing space) */
+    while (p < line_end && *p != ';') {
+        if (*p != ' ' && *p != '\t' && *p != '[' && *p != ']' &&
+            (*p < '0' || *p > '9')) return 0;
+        p++;
+    }
+    if (p >= line_end || *p != ';') return 0;
+
+    return 1;
+}
+
+static void mglAggregateLooseUniforms(char *src, size_t src_capacity)
+{
+    if (!src || src_capacity == 0) return;
+
+    /* Collect loose uniform declarations */
+    struct { char type[32]; char name[128]; size_t line_off; size_t line_len; } unis[128];
+    int uni_count = 0;
+
+    const char *src_end = src + strlen(src);
+    const char *line_start = src;
+    while (line_start < src_end && uni_count < 128) {
+        const char *line_end = strchr(line_start, '\n');
+        if (!line_end) line_end = src_end;
+        size_t line_len = line_end - line_start + 1;
+
+        char type_buf[32], name_buf[128];
+        if (mglIsLooseUniformLine(line_start, line_end,
+                                   type_buf, sizeof(type_buf),
+                                   name_buf, sizeof(name_buf))) {
+            unis[uni_count].line_off = (size_t)(line_start - src);
+            unis[uni_count].line_len = line_len;
+            strncpy(unis[uni_count].type, type_buf, sizeof(unis[uni_count].type) - 1);
+            unis[uni_count].type[sizeof(unis[uni_count].type) - 1] = '\0';
+            strncpy(unis[uni_count].name, name_buf, sizeof(unis[uni_count].name) - 1);
+            unis[uni_count].name[sizeof(unis[uni_count].name) - 1] = '\0';
+            uni_count++;
+        }
+
+        line_start = line_end + 1;
+    }
+
+    /* Only aggregate if we have enough loose uniforms to exceed Metal's limit */
+    if (uni_count <= 20) return;
+
+    /* Build the struct definition, uniform declaration, and #define macros */
+    /* Estimate: 60 bytes per uniform for struct member + #define macro */
+    size_t inject_size = 256 + (size_t)uni_count * 128;
+    char *inject = (char *)malloc(inject_size);
+    if (!inject) return;
+
+    size_t off = 0;
+    off += snprintf(inject + off, inject_size - off,
+                    "struct _MGLLooseUniforms {\n");
+    for (int i = 0; i < uni_count; i++) {
+        off += snprintf(inject + off, inject_size - off,
+                        "    %s %s;\n", unis[i].type, unis[i].name);
+    }
+    off += snprintf(inject + off, inject_size - off,
+                    "};\n"
+                    "uniform _MGLLooseUniforms _mgl_loose;\n");
+    for (int i = 0; i < uni_count; i++) {
+        off += snprintf(inject + off, inject_size - off,
+                        "#define %s _mgl_loose.%s\n", unis[i].name, unis[i].name);
+    }
+    off += snprintf(inject + off, inject_size - off, "\n");
+
+    size_t inject_len = off;
+    size_t src_len = strlen(src);
+
+    /* Check capacity */
+    if (src_len + inject_len + 1 > src_capacity) {
+        free(inject);
+        fprintf(stderr, "MGL WARNING: loose uniform aggregation skipped, "
+                        "not enough capacity (need %zu, have %zu)\n",
+                src_len + inject_len + 1, src_capacity);
+        return;
+    }
+
+    /* Inject the struct + defines after #version (and any preprocessor
+     * directives immediately following it) */
+    mgl_inject_after_version(src, src_capacity, inject, true);
+    free(inject);
+
+    /* Now blank out the original loose uniform declaration lines.
+     * We already injected #define macros, so the original declarations
+     * would conflict (redefinition).  Replace each line with spaces
+     * to preserve line numbers for debugging. */
+    for (int i = 0; i < uni_count; i++) {
+        /* Recalculate offset — injection shifted everything.
+         * Find the line by searching for "uniform <type> <name>;" */
+        char pattern[256];
+        snprintf(pattern, sizeof(pattern), "uniform %s %s;", unis[i].type, unis[i].name);
+        char *pos = strstr(src, pattern);
+        if (!pos) continue;
+
+        /* Find start of line */
+        char *ls = pos;
+        while (ls > src && ls[-1] != '\n') ls--;
+
+        /* Find end of line */
+        char *le = pos + strlen(pattern);
+        while (*le && *le != '\n') le++;
+
+        /* Blank the line (keep the newline) */
+        memset(ls, ' ', le - ls);
+    }
+
+    fprintf(stderr, "MGL AGGREGATE: packed %d loose uniforms into _MGLLooseUniforms struct\n",
+            uni_count);
+}
+
 static const glslang_resource_t *mgl_glslang_resource(GLMContext ctx)
 {
     static glslang_resource_t resource;
@@ -1307,7 +1502,7 @@ void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t
     char *modified_src = NULL;
     size_t modified_src_size = 0;
     size_t src_len = strlen(src);
-    modified_src_size = src_len + 2048;
+    modified_src_size = src_len + 32768;
     modified_src = (char *)malloc(modified_src_size);
 
     if (!modified_src) {
@@ -1450,6 +1645,10 @@ void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t
         if (!is_es_profile && strstr(modified_src, "#version 420") != NULL && glsl_version < 420) {
             glsl_version = 420;
         }
+
+        /* Aggregate loose uniforms into a single struct to avoid exceeding
+         * Metal's 31 buffer slot limit (Iris shaderpacks have 40+). */
+        mglAggregateLooseUniforms(modified_src, modified_src_size);
 
         input->code = modified_src;
         if (out_modified_src) {

@@ -171,6 +171,11 @@ GLboolean mglBufferSlotConflictsForProgram(Program *pptr, int stage, GLuint slot
         return GL_TRUE;
     }
 
+    if (stage >= 0 && stage < _MAX_SHADER_TYPES &&
+        (pptr->spirv[stage].argument_buffer_set_mask & (1u << slot))) {
+        return GL_TRUE;
+    }
+
     /* Conservative "any stage" check + stage-specific check. */
     GLboolean slot_conflicts = mglBufferSlotIsReserved(slot);
     if (!slot_conflicts && mglBufferSlotIsReservedForStage(slot, stage)) {
@@ -284,6 +289,14 @@ static GLboolean irBufferSlotConflictsForContext(const MGLIRPatchContext *ctx,
         return GL_FALSE;
     }
     if (slot >= kMGLMaxMetalVertexBufferCount) {
+        return GL_TRUE;
+    }
+
+    /* An argument-buffer descriptor set itself occupies [[buffer(set)]].
+     * Reserve those top-level slots so push constants, atomic counters and
+     * other still-discrete resources cannot be remapped on top of them. */
+    if (ctx->stage >= 0 && ctx->stage < _MAX_SHADER_TYPES &&
+        (ctx->program->spirv[ctx->stage].argument_buffer_set_mask & (1u << slot))) {
         return GL_TRUE;
     }
 
@@ -425,6 +438,7 @@ __attribute__((unused)) static GLboolean irUniformConstantLooksSamplerLike(const
 static GLboolean irResourceIsBufferBacked(SpirvResource *res, int res_type)
 {
     if (!res) return GL_FALSE;
+    if (res->uses_argument_buffer) return GL_FALSE;
     switch (res_type) {
         case SPVC_RESOURCE_TYPE_UNIFORM_BUFFER:
         case SPVC_RESOURCE_TYPE_STORAGE_BUFFER:

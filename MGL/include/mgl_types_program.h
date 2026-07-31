@@ -64,6 +64,8 @@ enum {
 #define TESS_EVALUATION_SHADER_MASK_BIT  SHADER_MASK_BIT(_TESS_EVALUATION_SHADER)
 #define COMPUTE_SHADER_MASK_BIT  SHADER_MASK_BIT(_COMPUTE_SHADER)
 
+#define MGL_MAX_ARGUMENT_BUFFER_SETS 4u
+
 typedef struct Shader_t {
     GLuint dirty_bits;
     GLuint name;
@@ -103,11 +105,30 @@ typedef struct Spirv_t {
     GLboolean needs_buffer_size_buffer; /* true if SPIRV-Cross MSL uses
                                          * spvBufferSizeConstants for
                                          * runtime-sized SSBO arrays */
+    /* Metal argument-buffer metadata.  Each bit in argument_buffer_set_mask
+     * identifies a descriptor set emitted as one top-level [[buffer(set)]]
+     * argument.  Encoders/storage are retained Objective-C objects bridged
+     * into this C struct and released by clearStageCompileState. */
+    GLboolean uses_argument_buffers;
+    uint32_t argument_buffer_set_mask;
+    void *mtl_argument_encoders[MGL_MAX_ARGUMENT_BUFFER_SETS];
+    void *mtl_argument_buffers[MGL_MAX_ARGUMENT_BUFFER_SETS];
+    void *mtl_argument_aux_buffers[MGL_MAX_ARGUMENT_BUFFER_SETS];
+    uint64_t argument_buffer_signatures[MGL_MAX_ARGUMENT_BUFFER_SETS];
+    size_t argument_buffer_lengths[MGL_MAX_ARGUMENT_BUFFER_SETS];
     char *msl_str_capture; /* MSL variant compiled with SPIRV-Cross output-capture
                             * options for GPU transform feedback. NULL unless
                             * MGL_XFB_GPU_CAPTURE is set and the stage is the
                             * program's feedback stage. The renderer dispatch
                             * that consumes this variant is not yet wired. */
+    GLuint point_size_buffer_slot; /* Metal [[buffer(N)]] slot used by the
+                                    * injected _mgl_point_size_params parameter.
+                                    * Defaults to kMGLPointSizeBufferIndex (15)
+                                    * but may be reassigned by
+                                    * mglInjectMSLPointSizeParams when slot 15
+                                    * is already occupied by a user UBO.  The
+                                    * draw path reads this to bind the point-size
+                                    * constant buffer at the correct slot. */
 } Spirv;
 
 typedef struct SpirvUBOMember_t {
@@ -140,6 +161,13 @@ typedef struct SpirvResource_t {
     char   *ubo_instance_name;
     /* Metal argument slot parsed from generated MSL after resource repair. */
     GLuint  binding;
+    /* Argument-buffer resources use a separate namespace from OpenGL client
+     * bindings.  argument_id is the [[id(N)]] inside argument_buffer_set;
+     * gl_binding remains the GL UBO/SSBO binding point used at draw time. */
+    GLboolean uses_argument_buffer;
+    GLuint argument_buffer_set;
+    GLuint argument_id;
+    GLuint argument_secondary_id;
     GLuint  location;
     GLuint  location_index; /* dual-source blending index (SpvDecorationIndex) */
     GLuint  gl_type;

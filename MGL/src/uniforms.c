@@ -1644,6 +1644,21 @@ GLint  mglGetUniformLocation(GLMContext ctx, GLuint program, const GLchar *name)
         }
     }
 
+    /* Fallback: try "_mgl_loose." prefix for aggregated loose uniforms.
+     * mglAggregateLooseUniforms packs loose uniforms into a struct
+     * _MGLLooseUniforms _mgl_loose, so "sunAngle" becomes queryable as
+     * "_mgl_loose.sunAngle".  Iris queries the original name, so we
+     * retry with the prefixed name here. */
+    if (name[0] != '_' || strncmp(name, "_mgl_loose.", 11) != 0) {
+        char alias[256];
+        size_t name_len = strlen(name);
+        if (name_len < sizeof(alias) - 12) {
+            memcpy(alias, "_mgl_loose.", 11);
+            memcpy(alias + 11, name, name_len + 1);
+            return mglGetUniformLocation(ctx, program, alias);
+        }
+    }
+
     return -1;
 }
 

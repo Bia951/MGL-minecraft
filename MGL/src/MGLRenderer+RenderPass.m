@@ -1167,6 +1167,30 @@ static bool mglGeometryShaderIsPassthrough(const Shader *shader)
                         }
                     }
                 }
+                /* Dump MSL to file before Metal compile so we can diagnose
+                 * compiler crashes (Metal aborts without NSError on some
+                 * malformed MSL).  Writes unconditionally — the file is
+                 * small and overwritten each compile. */
+                {
+                    const char *stageTag = "x";
+                    switch (i) {
+                        case _VERTEX_SHADER: stageTag = "vert"; break;
+                        case _FRAGMENT_SHADER: stageTag = "frag"; break;
+                        case _COMPUTE_SHADER: stageTag = "comp"; break;
+                        case _TESS_CONTROL_SHADER: stageTag = "tcs"; break;
+                        case _TESS_EVALUATION_SHADER: stageTag = "tes"; break;
+                        case _GEOMETRY_SHADER: stageTag = "geom"; break;
+                    }
+                    char dumpPath[128];
+                    snprintf(dumpPath, sizeof(dumpPath),
+                             "/tmp/mgl_pre_compile_p%u_%s.msl",
+                             (unsigned)(ptr ? ptr->name : 0), stageTag);
+                    FILE *dfp = fopen(dumpPath, "w");
+                    if (dfp) {
+                        if (compileMSL) fputs(compileMSL, dfp);
+                        fclose(dfp);
+                    }
+                }
                 library = [self compileShader: compileMSL];
                 if (!library) {
                     const char *stageName = "shader";
@@ -5798,7 +5822,8 @@ stencil_format_ok:;
     static __strong id<MTLBuffer> s_fragmentSizeBuffer = nil;
 
     Program *vertexProgram = mglResolveProgramForStageFromState(ctx, _VERTEX_SHADER);
-    if (vertexProgram && vertexProgram->spirv[_VERTEX_SHADER].needs_buffer_size_buffer)
+    if (vertexProgram && vertexProgram->spirv[_VERTEX_SHADER].needs_buffer_size_buffer &&
+        !vertexProgram->spirv[_VERTEX_SHADER].uses_argument_buffers)
     {
         uint32_t sizeConstants[31];
         memset(sizeConstants, 0, sizeof(sizeConstants));
@@ -5831,7 +5856,8 @@ stencil_format_ok:;
     }
 
     Program *fragmentProgram = mglResolveProgramForStageFromState(ctx, _FRAGMENT_SHADER);
-    if (fragmentProgram && fragmentProgram->spirv[_FRAGMENT_SHADER].needs_buffer_size_buffer)
+    if (fragmentProgram && fragmentProgram->spirv[_FRAGMENT_SHADER].needs_buffer_size_buffer &&
+        !fragmentProgram->spirv[_FRAGMENT_SHADER].uses_argument_buffers)
     {
         uint32_t sizeConstants[31];
         memset(sizeConstants, 0, sizeof(sizeConstants));

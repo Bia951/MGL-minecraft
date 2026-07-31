@@ -17,3 +17,12 @@ external/glslang/
 /.claude
 /docs
 /.workbuddy
+/.trae
+/.mixin.out
+/logs
+/todos
+/launch-mgl.command
+/config
+/ARGUMENT_BUFFER_*.md
+/deploy-mgl.sh
+

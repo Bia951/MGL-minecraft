@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdint.h>
 #include <ctype.h>
 #include <malloc/malloc.h>
@@ -368,6 +369,9 @@ void applyMSLResourceBindings(Program *pptr, int stage, char **msl_ptr)
         SpirvResourceList *resources = &pptr->spirv_resources_list[stage][res_type];
         for (GLuint i = 0; i < resources->count; i++) {
             SpirvResource *res = &resources->list[i];
+            if (res->uses_argument_buffer) {
+                continue;
+            }
             GLuint metal_index = 0;
             if (!res->name ||
                 !mglFindMSLResourceIndexInMap(&binding_map, MGL_MSL_BINDING_BUFFER, res->name, &metal_index)) {
@@ -996,15 +1000,17 @@ GLboolean mglFindMSLIdentifierBefore(const char *start,
     return GL_TRUE;
 }
 
-GLboolean mglInjectMSLPointSizeParams(char **msl_ptr)
+GLboolean mglInjectMSLPointSizeParams(char **msl_ptr, GLuint *out_slot)
 {
     if (!msl_ptr || !*msl_ptr || strstr(*msl_ptr, "_mgl_point_size_params")) {
+        if (out_slot) *out_slot = kMGLPointSizeBufferIndex;
         return GL_TRUE;
     }
 
     const char *param_open = mglFindMSLEntryParameterOpen(*msl_ptr);
     const char *param_close = mglFindMSLEntryParameterClose(*msl_ptr);
     if (!param_open || !param_close || param_open >= param_close) {
+        if (out_slot) *out_slot = kMGLPointSizeBufferIndex;
         return GL_FALSE;
     }
 
@@ -1016,12 +1022,70 @@ GLboolean mglInjectMSLPointSizeParams(char **msl_ptr)
         }
     }
 
+    /* Scan the entry-function parameter list for already-used [[buffer(N)]]
+     * slots.  Metal aborts (SIGABRT, no NSError) when two parameters share
+     * the same [[buffer(N)]] — which happened when an Iris shader bound a
+     * UBO to slot 15 (kMGLPointSizeBufferIndex) and the IR remap could not
+     * find a free slot in [0,15] because 0..14 were all occupied.
+     *
+     * Pick the point-size param slot dynamically: prefer 15, but if 15 is
+     * already taken, search [0, 30] for the first slot not used in the
+     * signature and not reserved by other MGL paths (tessellation 26-30,
+     * buffer-size 25, TCS stage-in 24).  This is a string-level fallback
+     * that runs AFTER IR remap, so it sees the final MSL bindings. */
+    GLuint point_size_slot = kMGLPointSizeBufferIndex;
+    {
+        GLboolean used_slots[31] = {0};
+        const char *scan = param_open;
+        while (scan < param_close) {
+            const char *hit = strstr(scan, "[[buffer(");
+            if (!hit || hit >= param_close) break;
+            const char *num_start = hit + 9; /* len("[[buffer(") == 9 */
+            unsigned long slot = strtoul(num_start, NULL, 10);
+            if (slot < 31) {
+                used_slots[slot] = GL_TRUE;
+            }
+            scan = num_start;
+        }
+        /* Also mark MGL-reserved slots so we don't pick them.  24 (TCS
+         * stage-in), 25 (buffer-size), 26-30 (tess/cull/fragcoord) are
+         * reserved by other paths that may run concurrently. */
+        used_slots[24] = GL_TRUE;
+        used_slots[25] = GL_TRUE;
+        for (GLuint s = 26; s <= 30; s++) used_slots[s] = GL_TRUE;
+
+        if (used_slots[point_size_slot]) {
+            for (GLuint s = 0; s < 31; s++) {
+                if (!used_slots[s]) {
+                    point_size_slot = s;
+                    break;
+                }
+            }
+            if (used_slots[point_size_slot]) {
+                /* All 31 slots occupied.  This happens with heavy Iris
+                 * shaderpacks that bind 24+ UBOs (slots 0-23) plus MGL's
+                 * reserved 24-30.  Injecting _mgl_point_size_params would
+                 * duplicate a [[buffer(N)]] and SIGABRT the Metal compiler.
+                 *
+                 * Fixed-function point size only matters for GL_POINTS
+                 * draws without GL_PROGRAM_POINT_SIZE.  Iris shaders don't
+                 * rely on it, so skip injection entirely and signal the
+                 * draw path not to bind the param buffer.  The shader's
+                 * own [[point_size]] output (if any) still rasterizes. */
+                if (out_slot) *out_slot = 0xFFFFFFFFu; /* sentinel: no slot */
+                return GL_TRUE;
+            }
+        }
+    }
+
     char param[128];
     snprintf(param, sizeof(param),
              "%sconstant float2& _mgl_point_size_params [[buffer(%u)]]",
              has_existing_params ? ", " : "",
-             (unsigned)kMGLPointSizeBufferIndex);
-    return mglInsertStringAt(msl_ptr, param_close, param) ? GL_TRUE : GL_FALSE;
+             (unsigned)point_size_slot);
+    GLboolean ok = mglInsertStringAt(msl_ptr, param_close, param) ? GL_TRUE : GL_FALSE;
+    if (ok && out_slot) *out_slot = point_size_slot;
+    return ok;
 }
 
 /* Inject or override [[point_size]] output for vertex-producing shaders.
@@ -1038,8 +1102,9 @@ GLboolean mglInjectMSLPointSizeParams(char **msl_ptr)
  * Vertex shaders read the current GL point-size state from a tiny internal
  * buffer.  If the shader already declares gl_PointSize, fixed-function point
  * size still overrides it when GL_PROGRAM_POINT_SIZE is disabled. */
-void mglInjectMSLPointSizeBuiltin(int stage, char **msl_ptr)
+void mglInjectMSLPointSizeBuiltin(int stage, char **msl_ptr, Spirv *spirv)
 {
+    if (spirv) spirv->point_size_buffer_slot = kMGLPointSizeBufferIndex;
     if (!msl_ptr || !*msl_ptr) {
         return;
     }
@@ -1089,9 +1154,18 @@ void mglInjectMSLPointSizeBuiltin(int stage, char **msl_ptr)
     }
 
     if (dynamic_vertex_point_size &&
-        !mglInjectMSLPointSizeParams(msl_ptr)) {
+        !mglInjectMSLPointSizeParams(msl_ptr,
+                                     spirv ? &spirv->point_size_buffer_slot : NULL)) {
         return;
     }
+
+    /* If mglInjectMSLPointSizeParams could not find a free buffer slot
+     * (all 31 occupied by Iris UBOs + MGL reserved), it sets
+     * point_size_buffer_slot to 0xFFFFFFFF and does NOT inject the
+     * _mgl_point_size_params parameter.  Fall back to a constant 1.0
+     * assignment so the [[point_size]] output is still initialized. */
+    GLboolean point_size_no_slot = (spirv &&
+                                     spirv->point_size_buffer_slot == 0xFFFFFFFFu);
 
     /* SPIRV-Cross consistently names the output variable `out` and uses
      * `return out;` as the return statement. */
@@ -1102,7 +1176,11 @@ void mglInjectMSLPointSizeBuiltin(int stage, char **msl_ptr)
     while ((cursor = strstr(cursor, return_pattern)) != NULL) {
         cursor_offset = (size_t)(cursor - *msl_ptr);
         char point_size_assign[256];
-        if (dynamic_vertex_point_size && has_point_size) {
+        if (point_size_no_slot) {
+            snprintf(point_size_assign, sizeof(point_size_assign),
+                     "out.%s = 1.0; ",
+                     point_size_name);
+        } else if (dynamic_vertex_point_size && has_point_size) {
             snprintf(point_size_assign, sizeof(point_size_assign),
                      "if (_mgl_point_size_params.y == 0.0) { out.%s = _mgl_point_size_params.x; } ",
                      point_size_name);
@@ -3888,7 +3966,7 @@ GLboolean mglPatchInjectPointSizeBuiltin(MSLPatchContext *ctx, char **msl_ptr)
     if (!(stage == _VERTEX_SHADER &&
           ptr->shader_slots[_GEOMETRY_SHADER] &&
           !mglProgramHasPassthroughGeometryShader(ptr))) {
-        mglInjectMSLPointSizeBuiltin(stage, msl_ptr);
+        mglInjectMSLPointSizeBuiltin(stage, msl_ptr, &ptr->spirv[stage]);
     }
     return GL_TRUE;
 }
@@ -3939,6 +4017,223 @@ GLboolean mglPatchTcsStageInFix(MSLPatchContext *ctx, char **msl_ptr)
     }
     return GL_TRUE;
 }
+
+/* === Metal argument-buffer planning ===================================== */
+static int mglArgumentBufferMode(void)
+{
+    const char *value = getenv("MGL_ARGUMENT_BUFFERS");
+    if (!value || !*value || !strcasecmp(value, "auto")) return -1; /* automatic */
+    if (!strcmp(value, "0") || !strcasecmp(value, "false") ||
+        !strcasecmp(value, "off") || !strcasecmp(value, "no")) return 0;
+    return 1;
+}
+
+static GLuint mglArgumentBufferResourceSpan(const SpirvResource *resource)
+{
+    if (!resource) return 1u;
+    if (resource->ubo_array_size > 1u) return resource->ubo_array_size;
+    if (resource->gl_array_size > 1) return (GLuint)resource->gl_array_size;
+    return 1u;
+}
+
+static GLboolean mglShouldUseArgumentBuffers(Program *program, int stage)
+{
+    /* The runtime binding path is implemented for the stages Minecraft and
+     * Voxy actually use here. Tessellation/geometry stages have custom MGL
+     * lowering paths with their own fixed buffer contracts, so keep them
+     * discrete until those paths gain explicit argument-buffer support. */
+    if (stage != _VERTEX_SHADER &&
+        stage != _FRAGMENT_SHADER &&
+        stage != _COMPUTE_SHADER) {
+        return GL_FALSE;
+    }
+
+    const int mode = mglArgumentBufferMode();
+    if (mode == 0) return GL_FALSE;
+    if (mode == 1) return GL_TRUE;
+
+    GLuint descriptorCount = 0u;
+    GLboolean directSlots[kMGLMaxMetalVertexBufferCount] = {0};
+    const int types[] = { SPVC_RESOURCE_TYPE_UNIFORM_BUFFER, SPVC_RESOURCE_TYPE_STORAGE_BUFFER };
+    for (size_t ti = 0; ti < sizeof(types) / sizeof(types[0]); ti++) {
+        SpirvResourceList *list = &program->spirv_resources_list[stage][types[ti]];
+        for (GLuint i = 0; i < list->count; i++) {
+            SpirvResource *resource = &list->list[i];
+            const GLuint span = mglArgumentBufferResourceSpan(resource);
+            descriptorCount += span;
+            for (GLuint element = 0; element < span; element++) {
+                const uint64_t slot64 = (uint64_t)resource->binding + element;
+                if (slot64 >= kMGLMaxMetalVertexBufferCount ||
+                    mglBufferSlotConflictsForProgram(program, stage, (GLuint)slot64)) {
+                    return GL_TRUE;
+                }
+                const GLuint slot = (GLuint)slot64;
+                /* OpenGL UBO and SSBO binding points are independent, while
+                 * Metal's direct buffer table is shared per stage.  Detect a
+                 * collision even when both GL resources happen to use the
+                 * same numeric client binding. */
+                if (directSlots[slot]) {
+                    return GL_TRUE;
+                }
+                directSlots[slot] = GL_TRUE;
+            }
+        }
+    }
+
+    /* Leave small vanilla shaders on the lower-overhead discrete path. */
+    return descriptorCount > ((stage == _VERTEX_SHADER) ? 12u : 20u) ? GL_TRUE : GL_FALSE;
+}
+
+static void mglMoveDescriptorResourcesToSet(Program *program,
+                                            int stage,
+                                            spvc_compiler compiler,
+                                            int resourceType,
+                                            GLuint descriptorSet)
+{
+    SpirvResourceList *resources = &program->spirv_resources_list[stage][resourceType];
+    for (GLuint i = 0; i < resources->count; i++) {
+        SpirvResource *resource = &resources->list[i];
+        spvc_compiler_set_decoration(compiler, resource->_id,
+                                     SpvDecorationDescriptorSet, descriptorSet);
+        resource->set = descriptorSet;
+    }
+}
+
+static GLboolean mglConfigureArgumentBuffers(Program *program,
+                                             int stage,
+                                             spvc_compiler compiler,
+                                             spvc_compiler_options options)
+{
+    Spirv *spirv = &program->spirv[stage];
+    spirv->uses_argument_buffers = GL_FALSE;
+    spirv->argument_buffer_set_mask = 0u;
+
+    if (!mglShouldUseArgumentBuffers(program, stage)) {
+        return GL_TRUE;
+    }
+
+    /* OpenGL has independent UBO/SSBO binding namespaces.  A single Metal
+     * argument-buffer ID namespace cannot reuse those numeric bindings safely,
+     * so place UBOs and SSBOs in separate sets and allocate dense, non-overlap
+     * [[id(N)]] ranges (arrays consume consecutive IDs). */
+    struct {
+        int type;
+        GLuint set;
+    } groups[] = {
+        { SPVC_RESOURCE_TYPE_UNIFORM_BUFFER, 0u },
+        { SPVC_RESOURCE_TYPE_STORAGE_BUFFER, 1u }
+    };
+
+    for (size_t gi = 0; gi < sizeof(groups) / sizeof(groups[0]); gi++) {
+        SpirvResourceList *resources = &program->spirv_resources_list[stage][groups[gi].type];
+        GLuint nextID = 0u;
+        if (resources->count == 0u) continue;
+        spirv->argument_buffer_set_mask |= 1u << groups[gi].set;
+        for (GLuint i = 0; i < resources->count; i++) {
+            SpirvResource *resource = &resources->list[i];
+            resource->uses_argument_buffer = GL_TRUE;
+            resource->argument_buffer_set = groups[gi].set;
+            GLuint span = mglArgumentBufferResourceSpan(resource);
+            /* SPIRV-Cross injects spvBufferSizeConstants at [[id(25)]] in
+             * an SSBO argument set when runtime array .length() is used.
+             * Keep that synthetic descriptor's ID free even before we know
+             * whether this particular shader needs it. */
+            if (groups[gi].set == 1u && nextID <= MGL_BUFFER_SIZE_BUFFER_INDEX &&
+                nextID + span > MGL_BUFFER_SIZE_BUFFER_INDEX) {
+                nextID = MGL_BUFFER_SIZE_BUFFER_INDEX + 1u;
+            }
+            resource->argument_id = nextID;
+            resource->argument_secondary_id = UINT32_MAX;
+            resource->set = groups[gi].set;
+            resource->binding = nextID;
+            spvc_compiler_set_decoration(compiler, resource->_id,
+                                         SpvDecorationDescriptorSet, groups[gi].set);
+            spvc_compiler_set_decoration(compiler, resource->_id,
+                                         SpvDecorationBinding, nextID);
+            nextID += span;
+        }
+    }
+
+    if (spirv->argument_buffer_set_mask == 0u) {
+        /* Forced mode on a shader with no UBO/SSBO has nothing to pack. */
+        return GL_TRUE;
+    }
+
+    /* Keep textures/samplers/images on their existing discrete Metal tables.
+     * They cannot remain in descriptor set 0 once set 0 is an argument buffer. */
+    const int discreteTextureTypes[] = {
+        SPVC_RESOURCE_TYPE_SAMPLED_IMAGE,
+        SPVC_RESOURCE_TYPE_SEPARATE_IMAGE,
+        SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS,
+        SPVC_RESOURCE_TYPE_STORAGE_IMAGE
+    };
+    for (size_t ti = 0; ti < sizeof(discreteTextureTypes) / sizeof(discreteTextureTypes[0]); ti++) {
+        mglMoveDescriptorResourcesToSet(program, stage, compiler,
+                                        discreteTextureTypes[ti], 2u);
+    }
+    /* Combined sampler/image uniforms can be reported as UNIFORM_CONSTANT. */
+    SpirvResourceList *uniformConstants =
+        &program->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT];
+    for (GLuint i = 0; i < uniformConstants->count; i++) {
+        SpirvResource *resource = &uniformConstants->list[i];
+        if (resource->image_dim != 0u || resource->uniform_location >= 0) {
+            spvc_compiler_set_decoration(compiler, resource->_id,
+                                         SpvDecorationDescriptorSet, 2u);
+            resource->set = 2u;
+        }
+    }
+    mglMoveDescriptorResourcesToSet(program, stage, compiler,
+                                    SPVC_RESOURCE_TYPE_ATOMIC_COUNTER, 3u);
+
+    if (spvc_compiler_options_set_bool(options,
+                                       SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS,
+                                       SPVC_TRUE) != SPVC_SUCCESS) {
+        return GL_FALSE;
+    }
+    {
+        const char *forceValue = getenv("MGL_ARGUMENT_BUFFERS_FORCE_ACTIVE");
+        GLboolean forceActive = (!forceValue ||
+                                 (strcmp(forceValue, "0") != 0 &&
+                                  strcasecmp(forceValue, "false") != 0 &&
+                                  strcasecmp(forceValue, "off") != 0))
+            ? GL_TRUE : GL_FALSE;
+        if (spvc_compiler_options_set_bool(options,
+                                           SPVC_COMPILER_OPTION_MSL_FORCE_ACTIVE_ARGUMENT_BUFFER_RESOURCES,
+                                           forceActive ? SPVC_TRUE : SPVC_FALSE) != SPVC_SUCCESS) {
+            return GL_FALSE;
+        }
+    }
+    if (spvc_compiler_install_compiler_options(compiler, options) != SPVC_SUCCESS) {
+        return GL_FALSE;
+    }
+
+    spirv->uses_argument_buffers = GL_TRUE;
+    fprintf(stderr,
+            "MGL ARGUMENT BUFFER: enabled program=%u stage=%d sets=0x%x (MGL_ARGUMENT_BUFFERS=0 disables)\n",
+            program->name, stage, spirv->argument_buffer_set_mask);
+    return GL_TRUE;
+}
+
+static void mglFinalizeArgumentBufferBindings(Program *program,
+                                              int stage,
+                                              spvc_compiler compiler)
+{
+    if (!program->spirv[stage].uses_argument_buffers) return;
+    const int types[] = { SPVC_RESOURCE_TYPE_UNIFORM_BUFFER, SPVC_RESOURCE_TYPE_STORAGE_BUFFER };
+    for (size_t ti = 0; ti < sizeof(types) / sizeof(types[0]); ti++) {
+        SpirvResourceList *resources = &program->spirv_resources_list[stage][types[ti]];
+        for (GLuint i = 0; i < resources->count; i++) {
+            SpirvResource *resource = &resources->list[i];
+            if (!resource->uses_argument_buffer) continue;
+            unsigned automatic = spvc_compiler_msl_get_automatic_resource_binding(compiler, resource->_id);
+            unsigned secondary = spvc_compiler_msl_get_automatic_resource_binding_secondary(compiler, resource->_id);
+            if (automatic != UINT32_MAX) resource->argument_id = automatic;
+            resource->argument_secondary_id = secondary;
+            resource->binding = resource->argument_id;
+        }
+    }
+}
+
 char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
 {
     const SpvId *spirv;
@@ -4031,7 +4326,8 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
     }
 
     // ERROR_CHECK_RETURN(spvc_compiler_msl_add_discrete_descriptor_set(compiler_msl, 3) == SPVC_SUCCESS, GL_INVALID_OPERATION);
-    if (spvc_compiler_msl_add_discrete_descriptor_set(compiler_msl, 3) != SPVC_SUCCESS) {
+    if (spvc_compiler_msl_add_discrete_descriptor_set(compiler_msl, 2) != SPVC_SUCCESS ||
+        spvc_compiler_msl_add_discrete_descriptor_set(compiler_msl, 3) != SPVC_SUCCESS) {
         fprintf(stderr, "MGL Error: spvc_compiler_msl_add_discrete_descriptor_set failed\n");
         spvc_context_destroy(context);
         ERROR_RETURN_VALUE(GL_INVALID_OPERATION, NULL);
@@ -4045,7 +4341,7 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
         ERROR_RETURN_VALUE(GL_INVALID_OPERATION, NULL);
     }
 
-    // ERROR_CHECK_RETURN(spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS, SPVC_FALSE) == SPVC_SUCCESS, GL_INVALID_OPERATION);
+    // Start discrete; auto/forced argument-buffer mode is selected after reflection.
     if (spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS, SPVC_FALSE) != SPVC_SUCCESS) {
         fprintf(stderr, "MGL Error: spvc_compiler_options_set_bool(SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS) failed\n");
         spvc_context_destroy(context);
@@ -5194,6 +5490,13 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
      * that needs decoration values after the pipeline must use live queries
      * such as spvc_compiler_get_decoration / spvc_compiler_has_decoration
      * on the compiler instead of relying on the `resources` snapshot. */
+    if (!mglConfigureArgumentBuffers(ptr, stage, compiler_msl, options)) {
+        fprintf(stderr, "MGL ERROR: argument-buffer configuration failed program=%u stage=%d\n",
+                ptr->name, stage);
+        spvc_context_destroy(context);
+        return NULL;
+    }
+
     mglRunIRPostprocessPipeline(ctx, ptr, stage, compiler_msl);
 
     if (spvc_compiler_compile(compiler_msl, &result) != SPVC_SUCCESS || !result) {
@@ -5206,6 +5509,8 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
         spvc_context_destroy(context);
         return NULL;
     }
+    mglFinalizeArgumentBufferBindings(ptr, stage, compiler_msl);
+
     if (getenv("MGL_DUMP_MSL")) {
         fprintf(stderr, "MGL DBG MSL DUMP (program=%u stage=%d):\n%.8000s\n", ptr->name, stage, result);
     }
@@ -5419,6 +5724,15 @@ void clearStageCompileState(Program *pptr, int stage)
     }
     mglSafeReleaseMetalObj((void **)&pptr->spirv[stage].mtl_function);
     mglSafeReleaseMetalObj((void **)&pptr->spirv[stage].mtl_library);
+    for (GLuint set = 0; set < MGL_MAX_ARGUMENT_BUFFER_SETS; set++) {
+        mglSafeReleaseMetalObj((void **)&pptr->spirv[stage].mtl_argument_encoders[set]);
+        mglSafeReleaseMetalObj((void **)&pptr->spirv[stage].mtl_argument_buffers[set]);
+        mglSafeReleaseMetalObj((void **)&pptr->spirv[stage].mtl_argument_aux_buffers[set]);
+        pptr->spirv[stage].argument_buffer_signatures[set] = 0u;
+        pptr->spirv[stage].argument_buffer_lengths[set] = 0u;
+    }
+    pptr->spirv[stage].uses_argument_buffers = GL_FALSE;
+    pptr->spirv[stage].argument_buffer_set_mask = 0u;
 
     for (int res_type = 0; res_type < _MAX_SPIRV_RES; res_type++) {
         SpirvResourceList *rl = &pptr->spirv_resources_list[stage][res_type];

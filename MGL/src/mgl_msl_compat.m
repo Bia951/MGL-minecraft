@@ -491,6 +491,10 @@ bool mglShouldSkipStageBufferResource(Program *program,
         return false;
     }
 
+    if (resource->uses_argument_buffer) {
+        return true;
+    }
+
     if (resourceType == SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT &&
         mglRendererResourceLooksSamplerLike(resource, resourceType)) {
         return true;

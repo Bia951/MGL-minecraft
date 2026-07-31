@@ -326,6 +326,11 @@ void mglFreeProgram(GLMContext ctx, Program *ptr)
         }
         mglSafeReleaseMetalObj((void **)&ptr->spirv[i].mtl_function);
         mglSafeReleaseMetalObj((void **)&ptr->spirv[i].mtl_library);
+        for (GLuint set = 0; set < MGL_MAX_ARGUMENT_BUFFER_SETS; set++) {
+            mglSafeReleaseMetalObj((void **)&ptr->spirv[i].mtl_argument_encoders[set]);
+            mglSafeReleaseMetalObj((void **)&ptr->spirv[i].mtl_argument_buffers[set]);
+            mglSafeReleaseMetalObj((void **)&ptr->spirv[i].mtl_argument_aux_buffers[set]);
+        }
         
         for(int j=0; j<_MAX_SPIRV_RES; j++)
         {
