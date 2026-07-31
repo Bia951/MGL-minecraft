@@ -134,8 +134,8 @@ const char *mglFindMSLEntryParameterClose(const char *msl);
 /* ---- Group B.3: MSL Fix/Patch Functions ---- */
 
 void applyMSLFragCoordOriginFix(int stage, char **msl_ptr);
-GLboolean mglInjectMSLPointSizeParams(char **msl_ptr);
-void mglInjectMSLPointSizeBuiltin(int stage, char **msl_ptr);
+GLboolean mglInjectMSLPointSizeParams(char **msl_ptr, GLuint *out_slot);
+void mglInjectMSLPointSizeBuiltin(int stage, char **msl_ptr, Spirv *spirv);
 void mglFixMSLImage2DRectImageSize(char **msl_ptr);
 void mglFixMSLTcsStageIn(char **msl_ptr);
 void mglEnsurePatchId3Param(char **msl_ptr);

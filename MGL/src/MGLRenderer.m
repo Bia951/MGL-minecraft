@@ -42,6 +42,7 @@
 #include <dispatch/dispatch.h>
 
 #import "MGLRenderer_Private.h"
+#import "MGLRenderer+ArgumentBuffer_Private.h"
 #import "mgl.h"
 #import "mgl_sampler_compat.h"
 #import "mgl_state_log.h"
@@ -7896,7 +7897,8 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
      * shader uses .length() on unsized SSBO arrays. */
     {
         Program *computeProgram = mglResolveProgramForStageFromState(ctx, _COMPUTE_SHADER);
-        if (computeProgram && computeProgram->spirv[_COMPUTE_SHADER].needs_buffer_size_buffer)
+        if (computeProgram && computeProgram->spirv[_COMPUTE_SHADER].needs_buffer_size_buffer &&
+            !computeProgram->spirv[_COMPUTE_SHADER].uses_argument_buffers)
         {
             uint32_t sizeConstants[31];
             memset(sizeConstants, 0, sizeof(sizeConstants));
@@ -8287,6 +8289,11 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
     [computeCommandEncoder setComputePipelineState:computePipelineState];
 
     RETURN_FALSE_ON_FAILURE([self bindBuffersToComputeEncoder: computeCommandEncoder]);
+    RETURN_FALSE_ON_FAILURE([self bindArgumentBuffersForProgram:program
+                                                          stage:_COMPUTE_SHADER
+                                                        context:ctx
+                                                  renderEncoder:nil
+                                                 computeEncoder:computeCommandEncoder]);
 
     //setTexture:atIndex:
     //setTextures:withRange:
@@ -10140,7 +10147,8 @@ Buffer *getIndirectBuffer(GLMContext ctx)
     }
 
     Program *stageProgram = mglResolveProgramForStageFromState(ctx, stage);
-    if (stageProgram && stageProgram->spirv[stage].needs_buffer_size_buffer)
+    if (stageProgram && stageProgram->spirv[stage].needs_buffer_size_buffer &&
+        !stageProgram->spirv[stage].uses_argument_buffers)
     {
         uint32_t sizeConstants[31];
         memset(sizeConstants, 0, sizeof(sizeConstants));
@@ -10192,13 +10200,18 @@ Buffer *getIndirectBuffer(GLMContext ctx)
     if (!msl || !strstr(msl, "_mgl_point_size_params")) {
         return;
     }
+    GLuint psSlot = program->spirv[stage].point_size_buffer_slot;
+    if (psSlot == 0xFFFFFFFFu) {
+        return; /* no slot available — shader uses constant 1.0 */
+    }
+    if (psSlot == 0) psSlot = kMGLPointSizeParamBufferIndex;
     float pointSizeParams[2] = {
         ctx && ctx->state.var.point_size > 0.0f ? ctx->state.var.point_size : 1.0f,
         ctx && ctx->state.caps.program_point_size ? 1.0f : 0.0f
     };
     [computeEncoder setBytes:pointSizeParams
                       length:sizeof(pointSizeParams)
-                     atIndex:kMGLPointSizeParamBufferIndex];
+                     atIndex:psSlot];
 }
 
 - (id<MTLBuffer>)newTCSStageInBufferForContext:(GLMContext)drawCtx
@@ -11658,6 +11671,9 @@ void* CppCreateMGLRendererAndBindToContext (void *glm_ctx)
             [_layer removeFromSuperlayer];
             _layer = nil;
         }
+
+        _argumentBufferFallbackStorage = nil;
+        _argumentBufferRetiredFallbackStorage = nil;
 
         // Cleanup command queue and device
         if (_commandQueue) {

@@ -2,6 +2,7 @@
 // Draw command encoding methods extracted from MGLRenderer.m
 
 #import "MGLRenderer_Private.h"
+#import "MGLRenderer+ArgumentBuffer_Private.h"
 #import "MGLRenderer+Draw_Private.h"
 #import "mgl_frame_activity.h"
 
@@ -1043,23 +1044,30 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
     BOOL needsPointSizeParams = NO;
     int pointSizeStages[] = { _VERTEX_SHADER, _TESS_EVALUATION_SHADER, _GEOMETRY_SHADER };
     for (NSUInteger ps = 0; ps < sizeof(pointSizeStages) / sizeof(pointSizeStages[0]); ps++) {
-        Program *pointProgram = mglResolveProgramForStageFromState(ctx, pointSizeStages[ps]);
-        const char *pointMsl = pointProgram ? pointProgram->spirv[pointSizeStages[ps]].msl_str : NULL;
+        int psStage = pointSizeStages[ps];
+        Program *pointProgram = mglResolveProgramForStageFromState(ctx, psStage);
+        const char *pointMsl = pointProgram ? pointProgram->spirv[psStage].msl_str : NULL;
         if (pointMsl && strstr(pointMsl, "_mgl_point_size_params")) {
-            needsPointSizeParams = YES;
-            break;
+            /* Read the actual slot chosen by mglInjectMSLPointSizeParams.
+             * It defaults to kMGLPointSizeBufferIndex (15) but may have been
+             * reassigned when slot 15 was occupied by a user UBO.
+             * 0xFFFFFFFF means no slot was available (all 31 occupied) —
+             * the shader uses a constant 1.0, so skip binding. */
+            GLuint psSlot = pointProgram->spirv[psStage].point_size_buffer_slot;
+            if (psSlot == 0xFFFFFFFFu) {
+                continue;
+            }
+            if (psSlot == 0) psSlot = kMGLPointSizeParamBufferIndex;
+            float pointSizeParams[2] = {
+                ctx && ctx->state.var.point_size > 0.0f ? ctx->state.var.point_size : 1.0f,
+                ctx && ctx->state.caps.program_point_size ? 1.0f : 0.0f
+            };
+            [_currentRenderEncoder setVertexBytes:pointSizeParams
+                                          length:sizeof(pointSizeParams)
+                                          atIndex:psSlot];
+            [self invalidateLastBoundVertexBufferAtIndex:psSlot];
+            anyBindingPresent[psSlot] = true;
         }
-    }
-    if (needsPointSizeParams) {
-        float pointSizeParams[2] = {
-            ctx && ctx->state.var.point_size > 0.0f ? ctx->state.var.point_size : 1.0f,
-            ctx && ctx->state.caps.program_point_size ? 1.0f : 0.0f
-        };
-        [_currentRenderEncoder setVertexBytes:pointSizeParams
-                                      length:sizeof(pointSizeParams)
-                                      atIndex:kMGLPointSizeParamBufferIndex];
-        [self invalidateLastBoundVertexBufferAtIndex:kMGLPointSizeParamBufferIndex];
-        anyBindingPresent[kMGLPointSizeParamBufferIndex] = true;
     }
 
 }
@@ -4278,6 +4286,18 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
     RETURN_FALSE_ON_FAILURE([self updateDirtyBaseBufferList:&state->fragment_buffer_map_list]);
     RETURN_FALSE_ON_FAILURE([self bindVertexBuffersToCurrentRenderEncoder]);
     RETURN_FALSE_ON_FAILURE([self bindFragmentBuffersToCurrentRenderEncoder]);
+    Program *vertexProgram = mglResolveProgramForStageFromState(glm_ctx, _VERTEX_SHADER);
+    Program *fragmentProgram = mglResolveProgramForStageFromState(glm_ctx, _FRAGMENT_SHADER);
+    RETURN_FALSE_ON_FAILURE([self bindArgumentBuffersForProgram:vertexProgram
+                                                          stage:_VERTEX_SHADER
+                                                        context:glm_ctx
+                                                  renderEncoder:_currentRenderEncoder
+                                                 computeEncoder:nil]);
+    RETURN_FALSE_ON_FAILURE([self bindArgumentBuffersForProgram:fragmentProgram
+                                                          stage:_FRAGMENT_SHADER
+                                                        context:glm_ctx
+                                                  renderEncoder:_currentRenderEncoder
+                                                 computeEncoder:nil]);
     RETURN_FALSE_ON_FAILURE([self bindBufferSizeConstantsForRenderEncoder]);
     RETURN_FALSE_ON_FAILURE([self bindActiveTexturesToMTL]);
     RETURN_FALSE_ON_FAILURE([self restoreRenderEncoderAfterTextureUploadForDraw:"final-active-texture-bind"]);

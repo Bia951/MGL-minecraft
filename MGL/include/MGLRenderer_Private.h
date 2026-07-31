@@ -243,6 +243,8 @@ static inline void mglMetalUnlock(os_unfair_lock *lock) {
     id<MTLTexture> _fallbackSampledTexture;
     id<MTLTexture> _fallbackCubeSampledTexture;
     id<MTLBuffer> _fallbackTextureBufferStorage;
+    id<MTLBuffer> _argumentBufferFallbackStorage;
+    NSMutableArray<id<MTLBuffer>> *_argumentBufferRetiredFallbackStorage;
     id<MTLBuffer> _tessFactorBuffer;
     id<MTLBuffer> _tcsOutputBuffer;     /* TCS per-vertex output (spvOut, buffer 28) */
     id<MTLBuffer> _tcsPatchOutBuffer;   /* TCS per-patch output (spvPatchOut, buffer 27) */
@@ -325,6 +327,7 @@ static inline void mglMetalUnlock(os_unfair_lock *lock) {
  * the include guards prevent infinite recursion.  Importing them here means
  * existing code that imports just MGLRenderer_Private.h continues to see ALL
  * declarations. */
+#import "MGLRenderer+ArgumentBuffer_Private.h"
 #import "MGLRenderer+Draw_Private.h"
 #import "MGLRenderer+RenderPass_Private.h"
 #import "MGLRenderer+Blit_Private.h"
