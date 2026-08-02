@@ -35,17 +35,21 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
 
 - (bool) bindVertexBuffersToCurrentRenderEncoder
 {
-    static uint64_t s_vbindCallCount = 0;
-    static double s_vbindLastCallTime = 0.0;
-    static uint64_t s_vbindLastCallCount = 0;
-    uint64_t vbindCall = ++s_vbindCallCount;
-    double vbindStartSeconds = mglNowSeconds();
-    mglLogLoopHeartbeat("vbind.loop",
-                        vbindCall,
-                        vbindStartSeconds,
-                        &s_vbindLastCallTime,
-                        &s_vbindLastCallCount,
-                        0.25);
+    uint64_t vbindCall = 0;
+    double vbindStartSeconds = 0;
+    if (kMGLDiagnosticStateLogs || mglTraceLogIsEnabled()) {
+        static uint64_t s_vbindCallCount = 0;
+        static double s_vbindLastCallTime = 0.0;
+        static uint64_t s_vbindLastCallCount = 0;
+        vbindCall = ++s_vbindCallCount;
+        vbindStartSeconds = mglNowSeconds();
+        mglLogLoopHeartbeat("vbind.loop",
+                            vbindCall,
+                            vbindStartSeconds,
+                            &s_vbindLastCallTime,
+                            &s_vbindLastCallCount,
+                            0.25);
+    }
 
     BufferMap *map;
     Buffer *ptr;
@@ -127,18 +131,18 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
         attribBindingReserved[mappedIndex] = true;
     }
 
-    for (GLuint i = 0; i < MAX_ATTRIBS; i++) {
-        BOOL enabled = attribsEnabledByApp && ((vao->enabled_attribs >> i) & 0x1u) != 0;
-        MGLResolvedVertexAttribBinding resolved = {0};
-        Buffer *attribBuffer = mglRendererResolveVertexAttribBinding(ctx,
-                                                                     vao,
-                                                                     i,
-                                                                     __FUNCTION__,
-                                                                     &resolved)
-            ? resolved.buffer
-            : NULL;
-        GLuint attribBufferName = attribBuffer ? attribBuffer->name : 0;
-        if (kMGLVerboseBindLogs) {
+    if (kMGLVerboseBindLogs) {
+        for (GLuint i = 0; i < MAX_ATTRIBS; i++) {
+            BOOL enabled = attribsEnabledByApp && ((vao->enabled_attribs >> i) & 0x1u) != 0;
+            MGLResolvedVertexAttribBinding resolved = {0};
+            Buffer *attribBuffer = mglRendererResolveVertexAttribBinding(ctx,
+                                                                         vao,
+                                                                         i,
+                                                                         __FUNCTION__,
+                                                                         &resolved)
+                ? resolved.buffer
+                : NULL;
+            GLuint attribBufferName = attribBuffer ? attribBuffer->name : 0;
             NSLog(@"MGL VBIND attrib=%u enabled=%d buf=%p bufName=%u bindOffset=%lld ptr=0x%llx stride=%u size=%u type=0x%x normalized=%u divisor=%u binding=%u table=%d",
                   i,
                   enabled ? 1 : 0,
@@ -153,24 +157,24 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
                   (unsigned)(attribBuffer ? resolved.divisor : vao->attrib[i].divisor),
                   (unsigned)vao->attrib[i].buffer_bindingindex,
                   attribBuffer && resolved.uses_binding_table ? 1 : 0);
-        }
 
-        if (kMGLVerboseBindLogs && enabled && attribBuffer) {
-            NSLog(@"MGL VBIND buffer detail attrib=%u name=%u size=%lld mtl=%p data=%p init(ever=%u full=%u range=[%lld,%lld) source=%u off=%lld size=%lld src=%p hash=0x%016llx)",
-                  i,
-                  attribBuffer->name,
-                  (long long)attribBuffer->size,
-                  attribBuffer->data.mtl_data,
-                  (void *)attribBuffer->data.buffer_data,
-                  (unsigned)attribBuffer->ever_written,
-                  (unsigned)attribBuffer->has_initialized_data,
-                  (long long)attribBuffer->written_min,
-                  (long long)attribBuffer->written_max,
-                  (unsigned)attribBuffer->last_init_source,
-                  (long long)attribBuffer->last_write_offset,
-                  (long long)attribBuffer->last_write_size,
-                  attribBuffer->last_write_src_ptr,
-                  (unsigned long long)attribBuffer->last_write_src_hash);
+            if (enabled && attribBuffer) {
+                NSLog(@"MGL VBIND buffer detail attrib=%u name=%u size=%lld mtl=%p data=%p init(ever=%u full=%u range=[%lld,%lld) source=%u off=%lld size=%lld src=%p hash=0x%016llx)",
+                      i,
+                      attribBuffer->name,
+                      (long long)attribBuffer->size,
+                      attribBuffer->data.mtl_data,
+                      (void *)attribBuffer->data.buffer_data,
+                      (unsigned)attribBuffer->ever_written,
+                      (unsigned)attribBuffer->has_initialized_data,
+                      (long long)attribBuffer->written_min,
+                      (long long)attribBuffer->written_max,
+                      (unsigned)attribBuffer->last_init_source,
+                      (long long)attribBuffer->last_write_offset,
+                      (long long)attribBuffer->last_write_size,
+                      attribBuffer->last_write_src_ptr,
+                      (unsigned long long)attribBuffer->last_write_src_hash);
+            }
         }
     }
 
@@ -589,22 +593,58 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
                 continue;
             }
             static const NSUInteger kMGLCurrentAttribRepeatCount = 4096u;
-            NSMutableData *repeated = [NSMutableData dataWithLength:kMGLCurrentAttribRepeatCount * attribStride];
-            if (!repeated) {
-                NSLog(@"MGL VBIND skip attrib=%u: failed to allocate current vertex attrib stream", attrib);
+            if (attribStride > NSUIntegerMax / kMGLCurrentAttribRepeatCount) {
+                NSLog(@"MGL VBIND skip attrib=%u: current vertex attrib stream size overflow stride=%lu",
+                      attrib,
+                      (unsigned long)attribStride);
                 continue;
             }
-            uint8_t *dst = (uint8_t *)repeated.mutableBytes;
-            for (NSUInteger v = 0; v < kMGLCurrentAttribRepeatCount; v++) {
-                memcpy(dst + v * attribStride, attribBytes, MIN((NSUInteger)16u, attribStride));
+
+            NSUInteger streamLength = kMGLCurrentAttribRepeatCount * attribStride;
+            NSUInteger valueBytes = MIN((NSUInteger)sizeof(attribBytes), attribStride);
+            id<MTLBuffer> currentAttribBuffer = _currentVertexAttribBuffers[attrib];
+            BOOL cacheHit =
+                _currentVertexAttribBufferValid[attrib] &&
+                currentAttribBuffer != nil &&
+                _currentVertexAttribStrides[attrib] == attribStride &&
+                currentAttribBuffer.length == streamLength &&
+                memcmp(_currentVertexAttribBytes[attrib], attribBytes, valueBytes) == 0;
+
+            if (!cacheHit) {
+                currentAttribBuffer =
+                    [_device newBufferWithLength:streamLength
+                                         options:(MTLResourceStorageModeShared |
+                                                  MTLResourceCPUCacheModeWriteCombined)];
+                uint8_t *dst = currentAttribBuffer
+                    ? (uint8_t *)currentAttribBuffer.contents
+                    : NULL;
+                if (!currentAttribBuffer || !dst) {
+                    NSLog(@"MGL VBIND skip attrib=%u: failed to allocate current vertex attrib Metal buffer",
+                          attrib);
+                    continue;
+                }
+
+                /* Build one stride, then duplicate the initialized prefix by
+                 * powers of two.  This replaces 4096 tiny memcpy calls and
+                 * avoids an intermediate NSMutableData allocation. */
+                memset(dst, 0, attribStride);
+                memcpy(dst, attribBytes, valueBytes);
+                NSUInteger initialized = attribStride;
+                while (initialized < streamLength) {
+                    NSUInteger copyLength = MIN(initialized,
+                                                streamLength - initialized);
+                    memcpy(dst + initialized, dst, copyLength);
+                    initialized += copyLength;
+                }
+
+                _currentVertexAttribBuffers[attrib] = currentAttribBuffer;
+                _currentVertexAttribStrides[attrib] = attribStride;
+                memset(_currentVertexAttribBytes[attrib], 0,
+                       sizeof(_currentVertexAttribBytes[attrib]));
+                memcpy(_currentVertexAttribBytes[attrib], attribBytes, valueBytes);
+                _currentVertexAttribBufferValid[attrib] = GL_TRUE;
             }
-            id<MTLBuffer> currentAttribBuffer = [_device newBufferWithBytes:repeated.bytes
-                                                                      length:repeated.length
-                                                                     options:MTLResourceStorageModeShared];
-            if (!currentAttribBuffer) {
-                NSLog(@"MGL VBIND skip attrib=%u: failed to allocate current vertex attrib Metal buffer", attrib);
-                continue;
-            }
+
             if (!_lastBoundValid ||
                 _lastBoundVertexBuffers[bindingIndex].buffer != currentAttribBuffer ||
                 _lastBoundVertexBuffers[bindingIndex].offset != 0) {
@@ -1075,17 +1115,21 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
 
 - (bool) bindFragmentBuffersToCurrentRenderEncoder
 {
-    static uint64_t s_fbindCallCount = 0;
-    static double s_fbindLastCallTime = 0.0;
-    static uint64_t s_fbindLastCallCount = 0;
-    uint64_t fbindCall = ++s_fbindCallCount;
-    double fbindStartSeconds = mglNowSeconds();
-    mglLogLoopHeartbeat("fbind.loop",
-                        fbindCall,
-                        fbindStartSeconds,
-                        &s_fbindLastCallTime,
-                        &s_fbindLastCallCount,
-                        0.25);
+    uint64_t fbindCall = 0;
+    double fbindStartSeconds = 0;
+    if (kMGLDiagnosticStateLogs || mglTraceLogIsEnabled()) {
+        static uint64_t s_fbindCallCount = 0;
+        static double s_fbindLastCallTime = 0.0;
+        static uint64_t s_fbindLastCallCount = 0;
+        fbindCall = ++s_fbindCallCount;
+        fbindStartSeconds = mglNowSeconds();
+        mglLogLoopHeartbeat("fbind.loop",
+                            fbindCall,
+                            fbindStartSeconds,
+                            &s_fbindLastCallTime,
+                            &s_fbindLastCallCount,
+                            0.25);
+    }
 
     GLuint mapCount;
     BufferMap *map;
