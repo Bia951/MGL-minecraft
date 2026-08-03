@@ -2328,35 +2328,49 @@ void mglUniform(GLMContext ctx, GLint location, void *ptr, GLsizeiptr size)
         return;
     }
 
-    /*
-     * Deferred draws snapshot the GL state struct, but Program-owned uniform
-     * storage is mutable shared state. Match Apple OpenGL call ordering by
-     * submitting queued draws before this glUniform* changes that storage.
-     */
-    mglFlushPendingDraws(ctx);
-
     BufferBaseTarget *uniformSlot = &program->plain_uniform_buffers[location];
+    BufferBaseTarget *globalSlot =
+        &ctx->state.buffer_base[_UNIFORM_CONSTANT].buffers[location];
     Buffer *buf = uniformSlot->buf;
-    if (mglUniformBufferDataWouldChange(buf, size, ptr)) {
-        mglFlushPendingDrawsForBuffer(ctx, buf);
+
+    /* Minecraft frequently uploads unchanged projection/fog/color values.
+     * Avoid work only when both stores already contain the requested bytes. */
+    bool programDataChanged =
+        (buf == NULL) || mglUniformBufferDataWouldChange(buf, size, ptr);
+    bool globalDataChanged =
+        (globalSlot->buf == NULL) ||
+        mglUniformBufferDataWouldChange(globalSlot->buf, size, ptr);
+    if (!programDataChanged && !globalDataChanged) {
+        return;
     }
-    
-    if(buf == NULL)
-    {
-        GLuint internalName = MGL_INTERNAL_UNIFORM_BUFFER_NAME_BASE |
-                              (((GLuint)program->name & 0x0fffu) << 12) |
-                              (GLuint)location;
-        uniformSlot->buf = newBuffer(ctx, GL_UNIFORM_BUFFER, internalName);
-        buf = uniformSlot->buf;
-        if (buf) {
-            insertHashElement(&ctx->state.buffer_table, internalName, buf);
+
+    bool bindingLayoutChanged =
+        (buf == NULL || uniformSlot->size != size ||
+         globalSlot->buf == NULL || globalSlot->size != size);
+
+    if (programDataChanged) {
+        if(buf == NULL)
+        {
+            GLuint internalName = MGL_INTERNAL_UNIFORM_BUFFER_NAME_BASE |
+                                  (((GLuint)program->name & 0x0fffu) << 12) |
+                                  (GLuint)location;
+            uniformSlot->buf = newBuffer(ctx, GL_UNIFORM_BUFFER, internalName);
+            buf = uniformSlot->buf;
+            if (buf) {
+                insertHashElement(&ctx->state.buffer_table, internalName, buf);
+            }
         }
+
+        if (!buf) {
+            mglUniformSetError(ctx, GL_OUT_OF_MEMORY);
+            return;
+        }
+
+        initBufferData(ctx, buf, size, ptr, true);
+        uniformSlot->buffer = buf->name;
+        uniformSlot->offset = 0;
+        uniformSlot->size = size;
     }
-    
-    initBufferData(ctx, buf, size, ptr, true);
-    uniformSlot->buffer = buf ? buf->name : 0u;
-    uniformSlot->offset = 0;
-    uniformSlot->size = size;
 
     /*
      * Minecraft's shader layer can reuse the same logical plain uniform values
@@ -2364,7 +2378,6 @@ void mglUniform(GLMContext ctx, GLint location, void *ptr, GLsizeiptr size)
      * fallback for programs that have not received an explicit upload yet, while
      * still preferring the per-program storage above when it exists.
      */
-    BufferBaseTarget *globalSlot = &ctx->state.buffer_base[_UNIFORM_CONSTANT].buffers[location];
     if (!globalSlot->buf) {
         GLuint globalName = MGL_INTERNAL_UNIFORM_BUFFER_NAME_BASE |
                             0x00fff000u |
@@ -2375,16 +2388,17 @@ void mglUniform(GLMContext ctx, GLint location, void *ptr, GLsizeiptr size)
         }
     }
     if (globalSlot->buf) {
-        if (mglUniformBufferDataWouldChange(globalSlot->buf, size, ptr)) {
-            mglFlushPendingDrawsForBuffer(ctx, globalSlot->buf);
+        if (globalDataChanged) {
+            initBufferData(ctx, globalSlot->buf, size, ptr, true);
         }
-        initBufferData(ctx, globalSlot->buf, size, ptr, true);
         globalSlot->buffer = globalSlot->buf->name;
         globalSlot->offset = 0;
         globalSlot->size = size;
     }
 
-    ctx->state.dirty_bits |= DIRTY_BUFFER_BASE_STATE;
+    ctx->state.dirty_bits |= bindingLayoutChanged
+        ? DIRTY_BUFFER_BASE_STATE
+        : DIRTY_BUFFER;
 }
 
 static void mglUniformDoubleVectorAsFloat(GLMContext ctx,

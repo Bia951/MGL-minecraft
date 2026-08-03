@@ -8,6 +8,61 @@
 
 /* === Static C helpers used only by Draw methods === */
 
+/* Metal copies setVertexBytes/setFragmentBytes payloads into the command
+ * buffer at encode time. Snapshot small UBO ranges this way so applications
+ * may safely recycle or overwrite a shared dynamic uniform buffer before the
+ * GPU executes earlier draws. Metal's inline-byte API is limited to 4 KiB. */
+static const NSUInteger kMGLInlineUniformSnapshotLimit = 4096u;
+
+static NSUInteger mglRendererInlineUniformSnapshotLength(const BufferMap *map,
+                                                          NSUInteger requiredBytes,
+                                                          NSUInteger availableBytes)
+{
+    if (!map ||
+        map->attribute_mask != 0 ||
+        map->resource_type != SPVC_RESOURCE_TYPE_UNIFORM_BUFFER) {
+        return 0u;
+    }
+
+    NSUInteger length = map->size > 0 ? (NSUInteger)map->size : requiredBytes;
+    if (requiredBytes > length) {
+        length = requiredBytes;
+    }
+
+    if (length == 0u ||
+        length > kMGLInlineUniformSnapshotLimit ||
+        length > availableBytes) {
+        return 0u;
+    }
+
+    return length;
+}
+
+static const void *mglRendererInlineUniformSnapshotBytes(Buffer *buffer,
+                                                          id<MTLBuffer> metalBuffer,
+                                                          NSUInteger offset,
+                                                          NSUInteger length)
+{
+    if (!buffer || !metalBuffer || length == 0u ||
+        offset > metalBuffer.length ||
+        length > metalBuffer.length - offset) {
+        return NULL;
+    }
+
+    const void *metalContents = metalBuffer.contents;
+    if (metalContents) {
+        return ((const uint8_t *)metalContents) + offset;
+    }
+
+    if (!buffer->data.buffer_data || buffer->size <= 0 ||
+        offset > (NSUInteger)buffer->size ||
+        length > (NSUInteger)buffer->size - offset) {
+        return NULL;
+    }
+
+    return ((const uint8_t *)(uintptr_t)buffer->data.buffer_data) + offset;
+}
+
 static bool mglRendererProgramHasSampledResourceNamed(Program *program, const char *name)
 {
     if (!program || !name) {
@@ -407,6 +462,38 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
                     continue;
                 }
             } else {
+                continue;
+            }
+        }
+
+        /* Snapshot small UBO ranges at draw-encode time. Dynamic uniform
+         * rings (notably Minecraft's Chunk Sections UBO) are commonly reused
+         * before the GPU consumes earlier draws; directly binding the shared
+         * MTLBuffer would make those draws observe later range contents. */
+        NSUInteger uniformSnapshotLength =
+            mglRendererInlineUniformSnapshotLength(map,
+                                                   requiredBindingBytes,
+                                                   metalLen - bindOffset);
+        if (uniformSnapshotLength > 0u) {
+            const void *uniformSnapshotBytes =
+                mglRendererInlineUniformSnapshotBytes(ptr,
+                                                      buffer,
+                                                      bindOffset,
+                                                      uniformSnapshotLength);
+            if (uniformSnapshotBytes) {
+                [_currentRenderEncoder setVertexBytes:uniformSnapshotBytes
+                                                length:uniformSnapshotLength
+                                               atIndex:bindingIndex];
+                [self invalidateLastBoundVertexBufferAtIndex:bindingIndex];
+                if (kMGLVerboseBindLogs) {
+                    NSLog(@"MGL SET VERTEX BUFFER index=%lu glName=%u offset=%lu source=ubo-range-snapshot len=%lu range=%lld",
+                          (unsigned long)bindingIndex,
+                          ptr->name,
+                          (unsigned long)bindOffset,
+                          (unsigned long)uniformSnapshotLength,
+                          (long long)map->size);
+                }
+                anyBindingPresent[bindingIndex] = true;
                 continue;
             }
         }
@@ -1476,6 +1563,37 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
                 }
             }
             
+            /* Match the vertex path: snapshot small UBO ranges into the
+             * command buffer so later CPU writes cannot relocate or corrupt
+             * geometry/shading data used by already encoded draws. */
+            NSUInteger uniformSnapshotLength =
+                mglRendererInlineUniformSnapshotLength(map,
+                                                       requiredBindingBytes,
+                                                       metalLen - bindOffset);
+            if (uniformSnapshotLength > 0u) {
+                const void *uniformSnapshotBytes =
+                    mglRendererInlineUniformSnapshotBytes(ptr,
+                                                          buffer,
+                                                          bindOffset,
+                                                          uniformSnapshotLength);
+                if (uniformSnapshotBytes) {
+                    [_currentRenderEncoder setFragmentBytes:uniformSnapshotBytes
+                                                      length:uniformSnapshotLength
+                                                     atIndex:bindingIndex];
+                    [self invalidateLastBoundFragmentBufferAtIndex:bindingIndex];
+                    if (kMGLVerboseBindLogs) {
+                        NSLog(@"MGL SET FRAGMENT BUFFER index=%lu glName=%u offset=%lu source=ubo-range-snapshot len=%lu range=%lld",
+                              (unsigned long)bindingIndex,
+                              ptr->name,
+                              (unsigned long)bindOffset,
+                              (unsigned long)uniformSnapshotLength,
+                              (long long)map->size);
+                    }
+                    anyBindingPresent[bindingIndex] = true;
+                    continue;
+                }
+            }
+
             /* For small uniform constants (plain uniforms), use setFragmentBytes
              * to copy the data into the command buffer at bind time. This is
              * critical for correctness when the same uniform buffer is updated

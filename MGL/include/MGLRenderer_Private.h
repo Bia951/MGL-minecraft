@@ -245,6 +245,20 @@ static inline void mglMetalUnlock(os_unfair_lock *lock) {
     id<MTLBuffer> _fallbackTextureBufferStorage;
     id<MTLBuffer> _argumentBufferFallbackStorage;
     NSMutableArray<id<MTLBuffer>> *_argumentBufferRetiredFallbackStorage;
+    /* Packed loose-uniform structs share one suballocated arena per Metal
+     * command buffer instead of allocating one MTLBuffer per draw. */
+    id<MTLCommandBuffer> _packedUniformArenaCommandBuffer;
+    id<MTLBuffer> _packedUniformArenaBuffer;
+    NSMutableArray<id<MTLBuffer>> *_packedUniformRetiredArenas;
+    NSUInteger _packedUniformArenaCapacity;
+    NSUInteger _packedUniformArenaOffset;
+    /* glVertexAttrib* current values are expanded into a repeated Metal
+     * vertex stream.  Cache the immutable stream per attribute and rebuild it
+     * only when the encoded value or stride actually changes. */
+    id<MTLBuffer> _currentVertexAttribBuffers[MAX_ATTRIBS];
+    NSUInteger _currentVertexAttribStrides[MAX_ATTRIBS];
+    uint8_t _currentVertexAttribBytes[MAX_ATTRIBS][16];
+    GLboolean _currentVertexAttribBufferValid[MAX_ATTRIBS];
     id<MTLBuffer> _tessFactorBuffer;
     id<MTLBuffer> _tcsOutputBuffer;     /* TCS per-vertex output (spvOut, buffer 28) */
     id<MTLBuffer> _tcsPatchOutBuffer;   /* TCS per-patch output (spvPatchOut, buffer 27) */

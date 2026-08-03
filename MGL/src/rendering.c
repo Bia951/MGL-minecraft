@@ -93,7 +93,19 @@ static void mglUpdateDepthShadowForClear(GLMContext ctx)
 {
     Framebuffer *fbo = ctx ? ctx->state.framebuffer : NULL;
     Texture *texture = fbo ? mglStencilAttachmentTexture(&fbo->depth) : NULL;
-    if (!texture || !mglEnsureDepthShadow(texture)) return;
+
+    /*
+     * Render-target depth attachments are read back through the Metal depth
+     * path, not through depth_shadow.  The CPU shadow cannot be authoritative
+     * for a render target anyway because normal draws do not update it.
+     *
+     * Avoid filling width * height floats on every glClear.  At high
+     * resolutions this redundant CPU clear can dominate the render thread
+     * while Metal performs the real depth clear separately on the GPU.
+     */
+    if (!texture || texture->is_render_target ||
+        !mglEnsureDepthShadow(texture)) return;
+
     GLint x0 = 0, y0 = 0, x1 = (GLint)texture->width, y1 = (GLint)texture->height;
     if (ctx->state.caps.scissor_test) {
         if (x0 < ctx->state.var.scissor_box[0]) x0 = ctx->state.var.scissor_box[0];
