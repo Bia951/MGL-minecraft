@@ -74,6 +74,11 @@ static inline bool mglShouldTraceBufferMutation(uint64_t call, GLenum target, GL
 
 static uint64_t mglTraceHashBytes(const void *data, size_t len)
 {
+    /* This hash is diagnostic metadata only.  Buffer uploads are among the
+     * hottest Sodium paths, so do not sample bytes when tracing is disabled. */
+    if (!MGL_VERBOSE_BUFFER_MAP_LOGS && !mglTraceLogIsEnabled()) {
+        return 0ull;
+    }
     if (!data || len == 0) {
         return 0ull;
     }
@@ -222,43 +227,51 @@ static void mglBufferMarkMapWrite(Buffer *ptr)
     GLsizeiptr write_size = ptr->mapped_length > 0 ? ptr->mapped_length : ptr->size;
     const uint8_t *src = NULL;
     uint64_t hash = 0ull;
+    bool trace_enabled = MGL_VERBOSE_BUFFER_MAP_LOGS || mglTraceLogIsEnabled();
 
     if (ptr->mapped_ptr && write_size > 0) {
         src = (const uint8_t *)ptr->mapped_ptr;
-        hash = mglTraceHashBytes(src, (size_t)write_size);
     } else if (ptr->data.buffer_data && write_size > 0) {
         size_t safe_offset = (write_offset > 0) ? (size_t)write_offset : 0u;
         src = ((const uint8_t *)(uintptr_t)ptr->data.buffer_data) + safe_offset;
-        hash = mglTraceHashBytes(src, (size_t)write_size);
     }
 
-    char head[64];
-    mglTraceFormatBytes(src, (write_size > 0) ? (size_t)write_size : 0u, head, sizeof(head));
-    size_t probe_len = 0u;
-    if (src && write_size > 0) {
-        size_t ws = (size_t)write_size;
-        probe_len = ws < 256u ? ws : 256u;
-    }
-    bool probe_all_zero = mglTraceSampleAllZero(src, probe_len);
-    static uint64_t s_buffer_map_write_trace_count = 0u;
-    uint64_t trace_call = ++s_buffer_map_write_trace_count;
-    if (MGL_VERBOSE_BUFFER_MAP_LOGS ||
-        mglShouldTraceBufferMutation(trace_call, ptr->target, write_size)) {
-        fprintf(stderr,
-                "MGL TRACE BufferMap.write buffer=%u target=0x%x off=%lld size=%lld src=%p mappedPtr=%p backing=%p hash=0x%016" PRIx64 " head=%s probe256AllZero=%d access=0x%x accessFlags=0x%x mapped=%u\n",
-                ptr->name,
-                ptr->target,
-                (long long)write_offset,
-                (long long)write_size,
-                src,
-                ptr->mapped_ptr,
-                (void *)(uintptr_t)ptr->data.buffer_data,
-                hash,
-                head,
-                probe_all_zero ? 1 : 0,
-                ptr->access,
-                ptr->access_flags,
-                (unsigned)ptr->mapped);
+    if (trace_enabled) {
+        hash = (src && write_size > 0)
+            ? mglTraceHashBytes(src, (size_t)write_size)
+            : 0ull;
+
+        static uint64_t s_buffer_map_write_trace_count = 0u;
+        uint64_t trace_call = ++s_buffer_map_write_trace_count;
+        if (MGL_VERBOSE_BUFFER_MAP_LOGS ||
+            mglShouldTraceBufferMutation(trace_call, ptr->target, write_size)) {
+            char head[64];
+            mglTraceFormatBytes(src,
+                                (write_size > 0) ? (size_t)write_size : 0u,
+                                head,
+                                sizeof(head));
+            size_t probe_len = 0u;
+            if (src && write_size > 0) {
+                size_t ws = (size_t)write_size;
+                probe_len = ws < 256u ? ws : 256u;
+            }
+            bool probe_all_zero = mglTraceSampleAllZero(src, probe_len);
+            fprintf(stderr,
+                    "MGL TRACE BufferMap.write buffer=%u target=0x%x off=%lld size=%lld src=%p mappedPtr=%p backing=%p hash=0x%016" PRIx64 " head=%s probe256AllZero=%d access=0x%x accessFlags=0x%x mapped=%u\n",
+                    ptr->name,
+                    ptr->target,
+                    (long long)write_offset,
+                    (long long)write_size,
+                    src,
+                    ptr->mapped_ptr,
+                    (void *)(uintptr_t)ptr->data.buffer_data,
+                    hash,
+                    head,
+                    probe_all_zero ? 1 : 0,
+                    ptr->access,
+                    ptr->access_flags,
+                    (unsigned)ptr->mapped);
+        }
     }
 
     mglBufferMarkWrite(ptr,
@@ -1650,14 +1663,18 @@ kern_return_t initBufferData(GLMContext ctx, Buffer *ptr, GLsizeiptr size, const
         }
     }
 
-    if (!uniform_data_unchanged) {
-        mglFlushPendingDrawsForBuffer(ctx, ptr);
+    /* The caller stores uniform constants in reusable Buffer objects.
+     * Identical bytes require neither a hazard flush nor another Metal upload. */
+    if (uniform_data_unchanged) {
+        return 0;
+    }
 
-        /* MGL_SYNC_STRICT: 强制 full flush + commit + waitUntilCompleted，用于排查回归 */
-        if (ctx->sync_strict) {
-            mglFlushCommandBuffer(ctx);
-            ctx->mtl_funcs.mtlFlush(ctx, true);
-        }
+    mglFlushPendingDrawsForBuffer(ctx, ptr);
+
+    /* MGL_SYNC_STRICT: 强制 full flush + commit + waitUntilCompleted，用于排查回归 */
+    if (ctx->sync_strict) {
+        mglFlushCommandBuffer(ctx);
+        ctx->mtl_funcs.mtlFlush(ctx, true);
     }
 
     if (ptr->data.buffer_data)
@@ -2559,17 +2576,22 @@ void *mglMapBuffer(GLMContext ctx, GLenum target, GLenum access)
         mapped_ptr = (void *)(uintptr_t)ptr->data.buffer_data;
     }
 
-    char head[64];
-    mglTraceFormatBytes(mapped_ptr, (ptr->size > 0) ? (size_t)ptr->size : 0u, head, sizeof(head));
-    fprintf(stderr,
-            "MGL TRACE MapBuffer.full target=0x%x buffer=%u size=%lld access=0x%x mappedPtr=%p baseData=%p head=%s\n",
-            target,
-            ptr->name,
-            (long long)ptr->size,
-            access,
-            mapped_ptr,
-            (void *)(uintptr_t)ptr->data.buffer_data,
-            head);
+    if (MGL_VERBOSE_BUFFER_MAP_LOGS || mglTraceLogIsEnabled()) {
+        char head[64];
+        mglTraceFormatBytes(mapped_ptr,
+                            (ptr->size > 0) ? (size_t)ptr->size : 0u,
+                            head,
+                            sizeof(head));
+        fprintf(stderr,
+                "MGL TRACE MapBuffer.full target=0x%x buffer=%u size=%lld access=0x%x mappedPtr=%p baseData=%p head=%s\n",
+                target,
+                ptr->name,
+                (long long)ptr->size,
+                access,
+                mapped_ptr,
+                (void *)(uintptr_t)ptr->data.buffer_data,
+                head);
+    }
 
     ptr->mapped_ptr = mapped_ptr;
     return mapped_ptr;
@@ -2790,10 +2812,13 @@ void *mglMapBufferRange(GLMContext ctx, GLenum target, GLintptr offset, GLsizeip
         ERROR_RETURN_VALUE(GL_INVALID_VALUE, NULL);
     }
 
-    static uint64_t s_map_buffer_range_trace_count = 0u;
-    uint64_t trace_call = ++s_map_buffer_range_trace_count;
-    bool trace_map = MGL_VERBOSE_BUFFER_MAP_LOGS ||
-                     mglShouldTraceBufferMutation(trace_call, target, length);
+    bool trace_map = false;
+    if (MGL_VERBOSE_BUFFER_MAP_LOGS || mglTraceLogIsEnabled()) {
+        static uint64_t s_map_buffer_range_trace_count = 0u;
+        uint64_t trace_call = ++s_map_buffer_range_trace_count;
+        trace_map = MGL_VERBOSE_BUFFER_MAP_LOGS ||
+                    mglShouldTraceBufferMutation(trace_call, target, length);
+    }
 
     const uint8_t *base = (const uint8_t *)(uintptr_t)ptr->data.buffer_data;
     const uint8_t *range_ptr = base + (size_t)offset;
@@ -3034,10 +3059,13 @@ void *mglMapNamedBufferRange(GLMContext ctx, GLuint buffer, GLintptr offset, GLs
     ptr->mapped_offset = offset;
     ptr->mapped_length = length;
 
-    static uint64_t s_map_named_buffer_range_trace_count = 0u;
-    uint64_t trace_call = ++s_map_named_buffer_range_trace_count;
-    bool trace_map = MGL_VERBOSE_BUFFER_MAP_LOGS ||
-                     mglShouldTraceBufferMutation(trace_call, ptr->target, length);
+    bool trace_map = false;
+    if (MGL_VERBOSE_BUFFER_MAP_LOGS || mglTraceLogIsEnabled()) {
+        static uint64_t s_map_named_buffer_range_trace_count = 0u;
+        uint64_t trace_call = ++s_map_named_buffer_range_trace_count;
+        trace_map = MGL_VERBOSE_BUFFER_MAP_LOGS ||
+                    mglShouldTraceBufferMutation(trace_call, ptr->target, length);
+    }
 
     if (access & GL_MAP_PERSISTENT_BIT)
     {

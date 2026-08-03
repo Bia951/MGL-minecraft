@@ -809,6 +809,39 @@ void mglBindFramebuffer(GLMContext ctx, GLenum target, GLuint framebuffer)
     oldDrawFbo = ctx->state.framebuffer;
     oldReadFbo = ctx->state.readbuffer;
 
+    if(framebuffer)
+    {
+        ptr = getFramebuffer(ctx, framebuffer);
+        if (!ptr)
+            return;
+        if (MGL_VERBOSE_FBO_LOGS) {
+            fprintf(stderr, "MGL: glBindFramebuffer target=%x fbo=%u ptr=%p\n", target, framebuffer, ptr);
+        }
+    }
+    else
+    {
+        ptr = NULL;
+        if (MGL_VERBOSE_FBO_LOGS) {
+            fprintf(stderr, "MGL: glBindFramebuffer target=%x fbo=0 (default framebuffer)\n", target);
+        }
+    }
+
+    drawTargetChanged =
+        (target == GL_DRAW_FRAMEBUFFER || target == GL_FRAMEBUFFER) &&
+        oldDrawFbo != ptr;
+    readTargetChanged =
+        (target == GL_READ_FRAMEBUFFER || target == GL_FRAMEBUFFER) &&
+        oldReadFbo != ptr;
+
+    /*
+     * Rebinding the object already installed for every affected target is a
+     * GL no-op.  Return before unrelated VAO validation, draw-buffer
+     * normalization, render-pass invalidation, and dirty-bit propagation.
+     */
+    if (!drawTargetChanged && !readTargetChanged) {
+        return;
+    }
+
     VertexArray *currentVAO = ctx->state.vao;
     if (currentVAO &&
         (!mglObjectPointerLooksPlausible(currentVAO) ||
@@ -836,32 +869,11 @@ void mglBindFramebuffer(GLMContext ctx, GLenum target, GLuint framebuffer)
         ctx->state.dirty_bits |= DIRTY_VAO;
     }
 
-    if(framebuffer)
-    {
-        ptr = getFramebuffer(ctx, framebuffer);
-        if (!ptr)
-            return;
-        if (MGL_VERBOSE_FBO_LOGS) {
-            fprintf(stderr, "MGL: glBindFramebuffer target=%x fbo=%u ptr=%p\n", target, framebuffer, ptr);
-        }
-    }
-    else
-    {
-        ptr = NULL;
-        if (MGL_VERBOSE_FBO_LOGS) {
-            fprintf(stderr, "MGL: glBindFramebuffer target=%x fbo=0 (default framebuffer)\n", target);
-        }
-    }
-
-    if ((target == GL_DRAW_FRAMEBUFFER || target == GL_FRAMEBUFFER) &&
-        oldDrawFbo != ptr)
-    {
+    if (drawTargetChanged) {
         mglFlushPendingDraws(ctx);
     }
 
-    if ((target == GL_DRAW_FRAMEBUFFER || target == GL_FRAMEBUFFER) &&
-        oldDrawFbo != ptr &&
-        ctx->mtl_funcs.mtlInvalidateRenderPass)
+    if (drawTargetChanged && ctx->mtl_funcs.mtlInvalidateRenderPass)
     {
         ctx->mtl_funcs.mtlInvalidateRenderPass(ctx);
     }
@@ -872,7 +884,6 @@ void mglBindFramebuffer(GLMContext ctx, GLenum target, GLuint framebuffer)
             ctx->state.framebuffer = ptr;
             mglFramebufferSyncBindingNames(ctx);
             mglFramebufferLoadDrawBuffer(ctx, ptr);
-            drawTargetChanged = GL_TRUE;
             break;
 
         case GL_READ_FRAMEBUFFER:
@@ -880,7 +891,6 @@ void mglBindFramebuffer(GLMContext ctx, GLenum target, GLuint framebuffer)
             ctx->state.readbuffer = ptr;
             mglFramebufferSyncBindingNames(ctx);
             mglFramebufferLoadReadBuffer(ctx, ptr);
-            readTargetChanged = GL_TRUE;
             break;
 
         case GL_FRAMEBUFFER:
@@ -891,8 +901,6 @@ void mglBindFramebuffer(GLMContext ctx, GLenum target, GLuint framebuffer)
             mglFramebufferSyncBindingNames(ctx);
             mglFramebufferLoadDrawBuffer(ctx, ptr);
             mglFramebufferLoadReadBuffer(ctx, ptr);
-            drawTargetChanged = GL_TRUE;
-            readTargetChanged = GL_TRUE;
             break;
 
         default:

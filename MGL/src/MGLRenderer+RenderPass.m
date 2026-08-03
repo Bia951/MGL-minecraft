@@ -4,6 +4,20 @@
 #import "MGLRenderer_Private.h"
 #import "MGLRenderer+RenderPass_Private.h"
 
+extern void mglBeginProgramResolveScope(GLMContext ctx);
+extern void mglEndProgramResolveScope(GLMContext ctx);
+
+typedef struct MGLProgramResolveScopeGuard {
+    GLMContext ctx;
+} MGLProgramResolveScopeGuard;
+
+static void mglCleanupProgramResolveScope(MGLProgramResolveScopeGuard *guard)
+{
+    if (guard && guard->ctx) {
+        mglEndProgramResolveScope(guard->ctx);
+    }
+}
+
 /* === MGLDepthStencilCacheKey ===
  * Lightweight value key covering every field of MTLDepthStencilDescriptor that
  * affects the created id<MTLDepthStencilState>.  Used only when the
@@ -1003,35 +1017,19 @@ static bool mglGeometryShaderIsPassthrough(const Shader *shader)
 {
     if (ptr->dirty_bits & DIRTY_PROGRAM)
     {
-        // release mtl shaders
+        // release Metal link products owned by this Program.  Shader objects
+        // may be attached to multiple programs, so they must not own these.
         for(int i=_VERTEX_SHADER; i<_MAX_SHADER_TYPES; i++)
         {
-            Shader *shader;
-            shader = ptr->shader_slots[i];
-
-	            if (shader)
-	            {
-	                if (shader->mtl_data.library)
-	                {
-	                    mglSafeReleaseMetalObj((void **)&shader->mtl_data.library);
-	                    mglSafeReleaseMetalObj((void **)&shader->mtl_data.function);
-	                }
-	                if (shader->mtl_data.zero_to_one_library)
-	                {
-	                    mglSafeReleaseMetalObj((void **)&shader->mtl_data.zero_to_one_library);
-	                    mglSafeReleaseMetalObj((void **)&shader->mtl_data.zero_to_one_function);
-	                }
-	                if (shader->mtl_data.upper_left_library)
-	                {
-	                    mglSafeReleaseMetalObj((void **)&shader->mtl_data.upper_left_library);
-	                    mglSafeReleaseMetalObj((void **)&shader->mtl_data.upper_left_function);
-	                }
-	                if (shader->mtl_data.upper_left_zero_to_one_library)
-	                {
-	                    mglSafeReleaseMetalObj((void **)&shader->mtl_data.upper_left_zero_to_one_library);
-	                    mglSafeReleaseMetalObj((void **)&shader->mtl_data.upper_left_zero_to_one_function);
-	                }
-	            }
+	            Spirv *stage = &ptr->spirv[i];
+	            mglSafeReleaseMetalObj((void **)&stage->mtl_function);
+	            mglSafeReleaseMetalObj((void **)&stage->mtl_library);
+	            mglSafeReleaseMetalObj((void **)&stage->mtl_zero_to_one_function);
+	            mglSafeReleaseMetalObj((void **)&stage->mtl_zero_to_one_library);
+	            mglSafeReleaseMetalObj((void **)&stage->mtl_upper_left_function);
+	            mglSafeReleaseMetalObj((void **)&stage->mtl_upper_left_library);
+	            mglSafeReleaseMetalObj((void **)&stage->mtl_upper_left_zero_to_one_function);
+	            mglSafeReleaseMetalObj((void **)&stage->mtl_upper_left_zero_to_one_library);
 	        }
 
         ptr->dirty_bits &= ~DIRTY_PROGRAM;
@@ -1046,11 +1044,11 @@ static bool mglGeometryShaderIsPassthrough(const Shader *shader)
         if (shader)
         {
             if (i == _GEOMETRY_SHADER) {
-                if (shader->mtl_data.library) {
-                    mglSafeReleaseMetalObj((void **)&shader->mtl_data.library);
+                if (ptr->spirv[i].mtl_function) {
+                    mglSafeReleaseMetalObj((void **)&ptr->spirv[i].mtl_function);
                 }
-                if (shader->mtl_data.function) {
-                    mglSafeReleaseMetalObj((void **)&shader->mtl_data.function);
+                if (ptr->spirv[i].mtl_library) {
+                    mglSafeReleaseMetalObj((void **)&ptr->spirv[i].mtl_library);
                 }
                 if (mglGeometryShaderIsPassthrough(shader)) {
                     static uint64_t s_passthroughGeometryShaderSkipCount = 0;
@@ -1075,11 +1073,11 @@ static bool mglGeometryShaderIsPassthrough(const Shader *shader)
                 NSLog(@"MGL WARNING: Program %u stage %d has reflection but no MSL; skipping Metal bind",
                       (unsigned)ptr->name,
                       i);
-                shader->mtl_data.library = NULL;
-                shader->mtl_data.function = NULL;
+                ptr->spirv[i].mtl_library = NULL;
+                ptr->spirv[i].mtl_function = NULL;
                 return false;
             }
-            if (shader->mtl_data.library == NULL)
+            if (ptr->spirv[i].mtl_library == NULL)
             {
                 id<MTLLibrary> library;
                 id<MTLFunction> function;
@@ -1203,8 +1201,8 @@ static bool mglGeometryShaderIsPassthrough(const Shader *shader)
                         case _COMPUTE_SHADER: stageName = "compute"; break;
                     }
                     NSLog(@"MGL ERROR: Failed to compile %s shader, skipping render", stageName);
-                    shader->mtl_data.library = NULL;
-                    shader->mtl_data.function = NULL;
+                    ptr->spirv[i].mtl_library = NULL;
+                    ptr->spirv[i].mtl_function = NULL;
                     return false;  // Signal shader compilation failure
                 }
                 NSString *entryName = [NSString stringWithUTF8String:shader->entry_point];
@@ -1214,12 +1212,12 @@ static bool mglGeometryShaderIsPassthrough(const Shader *shader)
                                                   label:entryName];
                 if (!function) {
                     NSLog(@"MGL ERROR: Failed to find function '%s' in compiled shader", shader->entry_point);
-                    shader->mtl_data.library = NULL;
-                    shader->mtl_data.function = NULL;
+                    ptr->spirv[i].mtl_library = NULL;
+                    ptr->spirv[i].mtl_function = NULL;
                     return false;  // Signal function lookup failure
                 }
-                shader->mtl_data.library = (void *)CFBridgingRetain(library);
-	                shader->mtl_data.function = (void *)CFBridgingRetain(function);
+                ptr->spirv[i].mtl_library = (void *)CFBridgingRetain(library);
+	                ptr->spirv[i].mtl_function = (void *)CFBridgingRetain(function);
 	            }
 	        }
 	    }
@@ -1227,7 +1225,7 @@ static bool mglGeometryShaderIsPassthrough(const Shader *shader)
 	    if (ctx &&
 	        ctx->state.var.clip_depth_mode == GL_ZERO_TO_ONE &&
 	        ptr->shader_slots[_VERTEX_SHADER] &&
-	        ptr->shader_slots[_VERTEX_SHADER]->mtl_data.zero_to_one_library == NULL)
+	        ptr->spirv[_VERTEX_SHADER].mtl_zero_to_one_library == NULL)
 	    {
 	        Shader *vertexShader = ptr->shader_slots[_VERTEX_SHADER];
 	        NSString *variantSource = mglZeroToOneVertexMSLSource(ptr, vertexShader);
@@ -1261,8 +1259,8 @@ static bool mglGeometryShaderIsPassthrough(const Shader *shader)
 	            return false;
 	        }
 
-	        vertexShader->mtl_data.zero_to_one_library = (void *)CFBridgingRetain(library);
-	        vertexShader->mtl_data.zero_to_one_function = (void *)CFBridgingRetain(function);
+	        ptr->spirv[_VERTEX_SHADER].mtl_zero_to_one_library = (void *)CFBridgingRetain(library);
+	        ptr->spirv[_VERTEX_SHADER].mtl_zero_to_one_function = (void *)CFBridgingRetain(function);
 	    }
 
 	    if (ctx &&
@@ -1272,8 +1270,8 @@ static bool mglGeometryShaderIsPassthrough(const Shader *shader)
 	        Shader *vertexShader = ptr->shader_slots[_VERTEX_SHADER];
 	        BOOL zeroToOneDepth = (ctx->state.var.clip_depth_mode == GL_ZERO_TO_ONE);
 	        BOOL needsVariant = zeroToOneDepth
-	            ? (vertexShader->mtl_data.upper_left_zero_to_one_library == NULL)
-	            : (vertexShader->mtl_data.upper_left_library == NULL);
+	            ? (ptr->spirv[_VERTEX_SHADER].mtl_upper_left_zero_to_one_library == NULL)
+	            : (ptr->spirv[_VERTEX_SHADER].mtl_upper_left_library == NULL);
 
 	        if (needsVariant) {
 	            NSString *variantSource = mglUpperLeftVertexMSLSource(ptr, vertexShader, zeroToOneDepth);
@@ -1310,11 +1308,11 @@ static bool mglGeometryShaderIsPassthrough(const Shader *shader)
 	            }
 
 	            if (zeroToOneDepth) {
-	                vertexShader->mtl_data.upper_left_zero_to_one_library = (void *)CFBridgingRetain(library);
-	                vertexShader->mtl_data.upper_left_zero_to_one_function = (void *)CFBridgingRetain(function);
+	                ptr->spirv[_VERTEX_SHADER].mtl_upper_left_zero_to_one_library = (void *)CFBridgingRetain(library);
+	                ptr->spirv[_VERTEX_SHADER].mtl_upper_left_zero_to_one_function = (void *)CFBridgingRetain(function);
 	            } else {
-	                vertexShader->mtl_data.upper_left_library = (void *)CFBridgingRetain(library);
-	                vertexShader->mtl_data.upper_left_function = (void *)CFBridgingRetain(function);
+	                ptr->spirv[_VERTEX_SHADER].mtl_upper_left_library = (void *)CFBridgingRetain(library);
+	                ptr->spirv[_VERTEX_SHADER].mtl_upper_left_function = (void *)CFBridgingRetain(function);
 	            }
 	        }
 	    }
@@ -3561,22 +3559,22 @@ create_new_command_buffer:
         return nil;
     }
 
-	    void *vertexFunctionPtr = vertex_shader->mtl_data.function;
+	    void *vertexFunctionPtr = vertexProgram->spirv[_VERTEX_SHADER].mtl_function;
 	    if (ctx->state.var.clip_origin == GL_UPPER_LEFT) {
 	        if (ctx->state.var.clip_depth_mode == GL_ZERO_TO_ONE &&
-	            vertex_shader->mtl_data.upper_left_zero_to_one_function) {
-	            vertexFunctionPtr = vertex_shader->mtl_data.upper_left_zero_to_one_function;
+	            vertexProgram->spirv[_VERTEX_SHADER].mtl_upper_left_zero_to_one_function) {
+	            vertexFunctionPtr = vertexProgram->spirv[_VERTEX_SHADER].mtl_upper_left_zero_to_one_function;
 	        } else if (ctx->state.var.clip_depth_mode != GL_ZERO_TO_ONE &&
-	                   vertex_shader->mtl_data.upper_left_function) {
-	            vertexFunctionPtr = vertex_shader->mtl_data.upper_left_function;
+	                   vertexProgram->spirv[_VERTEX_SHADER].mtl_upper_left_function) {
+	            vertexFunctionPtr = vertexProgram->spirv[_VERTEX_SHADER].mtl_upper_left_function;
 	        }
 	    } else if (ctx->state.var.clip_depth_mode == GL_ZERO_TO_ONE &&
-	               vertex_shader->mtl_data.zero_to_one_function) {
-	        vertexFunctionPtr = vertex_shader->mtl_data.zero_to_one_function;
+	               vertexProgram->spirv[_VERTEX_SHADER].mtl_zero_to_one_function) {
+	        vertexFunctionPtr = vertexProgram->spirv[_VERTEX_SHADER].mtl_zero_to_one_function;
 	    }
 
 	    id<MTLFunction> vertexFunction = (__bridge id<MTLFunction>)vertexFunctionPtr;
-	    id<MTLFunction> fragmentFunction = fragment_shader ? (__bridge id<MTLFunction>)(fragment_shader->mtl_data.function) : nil;
+	    id<MTLFunction> fragmentFunction = fragmentProgram ? (__bridge id<MTLFunction>)(fragmentProgram->spirv[_FRAGMENT_SHADER].mtl_function) : nil;
     if (kMGLVerbosePipelineLogs) {
         NSLog(@"MGL PIPELINE DESC vs=%@ fs=%@",
               vertexFunction ? vertexFunction.name : @"(null)",
@@ -4609,6 +4607,11 @@ create_new_command_buffer:
         NSLog(@"MGL ERROR: Invalid context pointer detected: 0x%lx", earlyCtxAddr);
         return false;
     }
+
+    mglBeginProgramResolveScope(ctx);
+    MGLProgramResolveScopeGuard programResolveScope
+        __attribute__((cleanup(mglCleanupProgramResolveScope))) = { ctx };
+    (void)programResolveScope;
 
     // REMOVED: Thread synchronization was causing deadlocks
     // The issue is not thread contention but Metal object corruption

@@ -371,6 +371,14 @@ static inline bool mglRangesOverlap(uint64_t a0, uint64_t a1, uint64_t b0, uint6
     return a0 < b1 && b0 < a1;
 }
 
+/* Half-open ranges that overlap or directly touch can share one conservative
+ * hazard interval. */
+static inline bool mglRangesOverlapOrTouch(uint64_t a0, uint64_t a1,
+                                           uint64_t b0, uint64_t b1)
+{
+    return a0 <= b1 && b0 <= a1;
+}
+
 static uint32_t mglEnvUInt32Clamped(const char *name,
                                     uint32_t defaultValue,
                                     uint32_t minValue,
@@ -418,6 +426,42 @@ static uint32_t mglRuntimeMaxBatchCount(void)
                                       MGL_MAX_BATCHES);
     }
     return s_value;
+}
+
+/* Exact indexed vertex-range discovery is O(indexCount). Large terrain draws
+ * use a conservative whole-VBO hazard instead of rescanning every index. */
+static uint32_t mglRuntimeIndexRangeScanLimit(void)
+{
+    static uint32_t s_value = 0u;
+    if (s_value == 0u) {
+        s_value = mglEnvUInt32Clamped("MGL_INDEX_RANGE_SCAN_LIMIT",
+                                      512u,
+                                      1u,
+                                      1024u * 1024u);
+    }
+    return s_value;
+}
+
+/* Resource maps contain the buffers reflected by the active programs. Set
+ * MGL_HAZARD_MAP_FASTPATH=0 to restore the conservative full binding scan. */
+static int mglHazardMapFastPathEnabled(void)
+{
+    static _Atomic int cached = -1;
+    int v = atomic_load_explicit(&cached, memory_order_acquire);
+    if (v < 0) {
+        const char *value = getenv("MGL_HAZARD_MAP_FASTPATH");
+        if (value &&
+            (strcmp(value, "0") == 0 ||
+             strcasecmp(value, "false") == 0 ||
+             strcasecmp(value, "no") == 0 ||
+             strcasecmp(value, "off") == 0)) {
+            v = 0;
+        } else {
+            v = 1;
+        }
+        atomic_store_explicit(&cached, v, memory_order_release);
+    }
+    return v != 0;
 }
 
 /* MGL_BIND_NO_FLUSH: default ON; =0/false/no/off disables. Cached process-wide. */
@@ -470,13 +514,46 @@ static void mglTrackPendingReadRange(GLMContext ctx, Buffer *buffer, uint64_t st
     if (!ctx || !buffer || end <= start) return;
 
     MGLCommandBuffer *cb = &ctx->draw_command_buffer;
+    uint32_t mergedIndex = UINT32_MAX;
     for (uint32_t i = 0; i < cb->buffer_read_range_count; i++) {
         MGLBufferReadRange *range = &cb->buffer_read_ranges[i];
-        if (range->buffer == buffer && mglRangesOverlap(range->start, range->end, start, end)) {
+        if (range->buffer == buffer &&
+            mglRangesOverlapOrTouch(range->start, range->end, start, end)) {
             if (start < range->start) range->start = start;
             if (end > range->end) range->end = end;
-            return;
+            mergedIndex = i;
+            break;
         }
+    }
+
+    if (mergedIndex != UINT32_MAX) {
+        bool folded;
+        do {
+            folded = false;
+            MGLBufferReadRange *merged = &cb->buffer_read_ranges[mergedIndex];
+            for (uint32_t i = 0; i < cb->buffer_read_range_count; i++) {
+                if (i == mergedIndex) continue;
+
+                MGLBufferReadRange *range = &cb->buffer_read_ranges[i];
+                if (range->buffer != buffer ||
+                    !mglRangesOverlapOrTouch(merged->start, merged->end,
+                                             range->start, range->end)) {
+                    continue;
+                }
+
+                if (range->start < merged->start) merged->start = range->start;
+                if (range->end > merged->end) merged->end = range->end;
+
+                uint32_t last = --cb->buffer_read_range_count;
+                if (i != last) {
+                    cb->buffer_read_ranges[i] = cb->buffer_read_ranges[last];
+                    if (mergedIndex == last) mergedIndex = i;
+                }
+                folded = true;
+                break;
+            }
+        } while (folded);
+        return;
     }
 
     if (cb->buffer_read_range_count >= MGL_MAX_PENDING_BUFFER_RANGES) {
@@ -489,7 +566,7 @@ static void mglTrackPendingReadRange(GLMContext ctx, Buffer *buffer, uint64_t st
     range->start = start;
     range->end = end;
 
-    MGL_PERF_ADD(g_mglHazardRangeCountSinceSwap, cb->buffer_read_range_count);
+    MGL_PERF_INC(g_mglHazardRangeCountSinceSwap);
 }
 
 static void mglTrackPendingReadBytes(GLMContext ctx, Buffer *buffer, uint64_t start, uint64_t size)
@@ -1687,11 +1764,70 @@ static void mglTrackPendingAttribRead(GLMContext ctx,
     mglTrackPendingReadRange(ctx, resolved->buffer, start, end);
 }
 
+static uint64_t mglTrackPendingBufferMapReads(GLMContext ctx,
+                                               const BufferMapList *maps)
+{
+    if (!ctx || !maps) return 0u;
+
+    GLuint count = maps->count;
+    if (count > MAX_MAPPED_BUFFERS) count = MAX_MAPPED_BUFFERS;
+
+    uint64_t activeCount = 0u;
+    for (GLuint i = 0; i < count; i++) {
+        const BufferMap *map = &maps->buffers[i];
+        if (!map->buf || map->attribute_mask != 0u) continue;
+
+        activeCount++;
+        if (map->size > 0 && map->offset >= 0) {
+            mglTrackPendingReadBytes(ctx,
+                                     map->buf,
+                                     (uint64_t)map->offset,
+                                     (uint64_t)map->size);
+        } else {
+            mglTrackPendingReadWholeBuffer(ctx, map->buf);
+        }
+    }
+    return activeCount;
+}
+
 static void mglTrackPendingBaseBufferReads(GLMContext ctx)
 {
     if (!ctx) return;
 
     uint64_t activeCount = 0;
+
+    bool mapsCurrent =
+        mglHazardMapFastPathEnabled() &&
+        (ctx->state.dirty_bits & (DIRTY_PROGRAM | DIRTY_BUFFER_BASE_STATE)) == 0u &&
+        (ctx->state.vertex_buffer_map_list.count > 0u ||
+         ctx->state.fragment_buffer_map_list.count > 0u);
+
+    if (mapsCurrent) {
+        activeCount += mglTrackPendingBufferMapReads(
+            ctx, &ctx->state.vertex_buffer_map_list);
+        activeCount += mglTrackPendingBufferMapReads(
+            ctx, &ctx->state.fragment_buffer_map_list);
+
+        Program *program = ctx->state.program;
+        if (program) {
+            for (int i = 0; i < MAX_BINDABLE_BUFFERS; i++) {
+                BufferBaseTarget *binding = &program->plain_uniform_buffers[i];
+                if (!binding->buf) continue;
+                activeCount++;
+                if (binding->size > 0 && binding->offset >= 0) {
+                    mglTrackPendingReadBytes(ctx,
+                                             binding->buf,
+                                             (uint64_t)binding->offset,
+                                             (uint64_t)binding->size);
+                } else {
+                    mglTrackPendingReadWholeBuffer(ctx, binding->buf);
+                }
+            }
+        }
+
+        MGL_PERF_ADD(g_mglHazardActiveBindingsSinceSwap, activeCount);
+        return;
+    }
 
     const int trackedTargets[] = {
         _UNIFORM_BUFFER,
@@ -2439,8 +2575,13 @@ static void mglTrackPendingDrawBufferReads(GLMContext ctx,
 
     uint64_t minVertex = 0;
     uint64_t maxVertex = 0;
+    bool scanExactElementRange =
+        !uses_elements ||
+        (cmd->count > 0 &&
+         (uint64_t)cmd->count <= (uint64_t)mglRuntimeIndexRangeScanLimit());
     bool rangeKnown = uses_elements
-        ? mglCommandComputeElementVertexRange(ctx, cmd, &minVertex, &maxVertex)
+        ? (scanExactElementRange &&
+           mglCommandComputeElementVertexRange(ctx, cmd, &minVertex, &maxVertex))
         : mglCommandComputeArrayVertexRange(cmd, &minVertex, &maxVertex);
 
     VertexArray *vao = ctx->state.vao;

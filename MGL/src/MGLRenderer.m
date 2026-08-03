@@ -311,7 +311,133 @@ static inline BOOL mglRendererContextLikelyValid(GLMContext ctx)
     return (ctx != NULL) && ((uintptr_t)ctx >= 0x10000u);
 }
 
-Program *mglResolveProgramFromState(GLMContext ctx)
+/*
+ * Draw-state processing asks for the monolithic program, both stage programs,
+ * and the render-program key from several helper layers.  Keep a short-lived
+ * per-thread cache while processGLStateLocked: is active so all of those
+ * requests share one validation/resolution pass.
+ *
+ * The cache is deliberately scoped rather than frame-global.  It is also
+ * keyed by every GL binding field that can change the answer; a binding
+ * mutation inside the scope invalidates only the affected cached domains.
+ */
+typedef struct MGLProgramResolveScopeCache {
+    GLMContext ctx;
+    unsigned int depth;
+    unsigned int bypass_depth;
+
+    Program *state_program;
+    GLuint program_name;
+    GLuint current_program;
+    ProgramPipeline *state_pipeline;
+    GLuint pipeline_name;
+
+    GLboolean monolithic_resolved;
+    GLboolean pipeline_resolved;
+    GLboolean stage_resolved[_MAX_SHADER_TYPES];
+
+    Program *monolithic;
+    ProgramPipeline *pipeline;
+    Program *stage_programs[_MAX_SHADER_TYPES];
+} MGLProgramResolveScopeCache;
+
+static __thread MGLProgramResolveScopeCache s_mglProgramResolveScopeCache;
+
+static inline GLboolean mglProgramResolveCacheActiveForContext(GLMContext ctx)
+{
+    MGLProgramResolveScopeCache *cache = &s_mglProgramResolveScopeCache;
+    return cache->depth > 0u &&
+           cache->bypass_depth == 0u &&
+           cache->ctx == ctx;
+}
+
+static void mglProgramResolveCacheClearStages(MGLProgramResolveScopeCache *cache)
+{
+    memset(cache->stage_resolved, 0, sizeof(cache->stage_resolved));
+    memset(cache->stage_programs, 0, sizeof(cache->stage_programs));
+}
+
+static void mglProgramResolveCacheSyncState(MGLProgramResolveScopeCache *cache,
+                                            GLMContext ctx)
+{
+    if (!cache || !ctx) {
+        return;
+    }
+
+    GLboolean programChanged =
+        cache->state_program != ctx->state.program ||
+        cache->program_name != ctx->state.program_name ||
+        cache->current_program != ctx->state.var.current_program;
+    GLboolean pipelineChanged =
+        cache->state_pipeline != ctx->state.program_pipeline ||
+        cache->pipeline_name != ctx->state.var.program_pipeline_binding;
+
+    if (programChanged) {
+        cache->monolithic_resolved = GL_FALSE;
+        cache->monolithic = NULL;
+        mglProgramResolveCacheClearStages(cache);
+    }
+
+    if (pipelineChanged) {
+        cache->pipeline_resolved = GL_FALSE;
+        cache->pipeline = NULL;
+        mglProgramResolveCacheClearStages(cache);
+    }
+
+    cache->state_program = ctx->state.program;
+    cache->program_name = ctx->state.program_name;
+    cache->current_program = ctx->state.var.current_program;
+    cache->state_pipeline = ctx->state.program_pipeline;
+    cache->pipeline_name = ctx->state.var.program_pipeline_binding;
+}
+
+void mglBeginProgramResolveScope(GLMContext ctx)
+{
+    MGLProgramResolveScopeCache *cache = &s_mglProgramResolveScopeCache;
+    if (!mglRendererContextLikelyValid(ctx)) {
+        return;
+    }
+
+    if (cache->depth == 0u && cache->bypass_depth == 0u) {
+        memset(cache, 0, sizeof(*cache));
+        cache->ctx = ctx;
+        cache->depth = 1u;
+        mglProgramResolveCacheSyncState(cache, ctx);
+        return;
+    }
+
+    if (cache->bypass_depth == 0u && cache->ctx == ctx) {
+        cache->depth++;
+        return;
+    }
+
+    /*
+     * A nested renderer using a different context must not consume the outer
+     * context's entries.  Disable caching until that nested scope unwinds.
+     */
+    cache->bypass_depth++;
+}
+
+void mglEndProgramResolveScope(GLMContext ctx)
+{
+    MGLProgramResolveScopeCache *cache = &s_mglProgramResolveScopeCache;
+
+    if (cache->bypass_depth > 0u) {
+        cache->bypass_depth--;
+        return;
+    }
+
+    if (cache->depth == 0u || cache->ctx != ctx) {
+        return;
+    }
+
+    cache->depth--;
+    if (cache->depth == 0u) {
+        memset(cache, 0, sizeof(*cache));
+    }
+}
+
+static Program *mglResolveProgramFromStateUncached(GLMContext ctx)
 {
     if (!mglRendererContextLikelyValid(ctx)) {
         return NULL;
@@ -374,7 +500,30 @@ Program *mglResolveProgramFromState(GLMContext ctx)
     return resolved;
 }
 
-static ProgramPipeline *mglResolveProgramPipelineFromState(GLMContext ctx)
+Program *mglResolveProgramFromState(GLMContext ctx)
+{
+    MGLProgramResolveScopeCache *cache = &s_mglProgramResolveScopeCache;
+    GLboolean useCache = mglProgramResolveCacheActiveForContext(ctx);
+
+    if (useCache) {
+        mglProgramResolveCacheSyncState(cache, ctx);
+        if (cache->monolithic_resolved) {
+            return cache->monolithic;
+        }
+    }
+
+    Program *program = mglResolveProgramFromStateUncached(ctx);
+
+    if (useCache) {
+        mglProgramResolveCacheSyncState(cache, ctx);
+        cache->monolithic = program;
+        cache->monolithic_resolved = GL_TRUE;
+    }
+
+    return program;
+}
+
+static ProgramPipeline *mglResolveProgramPipelineFromStateUncached(GLMContext ctx)
 {
     if (!mglRendererContextLikelyValid(ctx)) {
         return NULL;
@@ -418,6 +567,29 @@ static ProgramPipeline *mglResolveProgramPipelineFromState(GLMContext ctx)
 
     ctx->state.program_pipeline = resolved;
     return resolved;
+}
+
+static ProgramPipeline *mglResolveProgramPipelineFromState(GLMContext ctx)
+{
+    MGLProgramResolveScopeCache *cache = &s_mglProgramResolveScopeCache;
+    GLboolean useCache = mglProgramResolveCacheActiveForContext(ctx);
+
+    if (useCache) {
+        mglProgramResolveCacheSyncState(cache, ctx);
+        if (cache->pipeline_resolved) {
+            return cache->pipeline;
+        }
+    }
+
+    ProgramPipeline *pipeline = mglResolveProgramPipelineFromStateUncached(ctx);
+
+    if (useCache) {
+        mglProgramResolveCacheSyncState(cache, ctx);
+        cache->pipeline = pipeline;
+        cache->pipeline_resolved = GL_TRUE;
+    }
+
+    return pipeline;
 }
 
 static Program *mglRestoreMonolithicProgramBinding(GLMContext ctx, GLuint programName)
@@ -486,7 +658,7 @@ void mglRestoreProgramPipelinePair(GLMContext ctx, GLuint programName, GLuint pi
     (void)mglRestoreProgramPipelineBinding(ctx, pipelineName);
 }
 
-Program *mglResolveProgramForStageFromState(GLMContext ctx, int stage)
+static Program *mglResolveProgramForStageFromStateUncached(GLMContext ctx, int stage)
 {
     if (!mglRendererContextLikelyValid(ctx) || stage < 0 || stage >= _MAX_SHADER_TYPES) {
         return NULL;
@@ -516,8 +688,12 @@ Program *mglResolveProgramForStageFromState(GLMContext ctx, int stage)
         return NULL;
     }
 
+    GLboolean stageProgramInTable =
+        mglRendererObjectPointerLikelyValid(stageProgram) &&
+        mglHashTableContainsData(&ctx->state.program_table, stageProgram);
     if (!mglRendererObjectPointerLikelyValid(stageProgram) ||
-        !mglPointerRangeIsReadable(stageProgram, sizeof(*stageProgram)) ||
+        (!stageProgramInTable &&
+         !mglPointerRangeIsReadable(stageProgram, sizeof(*stageProgram))) ||
         !mglProgramPointerUsableForName(ctx, stageProgram, stageProgram->name)) {
         NSLog(@"MGL PROGRAM PIPELINE RESOLVE invalid stage program pipeline=%u stage=%s ptr=%p",
               (unsigned)pipeline->name,
@@ -539,6 +715,33 @@ Program *mglResolveProgramForStageFromState(GLMContext ctx, int stage)
     }
 
     return stageProgram;
+}
+
+Program *mglResolveProgramForStageFromState(GLMContext ctx, int stage)
+{
+    if (!mglRendererContextLikelyValid(ctx) || stage < 0 || stage >= _MAX_SHADER_TYPES) {
+        return NULL;
+    }
+
+    MGLProgramResolveScopeCache *cache = &s_mglProgramResolveScopeCache;
+    GLboolean useCache = mglProgramResolveCacheActiveForContext(ctx);
+
+    if (useCache) {
+        mglProgramResolveCacheSyncState(cache, ctx);
+        if (cache->stage_resolved[stage]) {
+            return cache->stage_programs[stage];
+        }
+    }
+
+    Program *program = mglResolveProgramForStageFromStateUncached(ctx, stage);
+
+    if (useCache) {
+        mglProgramResolveCacheSyncState(cache, ctx);
+        cache->stage_programs[stage] = program;
+        cache->stage_resolved[stage] = GL_TRUE;
+    }
+
+    return program;
 }
 
 void mglRendererSyncFramebufferBindingNames(GLMContext ctx)
@@ -3363,7 +3566,9 @@ void logDirtyBits(GLMContext ctx)
  * buffers at render time.
  */
 
-#define MGL_MAX_PACKED_STRUCT_BUFFERS 128
+#define MGL_MAX_PACKED_STRUCT_BUFFERS 256
+#define MGL_PACKED_UNIFORM_ARENA_INITIAL_SIZE (4u * 1024u * 1024u)
+#define MGL_PACKED_UNIFORM_ALIGNMENT 256u
 static Buffer *s_packedStructBuffers[MGL_MAX_PACKED_STRUCT_BUFFERS];
 static int s_packedStructBufferIdx = 0;
 
@@ -3440,16 +3645,102 @@ static GLuint mglGLTypeElementByteSize(GLuint gl_type)
     }
 }
 
-/* Get a reusable Buffer object for packed struct data.  The Metal buffer
- * is recreated each call; the Buffer wrapper is reused from a static ring. */
-static Buffer *mglGetPackedStructBuffer(GLMContext ctx,
-                                         id<MTLDevice> device,
-                                         const void *data,
-                                         size_t size)
+static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment)
 {
-    if (s_packedStructBufferIdx >= MGL_MAX_PACKED_STRUCT_BUFFERS) {
-        s_packedStructBufferIdx = 0;
+    if (alignment == 0u) return value;
+    NSUInteger mask = alignment - 1u;
+    if (value > NSUIntegerMax - mask) return NSUIntegerMax;
+    return (value + mask) & ~mask;
+}
+
+/* Suballocate immutable packed uniform data from one shared Metal buffer per
+ * command buffer.  The wrapper pool is reset before vertex+fragment mapping,
+ * so every map entry in one synchronization pass keeps a distinct Buffer
+ * object even if the arena has to grow between stages. */
+- (Buffer *)packedStructBufferWithData:(const void *)data
+                                  size:(size_t)size
+                                offset:(GLintptr *)outOffset
+{
+    if (!data || size == 0u || !outOffset || !_device || !_currentCommandBuffer) {
+        return NULL;
     }
+
+    if (_packedUniformArenaCommandBuffer != _currentCommandBuffer) {
+        _packedUniformArenaCommandBuffer = _currentCommandBuffer;
+        _packedUniformArenaBuffer = nil;
+        _packedUniformArenaCapacity = 0u;
+        _packedUniformArenaOffset = 0u;
+        [_packedUniformRetiredArenas removeAllObjects];
+    }
+
+    if (s_packedStructBufferIdx >= MGL_MAX_PACKED_STRUCT_BUFFERS) {
+        static uint64_t s_packedWrapperExhaustionCount = 0;
+        uint64_t hit = ++s_packedWrapperExhaustionCount;
+        if (hit <= 8u || (hit % 256u) == 0u) {
+            NSLog(@"MGL WARNING: packed uniform wrapper pool exhausted (%u entries)",
+                  MGL_MAX_PACKED_STRUCT_BUFFERS);
+        }
+        return NULL;
+    }
+
+    NSUInteger alignedSize = mglPackedUniformAlignUp((NSUInteger)size,
+                                                      MGL_PACKED_UNIFORM_ALIGNMENT);
+    NSUInteger alignedOffset = mglPackedUniformAlignUp(_packedUniformArenaOffset,
+                                                        MGL_PACKED_UNIFORM_ALIGNMENT);
+    if (alignedSize == NSUIntegerMax || alignedOffset == NSUIntegerMax) {
+        return NULL;
+    }
+
+    BOOL needsArena = !_packedUniformArenaBuffer ||
+        alignedOffset > _packedUniformArenaCapacity ||
+        alignedSize > (_packedUniformArenaCapacity - alignedOffset);
+    if (needsArena) {
+        NSUInteger previousCapacity = _packedUniformArenaCapacity;
+        NSUInteger grown = previousCapacity > 0u
+            ? previousCapacity
+            : (NSUInteger)MGL_PACKED_UNIFORM_ARENA_INITIAL_SIZE;
+        while (grown < alignedSize && grown <= NSUIntegerMax / 2u) {
+            grown *= 2u;
+        }
+        if (grown < alignedSize) {
+            grown = alignedSize;
+        } else if (_packedUniformArenaBuffer &&
+                   alignedSize <= previousCapacity &&
+                   grown <= NSUIntegerMax / 2u) {
+            /* When the current arena merely filled, grow rather than allocate
+             * the same capacity repeatedly during one command buffer. */
+            grown *= 2u;
+        }
+
+        id<MTLBuffer> replacement =
+            [_device newBufferWithLength:grown
+                                 options:(MTLResourceStorageModeShared |
+                                          MTLResourceCPUCacheModeWriteCombined)];
+        if (!replacement || !replacement.contents) {
+            return NULL;
+        }
+        replacement.label = [NSString stringWithFormat:@"MGL packed uniforms %lu KiB",
+                             (unsigned long)(grown / 1024u)];
+
+        if (_packedUniformArenaBuffer) {
+            if (!_packedUniformRetiredArenas) {
+                _packedUniformRetiredArenas = [NSMutableArray array];
+            }
+            [_packedUniformRetiredArenas addObject:_packedUniformArenaBuffer];
+        }
+        _packedUniformArenaBuffer = replacement;
+        _packedUniformArenaCapacity = grown;
+        _packedUniformArenaOffset = 0u;
+        alignedOffset = 0u;
+    }
+
+    uint8_t *destination = (uint8_t *)_packedUniformArenaBuffer.contents + alignedOffset;
+    memcpy(destination, data, size);
+    if (alignedSize > size) {
+        memset(destination + size, 0, alignedSize - size);
+    }
+    _packedUniformArenaOffset = alignedOffset + alignedSize;
+
     int idx = s_packedStructBufferIdx++;
     Buffer *buf = s_packedStructBuffers[idx];
     if (!buf) {
@@ -3459,55 +3750,26 @@ static Buffer *mglGetPackedStructBuffer(GLMContext ctx,
         }
         buf->name = 0xF0000000u | (GLuint)idx;
         buf->target = GL_UNIFORM_BUFFER;
-        buf->usage = GL_STATIC_DRAW;
-        buf->written_min = -1;
-        buf->written_max = -1;
+        buf->usage = GL_STREAM_DRAW;
         s_packedStructBuffers[idx] = buf;
     }
 
-    /* Release previous Metal buffer if any */
-    if (buf->data.mtl_data) {
-        mglSafeReleaseMetalObj((void **)&buf->data.mtl_data);
-    }
-
-    /* Create new Metal buffer with packed data.
-     * Pad to kMGLMinimumStageBindingSize so the buffer passes the
-     * minimum-size validation in the vertex/fragment binding paths
-     * (which otherwise replaces undersized buffers with a zero-filled
-     * fallback, losing the struct data). */
-    size_t mtl_size = size;
-    if (mtl_size < kMGLMinimumStageBindingSize) {
-        mtl_size = kMGLMinimumStageBindingSize;
-    }
-    uint8_t *padded = NULL;
-    const void *src = data;
-    if (mtl_size > size) {
-        padded = (uint8_t *)calloc(1, mtl_size);
-        if (padded) {
-            memcpy(padded, data, size);
-            src = padded;
-        }
-    }
-    id<MTLBuffer> mtlBuffer = [device newBufferWithBytes:src
-                                                  length:mtl_size
-                                                  options:MTLResourceCPUCacheModeDefaultCache];
-    if (padded) {
-        free(padded);
-    }
-    if (!mtlBuffer) {
-        return NULL;
-    }
-    buf->data.mtl_data = (void *)CFBridgingRetain(mtlBuffer);
-    buf->size = (GLsizeiptr)mtl_size;
+    /* Non-owning bridge: the renderer retains the active/retired arenas and
+     * Metal command buffers retain every encoded resource until completion. */
+    buf->data.mtl_data = (__bridge void *)_packedUniformArenaBuffer;
+    buf->size = (GLsizeiptr)_packedUniformArenaCapacity;
     buf->data.buffer_data = 0;
-    buf->data.buffer_size = mtl_size;
+    buf->data.buffer_size = _packedUniformArenaCapacity;
     buf->data.dirty_bits = 0;
     buf->has_initialized_data = GL_TRUE;
     buf->ever_written = GL_TRUE;
+    buf->written_min = (GLintptr)alignedOffset;
+    buf->written_max = (GLintptr)(alignedOffset + size);
     /* Mark as transient so mglRendererGetValidatedBuffer bypasses the
      * buffer hash-table lookup (packed struct buffers are standalone
      * Buffer wrappers, not inserted into the GL buffer table). */
     buf->transient_batch_buffer = GL_TRUE;
+    *outOffset = (GLintptr)alignedOffset;
     return buf;
 }
 
@@ -3809,8 +4071,10 @@ static Buffer *mglGetPackedStructBuffer(GLMContext ctx,
                             }
                         }
 
-                        Buffer *packedBuf = mglGetPackedStructBuffer(ctx, _device,
-                                                                      packed, struct_size);
+                        GLintptr packedOffset = 0;
+                        Buffer *packedBuf = [self packedStructBufferWithData:packed
+                                                                       size:struct_size
+                                                                     offset:&packedOffset];
                         if (packed != stack_packed) {
                             free(packed);
                         }
@@ -3832,18 +4096,21 @@ static Buffer *mglGetPackedStructBuffer(GLMContext ctx,
                         entry->metal_binding_index = metal_binding;
                         entry->has_metal_binding = GL_TRUE;
                         entry->buf = packedBuf;
-                        entry->offset = 0;
+                        entry->offset = packedOffset;
                         entry->size = (GLsizeiptr)struct_size;
                         buffer_map->count++;
 
-                        NSLog(@"MGL STRUCTPACK program=%u stage=%d resource=%s element=%u/%u loc=%d metal=%u size=%lu",
-                              (unsigned)program->name,
-                              stage,
-                              resource->name ? resource->name : "(null)",
-                              element, array_size,
-                              base_loc + (GLint)(loc_step * element),
-                              (unsigned)metal_binding,
-                              (unsigned long)struct_size);
+                        if (getenv("MGL_DEBUG_STRUCT_PACK")) {
+                            NSLog(@"MGL STRUCTPACK program=%u stage=%d resource=%s element=%u/%u loc=%d metal=%u size=%lu offset=%lld",
+                                  (unsigned)program->name,
+                                  stage,
+                                  resource->name ? resource->name : "(null)",
+                                  element, array_size,
+                                  base_loc + (GLint)(loc_step * element),
+                                  (unsigned)metal_binding,
+                                  (unsigned long)struct_size,
+                                  (long long)packedOffset);
+                        }
                     }
                     continue; /* Skip normal binding path for struct resource */
                 }
@@ -4241,6 +4508,7 @@ static Buffer *mglGetPackedStructBuffer(GLMContext ctx,
 
 - (bool) mapBuffersToMTL
 {
+    s_packedStructBufferIdx = 0;
     if ([self mapGLBuffersToMTLBufferMap: &ctx->state.vertex_buffer_map_list stage:_VERTEX_SHADER] == false)
         return false;
 
@@ -8269,8 +8537,8 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
         return false;
     }
 
-    id <MTLFunction> func;
-    func = (__bridge id<MTLFunction>)(computeShader->mtl_data.function);
+    id<MTLFunction> func =
+        (__bridge id<MTLFunction>)(program->spirv[_COMPUTE_SHADER].mtl_function);
     if (!func) {
         NSLog(@"MGL COMPUTE ERROR: compute shader for program %u has no Metal function", program->name);
         return false;
@@ -10419,12 +10687,13 @@ Buffer *getIndirectBuffer(GLMContext ctx)
     }
 
     Shader *tcsShader = tcsProgram->shader_slots[_TESS_CONTROL_SHADER];
-    if (!tcsShader || !tcsShader->mtl_data.function) {
+    if (!tcsShader || !tcsProgram->spirv[_TESS_CONTROL_SHADER].mtl_function) {
         NSLog(@"MGL TESS WARNING: TCS program %u has no compiled function", tcsProgram->name);
         return false;
     }
 
-    id<MTLFunction> tcsFunc = (__bridge id<MTLFunction>)(tcsShader->mtl_data.function);
+    id<MTLFunction> tcsFunc =
+        (__bridge id<MTLFunction>)(tcsProgram->spirv[_TESS_CONTROL_SHADER].mtl_function);
 
     /* Create compute pipeline state for TCS kernel. */
     NSError *err = nil;
@@ -10741,12 +11010,13 @@ Buffer *getIndirectBuffer(GLMContext ctx)
     }
 
     Shader *tesShader = tesProgram->shader_slots[_TESS_EVALUATION_SHADER];
-    if (!tesShader || !tesShader->mtl_data.function) {
+    if (!tesShader || !tesProgram->spirv[_TESS_EVALUATION_SHADER].mtl_function) {
         NSLog(@"MGL TESS WARNING: TES program %u has no compiled function", tesProgram->name);
         return false;
     }
 
-    id<MTLFunction> tesFunc = (__bridge id<MTLFunction>)(tesShader->mtl_data.function);
+    id<MTLFunction> tesFunc =
+        (__bridge id<MTLFunction>)(tesProgram->spirv[_TESS_EVALUATION_SHADER].mtl_function);
 
     /* Create compute pipeline state for TES kernel. */
     NSError *err = nil;

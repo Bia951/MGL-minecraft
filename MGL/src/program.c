@@ -326,6 +326,12 @@ void mglFreeProgram(GLMContext ctx, Program *ptr)
         }
         mglSafeReleaseMetalObj((void **)&ptr->spirv[i].mtl_function);
         mglSafeReleaseMetalObj((void **)&ptr->spirv[i].mtl_library);
+        mglSafeReleaseMetalObj((void **)&ptr->spirv[i].mtl_zero_to_one_function);
+        mglSafeReleaseMetalObj((void **)&ptr->spirv[i].mtl_zero_to_one_library);
+        mglSafeReleaseMetalObj((void **)&ptr->spirv[i].mtl_upper_left_function);
+        mglSafeReleaseMetalObj((void **)&ptr->spirv[i].mtl_upper_left_library);
+        mglSafeReleaseMetalObj((void **)&ptr->spirv[i].mtl_upper_left_zero_to_one_function);
+        mglSafeReleaseMetalObj((void **)&ptr->spirv[i].mtl_upper_left_zero_to_one_library);
         for (GLuint set = 0; set < MGL_MAX_ARGUMENT_BUFFER_SETS; set++) {
             mglSafeReleaseMetalObj((void **)&ptr->spirv[i].mtl_argument_encoders[set]);
             mglSafeReleaseMetalObj((void **)&ptr->spirv[i].mtl_argument_buffers[set]);
@@ -419,14 +425,27 @@ GLboolean mglProgramPointerUsableForName(GLMContext ctx, Program *program, GLuin
         return GL_FALSE;
     }
 
-    if (!mglObjectPointerLooksPlausible(program) ||
-        !mglPointerRangeIsReadable(program, sizeof(*program)) ||
-        program->name != expectedName) {
+    if (!mglObjectPointerLooksPlausible(program)) {
         return GL_FALSE;
     }
 
+    /*
+     * A program still owned by program_table is safe to dereference.  Check
+     * table identity before the expensive VM-region probe: the old order ran
+     * vm_region_64() for every draw-time program resolution.
+     */
     if (mglHashTableContainsData(&STATE(program_table), program)) {
-        return GL_TRUE;
+        return program->name == expectedName ? GL_TRUE : GL_FALSE;
+    }
+
+    /*
+     * Deleted-but-retained programs are intentionally absent from the name
+     * table.  Keep the VM readability check for that exceptional slow path,
+     * where it still protects deferred draws from a dangling pointer.
+     */
+    if (!mglPointerRangeIsReadable(program, sizeof(*program)) ||
+        program->name != expectedName) {
+        return GL_FALSE;
     }
 
     /*
