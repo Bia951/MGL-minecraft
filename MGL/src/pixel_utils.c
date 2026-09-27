@@ -2705,6 +2705,7 @@ GLboolean mglIsColorRenderableInternalFormat(GLint internalformat)
         case GL_RGBA16I:
         case GL_RGBA16UI:
         case GL_RGBA8:
+        case GL_RGBA8_SNORM: /* Metal supports RGBA8Snorm color attachments. */
         case GL_RGBA8I:
         case GL_RGBA8UI:
         case GL_SRGB8_ALPHA8:
@@ -2799,7 +2800,6 @@ GLboolean mglIsColorRenderableInternalFormat(GLint internalformat)
         case GL_R8_SNORM:
         case GL_RG8_SNORM:
         case GL_RGB8_SNORM:
-        case GL_RGBA8_SNORM:
         case GL_R16_SNORM:
         case GL_RG16_SNORM:
         case GL_RGB16_SNORM:

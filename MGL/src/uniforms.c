@@ -1649,13 +1649,20 @@ GLint  mglGetUniformLocation(GLMContext ctx, GLuint program, const GLchar *name)
      * _MGLLooseUniforms _mgl_loose, so "sunAngle" becomes queryable as
      * "_mgl_loose.sunAngle".  Iris queries the original name, so we
      * retry with the prefixed name here. */
-    if (name[0] != '_' || strncmp(name, "_mgl_loose.", 11) != 0) {
+    if (strncmp(name, "_mgl_loose", 10) != 0) {
         char alias[256];
         size_t name_len = strlen(name);
-        if (name_len < sizeof(alias) - 12) {
-            memcpy(alias, "_mgl_loose.", 11);
-            memcpy(alias + 11, name, name_len + 1);
-            return mglGetUniformLocation(ctx, program, alias);
+        static const char *prefixes[] = {
+            "_mgl_loose_v.", "_mgl_loose_f.", "_mgl_loose_c.",
+            "_mgl_loose_g.", "_mgl_loose_tc.", "_mgl_loose_te."
+        };
+        for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+            size_t prefix_len = strlen(prefixes[i]);
+            if (name_len + prefix_len >= sizeof(alias)) continue;
+            memcpy(alias, prefixes[i], prefix_len);
+            memcpy(alias + prefix_len, name, name_len + 1);
+            GLint location = mglGetUniformLocation(ctx, program, alias);
+            if (location >= 0) return location;
         }
     }
 
@@ -2343,6 +2350,21 @@ void mglUniform(GLMContext ctx, GLint location, void *ptr, GLsizeiptr size)
     if (!programDataChanged && !globalDataChanged) {
         return;
     }
+
+    /*
+     * Deferred batches replay against live Program-owned uniform storage
+     * (the state snapshot only captures buffer binding pointers, not
+     * contents), and delta replay skips rebinding uniform buffers when
+     * consecutive batch keys match.  Both mechanisms are only correct if
+     * all pending draws are replayed BEFORE this mutation lands:
+     * otherwise a draw recorded before the glUniform* call replays with
+     * the new bytes (GL ordering violation), and a same-key draw recorded
+     * after it keeps the encoder bound to the previous MTLBuffer.  Flush
+     * unconditionally whenever the bytes actually change — this also
+     * resets the replay delta chain.  Identical uploads still return
+     * early above, preserving the hot-path optimization.
+     */
+    mglFlushPendingDraws(ctx);
 
     bool bindingLayoutChanged =
         (buf == NULL || uniformSlot->size != size ||

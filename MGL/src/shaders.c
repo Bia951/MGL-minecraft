@@ -1193,9 +1193,42 @@ static int mglIsLooseUniformLine(const char *line_start, const char *line_end,
     return 1;
 }
 
-static void mglAggregateLooseUniforms(char *src, size_t src_capacity)
+/* A macro for a uniform name also expands a same-named function parameter or
+ * local variable (for example "float far" becomes "float _mgl_loose.far").
+ * Keep such uniforms loose instead of generating an invalid declaration. */
+static bool mglLooseUniformHasLocalDeclaration(const char *src,
+                                                const char *type,
+                                                const char *name)
+{
+    size_t type_len = strlen(type), name_len = strlen(name);
+    const char *p = src;
+    while ((p = strstr(p, type)) != NULL) {
+        if ((p == src || !mgl_is_identifier_char((unsigned char)p[-1])) &&
+            !mgl_is_identifier_char((unsigned char)p[type_len])) {
+            const char *q = p + type_len;
+            while (*q == ' ' || *q == '\t' || *q == '\n') q++;
+            if (strncmp(q, name, name_len) == 0 &&
+                !mgl_is_identifier_char((unsigned char)q[name_len])) {
+                const char *line = p;
+                while (line > src && line[-1] != '\n') line--;
+                if (!mglIsLooseUniformLine(line, strchr(line, '\n') ?: line + strlen(line),
+                                           (char[32]){0}, 32, (char[128]){0}, 128))
+                    return true;
+            }
+        }
+        p += type_len;
+    }
+    return false;
+}
+
+static void mglAggregateLooseUniforms(char *src, size_t src_capacity, GLuint shader_type)
 {
     if (!src || src_capacity == 0) return;
+    const char *stage = shader_type == GL_VERTEX_SHADER ? "v" :
+                        shader_type == GL_FRAGMENT_SHADER ? "f" :
+                        shader_type == GL_COMPUTE_SHADER ? "c" :
+                        shader_type == GL_GEOMETRY_SHADER ? "g" :
+                        shader_type == GL_TESS_CONTROL_SHADER ? "tc" : "te";
 
     /* Collect loose uniform declarations */
     struct { char type[32]; char name[128]; size_t line_off; size_t line_len; } unis[128];
@@ -1211,7 +1244,8 @@ static void mglAggregateLooseUniforms(char *src, size_t src_capacity)
         char type_buf[32], name_buf[128];
         if (mglIsLooseUniformLine(line_start, line_end,
                                    type_buf, sizeof(type_buf),
-                                   name_buf, sizeof(name_buf))) {
+                                   name_buf, sizeof(name_buf)) &&
+            !mglLooseUniformHasLocalDeclaration(src, type_buf, name_buf)) {
             unis[uni_count].line_off = (size_t)(line_start - src);
             unis[uni_count].line_len = line_len;
             strncpy(unis[uni_count].type, type_buf, sizeof(unis[uni_count].type) - 1);
@@ -1235,17 +1269,17 @@ static void mglAggregateLooseUniforms(char *src, size_t src_capacity)
 
     size_t off = 0;
     off += snprintf(inject + off, inject_size - off,
-                    "struct _MGLLooseUniforms {\n");
+                    "struct _MGLLooseUniforms_%s {\n", stage);
     for (int i = 0; i < uni_count; i++) {
         off += snprintf(inject + off, inject_size - off,
                         "    %s %s;\n", unis[i].type, unis[i].name);
     }
     off += snprintf(inject + off, inject_size - off,
                     "};\n"
-                    "uniform _MGLLooseUniforms _mgl_loose;\n");
+                    "uniform _MGLLooseUniforms_%s _mgl_loose_%s;\n", stage, stage);
     for (int i = 0; i < uni_count; i++) {
         off += snprintf(inject + off, inject_size - off,
-                        "#define %s _mgl_loose.%s\n", unis[i].name, unis[i].name);
+                        "#define %s _mgl_loose_%s.%s\n", unis[i].name, stage, unis[i].name);
     }
     off += snprintf(inject + off, inject_size - off, "\n");
 
@@ -1648,7 +1682,7 @@ void initGLSLInput(GLMContext ctx, GLuint type, const char *src, glslang_input_t
 
         /* Aggregate loose uniforms into a single struct to avoid exceeding
          * Metal's 31 buffer slot limit (Iris shaderpacks have 40+). */
-        mglAggregateLooseUniforms(modified_src, modified_src_size);
+        mglAggregateLooseUniforms(modified_src, modified_src_size, type);
 
         input->code = modified_src;
         if (out_modified_src) {
