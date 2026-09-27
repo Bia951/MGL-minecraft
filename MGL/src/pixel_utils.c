@@ -2705,6 +2705,9 @@ GLboolean mglIsColorRenderableInternalFormat(GLint internalformat)
         case GL_RGBA16I:
         case GL_RGBA16UI:
         case GL_RGBA8:
+        case GL_RGB8_SNORM:  /* Backed by renderable Metal RGBA8Snorm. */
+        case GL_RGB8:       /* Backed by renderable Metal RGBA8Unorm. */
+        case GL_RGB16F:     /* Backed by renderable Metal RGBA16Float. */
         case GL_RGBA8_SNORM: /* Metal supports RGBA8Snorm color attachments. */
         case GL_RGBA8I:
         case GL_RGBA8UI:
@@ -2799,7 +2802,6 @@ GLboolean mglIsColorRenderableInternalFormat(GLint internalformat)
         /* SNORM formats - not in the required color-renderable list. */
         case GL_R8_SNORM:
         case GL_RG8_SNORM:
-        case GL_RGB8_SNORM:
         case GL_R16_SNORM:
         case GL_RG16_SNORM:
         case GL_RGB16_SNORM:
@@ -2807,10 +2809,8 @@ GLboolean mglIsColorRenderableInternalFormat(GLint internalformat)
             return GL_FALSE;
 
         /* RGB-only sized formats not in the required list. */
-        case GL_RGB8:
         case GL_SRGB8:
         case GL_RGB16:
-        case GL_RGB16F:
         case GL_RGB8I:
         case GL_RGB8UI:
         case GL_RGB16I:

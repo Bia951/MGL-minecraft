@@ -1193,30 +1193,39 @@ static int mglIsLooseUniformLine(const char *line_start, const char *line_end,
     return 1;
 }
 
-/* A macro for a uniform name also expands a same-named function parameter or
- * local variable (for example "float far" becomes "float _mgl_loose.far").
- * Keep such uniforms loose instead of generating an invalid declaration. */
+/* A macro for a uniform name also expands a same-named function parameter,
+ * local variable, or member access. Keep those uniforms loose so declarations
+ * such as "vec2 velocity" do not become invalid GLSL. */
 static bool mglLooseUniformHasLocalDeclaration(const char *src,
                                                 const char *type,
                                                 const char *name)
 {
-    size_t type_len = strlen(type), name_len = strlen(name);
+    (void)type;
+    size_t name_len = strlen(name);
     const char *p = src;
-    while ((p = strstr(p, type)) != NULL) {
+    while ((p = strstr(p, name)) != NULL) {
         if ((p == src || !mgl_is_identifier_char((unsigned char)p[-1])) &&
-            !mgl_is_identifier_char((unsigned char)p[type_len])) {
-            const char *q = p + type_len;
-            while (*q == ' ' || *q == '\t' || *q == '\n') q++;
-            if (strncmp(q, name, name_len) == 0 &&
-                !mgl_is_identifier_char((unsigned char)q[name_len])) {
-                const char *line = p;
-                while (line > src && line[-1] != '\n') line--;
-                if (!mglIsLooseUniformLine(line, strchr(line, '\n') ?: line + strlen(line),
-                                           (char[32]){0}, 32, (char[128]){0}, 128))
-                    return true;
+            !mgl_is_identifier_char((unsigned char)p[name_len])) {
+            const char *line = p;
+            while (line > src && line[-1] != '\n') line--;
+            const char *line_end = strchr(line, '\n');
+            if (!line_end) line_end = line + strlen(line);
+            if (!mglIsLooseUniformLine(line, line_end,
+                                       (char[32]){0}, 32, (char[128]){0}, 128)) {
+                const char *q = p;
+                while (q > src && isspace((unsigned char)q[-1])) q--;
+                if (q > src && q[-1] == '.') return true;
+                const char *end = q;
+                while (q > src && mgl_is_identifier_char((unsigned char)q[-1])) q--;
+                size_t len = (size_t)(end - q);
+                static const char *types[] = {"float", "double", "int", "uint", "bool",
+                    "vec2", "vec3", "vec4", "ivec2", "ivec3", "ivec4",
+                    "uvec2", "uvec3", "uvec4", "mat2", "mat3", "mat4", NULL};
+                for (int i = 0; types[i]; i++)
+                    if (strlen(types[i]) == len && memcmp(q, types[i], len) == 0) return true;
             }
         }
-        p += type_len;
+        p += name_len;
     }
     return false;
 }
