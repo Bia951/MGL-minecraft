@@ -38,6 +38,7 @@
 #include "buffers.h"
 #include "shaders.h"
 #include "MGLRenderer.h"
+#include "mgl_trace_log.h"
 #include "error.h"
 #include "mgl_safety.h"
 
@@ -614,9 +615,17 @@ GLMContext createGLMContext(GLenum format, GLenum type,
     _ctx = save;
 
     mglInitCommandBuffer(&ctx->draw_command_buffer);
+    mglLoadEnvFileNextToDylibOnce();
     ctx->draw_defer_enabled = (getenv("MGL_DISABLE_DRAW_DEFER") == NULL);
     /* MGL_SYNC_STRICT: 开启时所有同步边界走最保守路径 (full flush + commit + waitUntilCompleted)，用于排查回归与正确性基线对照 */
     ctx->sync_strict = (getenv("MGL_SYNC_STRICT") != NULL);
+    mglTraceLog("MGL STARTUP FLAGS ctx=0x%lx sync_strict=%d sync_strict_env=%s draw_defer=%d "
+                "draw_defer_env=%s force_sync_strict=%s",
+                (unsigned long)ctx, ctx->sync_strict,
+                getenv("MGL_SYNC_STRICT") ? getenv("MGL_SYNC_STRICT") : "(unset)",
+                ctx->draw_defer_enabled,
+                getenv("MGL_DISABLE_DRAW_DEFER") ? getenv("MGL_DISABLE_DRAW_DEFER") : "(unset)",
+                getenv("MGL_FORCE_SYNC_STRICT") ? getenv("MGL_FORCE_SYNC_STRICT") : "(unset)");
 
     return ctx;
 }

@@ -3,6 +3,8 @@
 
 #import "MGLRenderer_Private.h"
 #import "MGLRenderer+Query_Private.h"
+#include "draw_command.h"
+#include "mgl_trace_log.h"
 
 @implementation MGLRenderer (Query)
 #pragma mark Metal visibility result (GL occlusion query)
@@ -168,12 +170,50 @@
 
     // Flush pending draws into the current command buffer so the CB captures
     // all GL commands issued before the fence insertion point.
+    //
+    // CRITICAL: deferred draw batches live in the GL-side command buffer and
+    // are NOT replayed by processGLState below.  Without this explicit
+    // replay, the fence would retain a command buffer that omits every draw
+    // issued before glFenceSync — the fence signals as soon as that (nearly
+    // empty) CB completes, while the deferred draws are only encoded and
+    // committed later (e.g. at swap).  A client that then honors the fence
+    // (glClientWaitSync) and rewrites a vertex buffer races the still-running
+    // draws — observed as chunk geometry landing in wrong places and
+    // per-frame animated vertices (flowers/sugar cane) twitching.
+    uint32_t fencePendingBatches = glm_ctx->draw_command_buffer.batch_count;
+    mglFlushCommandBuffer(glm_ctx);
+
+    if (mglTraceLogIsEnabled()) {
+        mglTraceLogExternal("MGL TRACE FenceSync sync=%u batchesReplayed=%u residualBatches=%u cb=%p cbStatus=%ld lastCommitted=%p lastCommittedStatus=%ld",
+                            sync->name,
+                            (unsigned)fencePendingBatches,
+                            (unsigned)glm_ctx->draw_command_buffer.batch_count,
+                            (__bridge void *)_currentCommandBuffer,
+                            (long)(_currentCommandBuffer ? _currentCommandBuffer.status : -1),
+                            (__bridge void *)_lastCommittedCommandBuffer,
+                            (long)(_lastCommittedCommandBuffer ? _lastCommittedCommandBuffer.status : -1));
+    }
+
     if (![self processGLState: false]) {
         NSLog(@"MGL WARNING: processGLState failed in mtlGetSync");
     }
 
     // End any open render encoder so the command buffer can be committed.
     [self endRenderEncoding];
+
+    // Belt-and-suspenders: snapshot the most recently committed CB (if it is
+    // still in flight) so the fence wait covers it too. Under strict queue-FIFO
+    // this is redundant; if the driver ever overlaps execution of queued CBs,
+    // a light fence CB could retire while a heavy earlier draw CB still reads
+    // a persistent-mapped ring buffer — letting the client overwrite it mid-
+    // read (chunk misplacement / billboard UV twitching).
+    if (_lastCommittedCommandBuffer &&
+        _lastCommittedCommandBuffer != _currentCommandBuffer &&
+        _lastCommittedCommandBuffer.status < MTLCommandBufferStatusCompleted) {
+        sync->mtl_prior_command_buffer = (void *)CFBridgingRetain(_lastCommittedCommandBuffer);
+    } else {
+        sync->mtl_prior_command_buffer = NULL;
+    }
 
     // CB-wait mechanism: retain the current command buffer (which now contains
     // exactly the commands issued before the fence), commit it to the GPU, and
@@ -194,10 +234,17 @@
             NSLog(@"MGL ERROR: Failed to commit fence command buffer: %@", exception);
             [self recordGPUError];
         }
+    } else if (sync->mtl_prior_command_buffer == NULL &&
+               _lastCommittedCommandBuffer &&
+               _lastCommittedCommandBuffer.status < MTLCommandBufferStatusCompleted) {
+        // No submittable current CB, but earlier work is still in flight: wait
+        // on the last committed CB instead of signaling immediately. (The old
+        // NULL assignment made such fences instantly signaled while the GPU
+        // could still be executing prior draws.)
+        sync->mtl_command_buffer = (void *)CFBridgingRetain(_lastCommittedCommandBuffer);
     } else {
-        // No in-flight command buffer (e.g. no draws issued before the fence)
-        // or the buffer is already finalized/errored: the fence is immediately
-        // signaled.
+        // No in-flight command buffer at all (e.g. no draws issued before the
+        // fence): the fence is immediately signaled.
         sync->mtl_command_buffer = NULL;
     }
 
@@ -327,7 +374,21 @@
 
     // CB-wait path: block until the command buffer captured at fence insertion
     // completes on the GPU. This is the real wait mechanism and runs regardless
-    // of kMGLDisableSharedEventSync.
+    // of kMGLDisableSharedEventSync. The prior (earlier-committed) CB is waited
+    // first so the fence covers all work committed before the insertion point
+    // even if the driver overlaps execution of queued command buffers.
+    if (sync->mtl_prior_command_buffer) {
+        id<MTLCommandBuffer> prior = (__bridge id<MTLCommandBuffer>)sync->mtl_prior_command_buffer;
+        @try {
+            if (prior.status != MTLCommandBufferStatusCompleted) {
+                [prior waitUntilCompleted];
+            }
+        } @catch (NSException *exception) {
+            NSLog(@"MGL ERROR: Exception waiting on fence prior command buffer: %@", exception);
+        }
+        mglSafeReleaseMetalObj((void **)&sync->mtl_prior_command_buffer);
+    }
+
     if (sync->mtl_command_buffer) {
         id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)sync->mtl_command_buffer;
         @try {
@@ -370,7 +431,22 @@
  */
 -(GLenum) mtlGetSyncStatus:(GLMContext) glm_ctx sync: (Sync *)sync
 {
-    if (!sync || !sync->mtl_command_buffer) {
+    if (!sync) {
+        return GL_SIGNALED;
+    }
+
+    if (sync->mtl_prior_command_buffer) {
+        id<MTLCommandBuffer> prior = (__bridge id<MTLCommandBuffer>)sync->mtl_prior_command_buffer;
+        @try {
+            if (prior.status != MTLCommandBufferStatusCompleted) {
+                return GL_UNSIGNALED;
+            }
+        } @catch (NSException *exception) {
+            NSLog(@"MGL ERROR: Exception querying fence prior command buffer status: %@", exception);
+        }
+    }
+
+    if (!sync->mtl_command_buffer) {
         return GL_SIGNALED;
     }
 
@@ -407,6 +483,14 @@
             mglSafeReleaseMetalObj((void **)&sync->mtl_command_buffer);
         } @catch (NSException *exception) {
             NSLog(@"MGL ERROR: Exception releasing fence command buffer: %@", exception);
+        }
+    }
+
+    if (sync->mtl_prior_command_buffer) {
+        @try {
+            mglSafeReleaseMetalObj((void **)&sync->mtl_prior_command_buffer);
+        } @catch (NSException *exception) {
+            NSLog(@"MGL ERROR: Exception releasing fence prior command buffer: %@", exception);
         }
     }
 

@@ -31,6 +31,15 @@ typedef struct __GLsync {
      * fence insertion point. mtlWaitForSync blocks on its completion. Stored as
      * void* (CFBridgingRetain/Release) since this struct is used from plain C. */
     void *mtl_command_buffer;
+    /* Retained most-recently-committed command buffer at fence creation time.
+     * A single MTLCommandQueue is expected to execute its buffers FIFO, so
+     * waiting on mtl_command_buffer alone should imply completion of all
+     * earlier work; this second reference is the belt-and-suspenders path in
+     * case execution overlap lets a later (lighter) fence CB retire while an
+     * earlier (heavier) draw CB is still running — the exact race that lets a
+     * persistent-mapped ring buffer be overwritten mid-read. NULL when no
+     * earlier CB was in flight. */
+    void *mtl_prior_command_buffer;
 #ifdef __cplusplus
 } Sync;
 #else

@@ -225,6 +225,14 @@ GLFWbool _glfwCreateContextMGL(_GLFWwindow* window,
 
     window->context.mgl.renderer = (id)CFBridgingRetain(renderer);
 
+    // One-shot bind verification: proves the fresh GLFW build is deployed and
+    // that the Metal layer is attached to the window's real contentView.
+    NSLog(@"MGL GLFW: binding renderer to contentView=%p bounds=%.0fx%.0f window=%@",
+          window->ns.view,
+          [window->ns.view bounds].size.width,
+          [window->ns.view bounds].size.height,
+          [window->ns.view window]);
+
     [window->context.mgl.renderer createMGLRendererAndBindToContext: window->context.mgl.ctx view: window->ns.view];
 
     //[window->context.mgl.object setView: window->ns.view];

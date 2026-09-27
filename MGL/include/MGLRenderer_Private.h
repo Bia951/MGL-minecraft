@@ -219,6 +219,11 @@ static inline void mglMetalUnlock(os_unfair_lock *lock) {
     uint32_t _traceReplayBatchIndex;
     GLuint _dontCareFrameGeneration;
     id<MTLCommandBuffer> _currentCommandBuffer;
+    /* Most recently committed command buffer (committed via
+     * commitCommandBufferWithAGXRecovery:). Retained so glFenceSync can cover
+     * in-flight work committed before the fence CB (belt-and-suspenders vs
+     * queue FIFO; see Sync::mtl_prior_command_buffer). */
+    id<MTLCommandBuffer> _lastCommittedCommandBuffer;
     SyncList  *_currentCommandBufferSyncList;
     id<MTLBuffer> _mdiArgsScratchBuffer;
     NSUInteger _mdiArgsScratchCapacity;

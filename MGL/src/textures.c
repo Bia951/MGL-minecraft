@@ -3486,6 +3486,8 @@ bool texSubImage(GLMContext ctx, Texture *tex, GLuint face, GLint level, GLint x
 
     /* MGL_SYNC_STRICT: 强制 full flush + commit + waitUntilCompleted，用于排查回归 */
     if (ctx->sync_strict) {
+        mglTraceLogExternal("MGL TRACE SYNC_STRICT texSubImage tex=%u %dx%dx%d strict=1",
+                            tex ? tex->name : 0u, width, height, depth);
         mglFlushCommandBuffer(ctx);
         ctx->mtl_funcs.mtlFlush(ctx, true);
     }

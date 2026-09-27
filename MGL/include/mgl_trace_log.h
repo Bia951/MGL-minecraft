@@ -73,6 +73,13 @@ BOOL mglTraceEnvFlagEnabled(const char *name);
  * MGLRenderer.m. */
 void mglInitTraceLogIfNeeded(void);
 
+/* Load KEY=VALUE lines from an optional "mgl.env" file next to the loaded
+ * dylib into the process environment (without overriding existing vars).
+ * Idempotent (dispatch_once).  Called lazily from every env-flag helper
+ * (mglTraceEnvFlag, mglEnvFlagEnabled, mglEnvFlagEnabledDefaultOn) so debug
+ * flags work regardless of dylib initializer order. */
+void mglLoadEnvFileNextToDylibOnce(void);
+
 #ifdef __OBJC__
 /* ObjC NSString-format wrapper gated by trace-enabled state.  Kept under the
  * old MGLTraceNSLog name so existing call sites keep compiling while trace

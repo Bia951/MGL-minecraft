@@ -1939,3 +1939,42 @@ GLFWAPI id glfwGetCocoaWindow(GLFWwindow* handle)
     return window->ns.object;
 }
 
+GLFWAPI id glfwGetCocoaView(GLFWwindow* handle)
+{
+    _GLFWwindow* window = (_GLFWwindow*) handle;
+    _GLFW_REQUIRE_INIT_OR_RETURN(nil);
+
+    if (_glfw.platform.platformID != GLFW_PLATFORM_COCOA)
+    {
+        _glfwInputError(GLFW_PLATFORM_UNAVAILABLE,
+                        "Cocoa: Platform not initialized");
+        return NULL;
+    }
+
+    return window->ns.view;
+}
+
+// LWJGL 3.4.1 binds glfwGetNSGLContext via GLFWNativeNSGL; nsgl_context.m
+// is excluded from the MGL build, so provide the entry point here and
+// return the MGL context object.
+GLFWAPI id glfwGetNSGLContext(GLFWwindow* handle)
+{
+    _GLFWwindow* window = (_GLFWwindow*) handle;
+    _GLFW_REQUIRE_INIT_OR_RETURN(nil);
+
+    if (_glfw.platform.platformID != GLFW_PLATFORM_COCOA)
+    {
+        _glfwInputError(GLFW_PLATFORM_UNAVAILABLE,
+                        "Cocoa: Platform not initialized");
+        return nil;
+    }
+
+    if (window->context.source != GLFW_NATIVE_CONTEXT_API)
+    {
+        _glfwInputError(GLFW_NO_WINDOW_CONTEXT, NULL);
+        return nil;
+    }
+
+    return (__bridge id)window->context.mgl.ctx;
+}
+

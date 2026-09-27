@@ -509,6 +509,10 @@ GLFWAPI int glfwGetInputMode(GLFWwindow* handle, int mode)
             return window->lockKeyMods;
         case GLFW_RAW_MOUSE_MOTION:
             return window->rawMouseMotion;
+        case GLFW_IME:
+            // GLFW 3.5 input mode requested via LWJGL 3.4.1 by Minecraft 26.x.
+            // MGL does not toggle the system IME; report disabled.
+            return GLFW_FALSE;
     }
 
     _glfwInputError(GLFW_INVALID_ENUM, "Invalid input mode 0x%08X", mode);
@@ -613,6 +617,13 @@ GLFWAPI void glfwSetInputMode(GLFWwindow* handle, int mode, int value)
 
             window->rawMouseMotion = value;
             _glfw.platform.setRawMouseMotion(window, value);
+            return;
+        }
+
+        case GLFW_IME:
+        {
+            // GLFW 3.5 input mode requested via LWJGL 3.4.1 by Minecraft 26.x.
+            // MGL does not toggle the system IME; silently accept the request.
             return;
         }
     }

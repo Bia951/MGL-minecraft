@@ -261,6 +261,7 @@ NSRange mglRendererFindMSLEntryParameterClose(NSString *msl, const char *entryPo
 
 BOOL mglEnvFlagEnabled(const char *name)
 {
+    mglLoadEnvFileNextToDylibOnce();
     const char *value = name ? getenv(name) : NULL;
     if (!value || value[0] == '\0') {
         return NO;
@@ -278,6 +279,7 @@ BOOL mglEnvFlagEnabled(const char *name)
  * Use for kill-switchable optimizations that should ship enabled. */
 BOOL mglEnvFlagEnabledDefaultOn(const char *name)
 {
+    mglLoadEnvFileNextToDylibOnce();
     const char *value = name ? getenv(name) : NULL;
     if (!value || value[0] == '\0') {
         return YES;
@@ -4526,7 +4528,7 @@ static BOOL mglSnapshotSharedDirtyBuffer(id<MTLDevice> device,
     const void *cpuData = ptr ? (const void *)(uintptr_t)ptr->data.buffer_data : NULL;
     if (!device || !ptr || !buffer || buffer.storageMode != MTLStorageModeShared ||
         !cpuData || (uintptr_t)cpuData < 0x1000u ||
-        (ptr->storage_flags & GL_CLIENT_STORAGE_BIT) || cpuData == buffer.contents) {
+        cpuData == buffer.contents) {
         return YES;
     }
 
@@ -4572,28 +4574,27 @@ static BOOL mglSnapshotSharedBufferRange(id<MTLDevice> device,
     const uint8_t *cpuData = ptr ? (const uint8_t *)(uintptr_t)ptr->data.buffer_data : NULL;
     if (!device || !ptr || !buffer || buffer.storageMode != MTLStorageModeShared ||
         !cpuData || (uintptr_t)cpuData < 0x1000u ||
-        (ptr->storage_flags & GL_CLIENT_STORAGE_BIT) || cpuData == buffer.contents ||
+        cpuData == buffer.contents ||
         offset > buffer.length || length > buffer.length - offset) {
         return YES;
     }
 
-    MTLResourceOptions options = MTLResourceStorageModeShared;
-    if (buffer.cpuCacheMode == MTLCPUCacheModeWriteCombined) {
-        options |= MTLResourceCPUCacheModeWriteCombined;
-    }
-
-    id<MTLBuffer> snapshot = [device newBufferWithLength:buffer.length options:options];
-    if (!snapshot) {
-        NSLog(@"MGL BUFFER ERROR: failed to snapshot mapped buffer %u", ptr->name);
-        return NO;
-    }
-
-    memcpy(snapshot.contents, buffer.contents, buffer.length);
-    memcpy((uint8_t *)snapshot.contents + offset, cpuData + offset, length);
-
-    mglSafeReleaseMetalObj((void **)&ptr->data.mtl_data);
-    ptr->data.mtl_data = (void *)CFBridgingRetain(snapshot);
-    *bufferPtr = snapshot;
+    /*
+     * Publish the flushed range in place: copy only [offset, offset+length)
+     * from the CPU persistent mapping into the existing GPU-side buffer.
+     *
+     * This replaces the previous full snapshot (new MTLBuffer + whole-buffer
+     * copy per flush): Sodium flushes per chunk section, so a 16MB streaming
+     * VBO paid a 16MB allocation + copy on every glFlushMappedBufferRange,
+     * which dominated frame time (massive FPS regression).
+     *
+     * Safety: the client only rewrites a flushed range after its fence has
+     * signaled (covered by the fence prior-command-buffer wait), and a freshly
+     * flushed range is not referenced by any in-flight GPU work yet.  Writing
+     * a disjoint range of the shared MTLBuffer does not disturb in-flight
+     * draws reading other regions of the same buffer.
+     */
+    memcpy((uint8_t *)buffer.contents + offset, cpuData + offset, length);
     return YES;
 }
 
@@ -9173,6 +9174,12 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
         if (traceSwap) {
             MGLTraceNSLog(@"MGL TRACE swap.nextDrawable.begin call=%llu stage=post_commit", (unsigned long long)swapCall);
         }
+        static uint32_t s_postCommitNextDrawableLogBudget = 4;
+        if (s_postCommitNextDrawableLogBudget > 0) {
+            s_postCommitNextDrawableLogBudget--;
+            NSLog(@"MGL VIEW: postCommitNextDrawable layer=%p superlayer=%p view=%p view.layer=%p view.window=%p",
+                  _layer, _layer.superlayer, _view, _view.layer, _view.window);
+        }
         _drawable = [_layer nextDrawable];
         if (traceSwap) {
             id<MTLTexture> tex = _drawable ? _drawable.texture : nil;
@@ -9871,7 +9878,6 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
     uint64_t call = ++s_mtlBufferSubDataCalls;
     bool trace = kMGLDiagnosticStateLogs && mglShouldTraceBufferTransferCall(call);
     id<MTLBuffer> mtl_buffer;
-    void *data;
 
     if (!buf) {
         NSLog(@"MGL ERROR: mtlBufferSubData null buffer offset=%zu size=%zu", offset, size);
@@ -9942,14 +9948,6 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
         return;
     }
 
-    uint8_t *cpuData = (uint8_t *)(uintptr_t)buf->data.buffer_data;
-    if (cpuData && cpuData != mtl_buffer.contents) {
-        memmove(cpuData + offset, ptr, size);
-        if (!mglSnapshotSharedDirtyBuffer(_device, buf, &mtl_buffer)) {
-            return;
-        }
-    }
-
     if (offset > mtl_buffer.length || size > (mtl_buffer.length - offset)) {
         NSLog(@"MGL ERROR: mtlBufferSubData range exceeds Metal buffer buffer=%u off=%zu size=%zu len=%lu",
               buf->name,
@@ -9959,12 +9957,19 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
         return;
     }
 
-    data = mtl_buffer.contents;
-    if (!data) {
+    uint8_t *cpuData = (uint8_t *)(uintptr_t)buf->data.buffer_data;
+    if (cpuData && cpuData != mtl_buffer.contents) {
+        memmove(cpuData + offset, ptr, size);
+        if (!mglSnapshotSharedDirtyBuffer(_device, buf, &mtl_buffer)) {
+            return;
+        }
+    }
+
+    if (!mtl_buffer.contents) {
         NSLog(@"MGL ERROR: mtlBufferSubData buffer=%u has NULL contents", buf->name);
         return;
     }
-    memcpy(data+offset, ptr, size);
+    memcpy((uint8_t *)mtl_buffer.contents + offset, ptr, size);
 
     if (mtl_buffer.storageMode == MTLStorageModeManaged) {
         [mtl_buffer didModifyRange:NSMakeRange(offset, size)];
@@ -10087,6 +10092,30 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
         }
 
         return mappedPtr;
+    }
+
+    /*
+     * UNMAP SYNCHRONIZATION (root-cause fix for chunk misplacement / stale
+     * terrain meshes):
+     *
+     * Non-persistent glMapBufferRange returns the CPU-side vm_allocate shadow
+     * (cpuBase), NOT the Metal buffer contents.  When cpuBase exists, the
+     * previous code did nothing here — client writes landed only in the CPU
+     * shadow while the GPU kept reading the stale Metal copy (attrib/draw
+     * paths never consume DIRTY_BUFFER_DATA for VBOs; only the uniform
+     * base-buffer list does).  Sodium uploads terrain vertex data through
+     * map/unmap, so every re-meshed chunk kept rendering with old (or, after
+     * glBufferData(NULL), uninitialized) vertex bytes.
+     *
+     * GL semantics: after glUnmapBuffer, the mapped range's contents must be
+     * visible to subsequent GL commands — so copy the mapped range from the
+     * CPU shadow into the shared Metal buffer right here.
+     */
+    if (cpuBase && mtlBase && mtlBase != cpuBase && safeLen > 0) {
+        memcpy(mtlBase + offset, cpuBase + offset, (size_t)safeLen);
+        if (mtl_buffer.storageMode == MTLStorageModeManaged) {
+            [mtl_buffer didModifyRange:NSMakeRange(offset, safeLen)];
+        }
     }
 
     if (!cpuBase && mtl_buffer.storageMode == MTLStorageModeManaged) {
@@ -11766,12 +11795,29 @@ void* CppCreateMGLRendererAndBindToContext (void *glm_ctx)
     _layer.magnificationFilter = kCAFilterNearest;
     _layer.presentsWithTransaction = NO;
 
-    // AGX-safe layer attachment
-    if ([_view layer]) {
+    // AGX-safe layer attachment.
+    // Order matters: enable layer-backing FIRST so AppKit does not later
+    // replace a layer that was assigned while the view was non-layer-backed
+    // (a Metal layer outside the render tree keeps drawables unreturned and
+    // nextDrawable blocks forever).
+    NSLog(@"MGL VIEW: pre-attach view=%p existingLayer=%p metalLayer=%p view.window=%p",
+          _view, [_view layer], _layer, [_view window]);
+    if ([_view layer] == _layer) {
+        // already attached (e.g. retry)
+    } else if ([_view layer]) {
         [[_view layer] addSublayer: _layer];
     } else {
-        [_view setLayer: _layer];
+        [_view setWantsLayer: YES];
+        if ([_view layer] == nil) {
+            [_view setLayer: _layer];
+        } else {
+            // AppKit created a default backing layer when wantsLayer was
+            // enabled; host the Metal layer as a sublayer.
+            [[_view layer] addSublayer: _layer];
+        }
     }
+    NSLog(@"MGL VIEW: post-attach view.layer=%p isMetal=%d layer.superlayer=%p view.wantsLayer=%d",
+          [_view layer], (int)([_view layer] == _layer), _layer.superlayer, (int)[_view wantsLayer]);
     [self mglSyncLayerDrawableSizeFromView:"createRenderer"];
 
     mglDrawBuffer(glm_ctx, GL_FRONT);
@@ -12272,6 +12318,7 @@ void* CppCreateMGLRendererAndBindToContext (void *glm_ctx)
             NSLog(@"MGL AGX: Committing command buffer (status: %ld)", (long)status);
         }
         [commandBuffer commit];
+        _lastCommittedCommandBuffer = commandBuffer;
         if (kMGLVerboseFrameLoopLogs) {
             NSLog(@"MGL AGX: Command buffer committed successfully");
         }

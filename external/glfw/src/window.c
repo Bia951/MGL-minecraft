@@ -215,6 +215,8 @@ GLFWAPI GLFWwindow* glfwCreateWindow(int width, int height,
     window->numer       = GLFW_DONT_CARE;
     window->denom       = GLFW_DONT_CARE;
 
+    window->title = _glfw_strdup(title);
+
     // Open the actual window and create its context
     if (!_glfw.platform.createWindow(window, &wndconfig, &ctxconfig, &fbconfig))
     {
@@ -470,6 +472,12 @@ GLFWAPI void glfwDestroyWindow(GLFWwindow* handle)
 
     _glfw.platform.destroyWindow(window);
 
+    if (window->title)
+    {
+        _glfw_free(window->title);
+        window->title = NULL;
+    }
+
     // Unlink window from global linked list
     {
         _GLFWwindow** prev = &_glfw.windowListHead;
@@ -504,11 +512,138 @@ GLFWAPI void glfwSetWindowShouldClose(GLFWwindow* handle, int value)
 GLFWAPI void glfwSetWindowTitle(GLFWwindow* handle, const char* title)
 {
     _GLFWwindow* window = (_GLFWwindow*) handle;
+    char* titleCopy;
+
     assert(window != NULL);
     assert(title != NULL);
 
     _GLFW_REQUIRE_INIT();
+
+    titleCopy = _glfw_strdup(title);
+    if (titleCopy)
+    {
+        if (window->title)
+            _glfw_free(window->title);
+        window->title = titleCopy;
+    }
+
     _glfw.platform.setWindowTitle(window, title);
+}
+
+GLFWAPI const char* glfwGetWindowTitle(GLFWwindow* handle)
+{
+    _GLFWwindow* window = (_GLFWwindow*) handle;
+
+    assert(window != NULL);
+
+    _GLFW_REQUIRE_INIT_OR_RETURN(NULL);
+    return window->title;
+}
+
+//////////////////////////////////////////////////////////////////////////
+//////                 MGL preedit / IME entry points               //////
+//////////////////////////////////////////////////////////////////////////
+// LWJGL 3.4.1 (GLFW 3.4/3.5 ABI) resolves every function it binds when
+// org.lwjgl.glfw.GLFW$Functions class-initializes; a missing symbol is a
+// hard crash.  MGL does not emit IME preedit events on Cocoa, so these
+// entry points store callbacks and rectangle state but never invoke the
+// callbacks.  glfwGetPreeditCandidate reports an empty candidate.
+
+GLFWAPI GLFWpreeditfun glfwSetPreeditCallback(GLFWwindow* handle,
+                                              GLFWpreeditfun cbfun)
+{
+    _GLFWwindow* window = (_GLFWwindow*) handle;
+    GLFWpreeditfun previous;
+
+    assert(window != NULL);
+
+    _GLFW_REQUIRE_INIT_OR_RETURN(NULL);
+    previous = window->callbacks.preedit;
+    window->callbacks.preedit = cbfun;
+    return previous;
+}
+
+GLFWAPI GLFWpreeditcandidatefun glfwSetPreeditCandidateCallback(GLFWwindow* handle,
+                                                                GLFWpreeditcandidatefun cbfun)
+{
+    _GLFWwindow* window = (_GLFWwindow*) handle;
+    GLFWpreeditcandidatefun previous;
+
+    assert(window != NULL);
+
+    _GLFW_REQUIRE_INIT_OR_RETURN(NULL);
+    previous = window->callbacks.preeditCandidate;
+    window->callbacks.preeditCandidate = cbfun;
+    return previous;
+}
+
+GLFWAPI GLFWimestatusfun glfwSetIMEStatusCallback(GLFWwindow* handle,
+                                                  GLFWimestatusfun cbfun)
+{
+    _GLFWwindow* window = (_GLFWwindow*) handle;
+    GLFWimestatusfun previous;
+
+    assert(window != NULL);
+
+    _GLFW_REQUIRE_INIT_OR_RETURN(NULL);
+    previous = window->callbacks.imeStatus;
+    window->callbacks.imeStatus = cbfun;
+    return previous;
+}
+
+GLFWAPI void glfwSetPreeditCursorRectangle(GLFWwindow* handle,
+                                           int x, int y, int width, int height)
+{
+    _GLFWwindow* window = (_GLFWwindow*) handle;
+
+    assert(window != NULL);
+
+    _GLFW_REQUIRE_INIT();
+    window->preeditRect[0] = x;
+    window->preeditRect[1] = y;
+    window->preeditRect[2] = width;
+    window->preeditRect[3] = height;
+}
+
+GLFWAPI void glfwGetPreeditCursorRectangle(GLFWwindow* handle,
+                                           int* x, int* y, int* width, int* height)
+{
+    _GLFWwindow* window = (_GLFWwindow*) handle;
+
+    assert(window != NULL);
+
+    _GLFW_REQUIRE_INIT();
+    if (x) *x = window->preeditRect[0];
+    if (y) *y = window->preeditRect[1];
+    if (width) *width = window->preeditRect[2];
+    if (height) *height = window->preeditRect[3];
+}
+
+GLFWAPI void glfwResetPreeditText(GLFWwindow* handle)
+{
+    _GLFWwindow* window = (_GLFWwindow*) handle;
+
+    assert(window != NULL);
+
+    _GLFW_REQUIRE_INIT();
+}
+
+GLFWAPI const int* glfwGetPreeditCandidate(GLFWwindow* handle,
+                                           int index,
+                                           int* candidate)
+{
+    _GLFWwindow* window = (_GLFWwindow*) handle;
+
+    assert(window != NULL);
+
+    _GLFW_REQUIRE_INIT_OR_RETURN(NULL);
+    if (candidate)
+    {
+        candidate[0] = 0;
+        candidate[1] = 0;
+    }
+
+    return candidate;
 }
 
 GLFWAPI void glfwSetWindowIcon(GLFWwindow* handle,

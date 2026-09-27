@@ -23,6 +23,7 @@
 
 #include "glm_context.h"
 #include "draw_command.h"
+#include "mgl_trace_log.h"
 
 Sync *newSync(GLMContext ctx)
 {
@@ -99,9 +100,12 @@ void mglDeleteSync(GLMContext ctx, GLsync sync)
      * GL spec, glDeleteSync does not require a GPU wait. Metal retains in-flight
      * command buffers internally, so releasing our reference here is safe and
      * avoids a leak without stalling on GPU completion. */
+    mglTraceLogExternal("MGL TRACE DeleteSync sync=%u cb=%p prior=%p",
+                        sync->name, sync->mtl_command_buffer, sync->mtl_prior_command_buffer);
+
     if (ctx->mtl_funcs.mtlReleaseSync) {
         ctx->mtl_funcs.mtlReleaseSync(ctx, sync);
-    } else if (sync->mtl_command_buffer || sync->mtl_event) {
+    } else if (sync->mtl_command_buffer || sync->mtl_event || sync->mtl_prior_command_buffer) {
         /* Fallback: blocking release if the non-blocking entry is unavailable. */
         ctx->mtl_funcs.mtlWaitForSync(ctx, sync);
     }
@@ -131,12 +135,18 @@ GLenum  mglClientWaitSync(GLMContext ctx, GLsync sync, GLbitfield flags, GLuint6
     if (ctx->mtl_funcs.mtlGetSyncStatus &&
         ctx->mtl_funcs.mtlGetSyncStatus(ctx, sync) == GL_SIGNALED)
     {
+        mglTraceLogExternal("MGL TRACE ClientWaitSync sync=%u timeout=%llu result=ALREADY_SIGNALED cb=%p prior=%p",
+                            sync->name, (unsigned long long)timeout,
+                            sync->mtl_command_buffer, sync->mtl_prior_command_buffer);
         return GL_ALREADY_SIGNALED;
     }
 
     /* timeout == 0 is a non-blocking probe: return immediately without waiting. */
     if (timeout == 0)
     {
+        mglTraceLogExternal("MGL TRACE ClientWaitSync sync=%u timeout=0 result=TIMEOUT_EXPIRED cb=%p prior=%p",
+                            sync->name,
+                            sync->mtl_command_buffer, sync->mtl_prior_command_buffer);
         return GL_TIMEOUT_EXPIRED;
     }
 
@@ -153,6 +163,10 @@ GLenum  mglClientWaitSync(GLMContext ctx, GLsync sync, GLbitfield flags, GLuint6
         {
             if (ctx->mtl_funcs.mtlGetSyncStatus(ctx, sync) == GL_SIGNALED)
             {
+                mglTraceLogExternal("MGL TRACE ClientWaitSync sync=%u timeout=%llu result=CONDITION_SATISFIED pollNs=%llu cb=%p prior=%p",
+                                    sync->name, (unsigned long long)timeout,
+                                    (unsigned long long)elapsed_ns,
+                                    sync->mtl_command_buffer, sync->mtl_prior_command_buffer);
                 return GL_CONDITION_SATISFIED;
             }
 
@@ -167,9 +181,15 @@ GLenum  mglClientWaitSync(GLMContext ctx, GLsync sync, GLbitfield flags, GLuint6
         /* Final check after the timeout has elapsed. */
         if (ctx->mtl_funcs.mtlGetSyncStatus(ctx, sync) == GL_SIGNALED)
         {
+            mglTraceLogExternal("MGL TRACE ClientWaitSync sync=%u timeout=%llu result=CONDITION_SATISFIED final=1 cb=%p prior=%p",
+                                sync->name, (unsigned long long)timeout,
+                                sync->mtl_command_buffer, sync->mtl_prior_command_buffer);
             return GL_CONDITION_SATISFIED;
         }
 
+        mglTraceLogExternal("MGL TRACE ClientWaitSync sync=%u timeout=%llu result=TIMEOUT_EXPIRED cb=%p prior=%p",
+                            sync->name, (unsigned long long)timeout,
+                            sync->mtl_command_buffer, sync->mtl_prior_command_buffer);
         return GL_TIMEOUT_EXPIRED;
     }
 

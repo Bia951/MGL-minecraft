@@ -490,7 +490,16 @@ static void mglUpdateRGB10A2ShadowForClear(GLMContext ctx)
                                                    &attachmentIndex) ||
             attachmentIndex >= MAX_COLOR_ATTACHMENTS) continue;
         Texture *texture = mglStencilAttachmentTexture(&fbo->color_attachments[attachmentIndex]);
-        if (!mglEnsureRGB10A2Shadow(texture)) continue;
+        /*
+         * Render-target color attachments are read back through the Metal
+         * path (see mglReadPixels), and mglInvalidateColorShadowsForDraw
+         * frees the shadow as soon as any draw touches the FBO anyway.
+         * Mirrors the depth-shadow fix: skip the width*height CPU fill for
+         * render targets — it dominated the render thread at 4K and the
+         * churned allocation was freed by the next draw in real games.
+         */
+        if (!texture || texture->is_render_target ||
+            !mglEnsureRGB10A2Shadow(texture)) continue;
 
         GLint x0 = 0, y0 = 0, x1 = (GLint)texture->width, y1 = (GLint)texture->height;
         if (ctx->state.caps.scissor_test) {
@@ -507,13 +516,35 @@ static void mglUpdateRGB10A2ShadowForClear(GLMContext ctx)
             mglClearComponentToByte(ctx->state.color_clear_value[0]),
             mglClearComponentToByte(ctx->state.color_clear_value[3])
         };
-        for (GLint y = y0; y < y1; y++) {
-            for (GLint x = x0; x < x1; x++) {
-                GLubyte *pixel = texture->rgb10a2_shadow + ((size_t)y * texture->width + x) * 4u;
-                if (ctx->state.var.color_writemask[slot][2]) pixel[0] = clear[0];
-                if (ctx->state.var.color_writemask[slot][1]) pixel[1] = clear[1];
-                if (ctx->state.var.color_writemask[slot][0]) pixel[2] = clear[2];
-                if (ctx->state.var.color_writemask[slot][3]) pixel[3] = clear[3];
+        const GLboolean *wm = ctx->state.var.color_writemask[slot];
+        if (wm[0] && wm[1] && wm[2] && wm[3]) {
+            /* Fast path: all channels enabled — fill one row then copy it
+             * (memcpy per row instead of a per-pixel branch loop; a 4K clear
+             * went from ~8M branchy pixel writes to ~2K memcpys). */
+            const size_t stride = (size_t)texture->width * 4u;
+            GLubyte *firstRow = texture->rgb10a2_shadow + (size_t)y0 * stride + (size_t)x0 * 4u;
+            const size_t rowBytes = (size_t)(x1 - x0) * 4u;
+            for (GLint x = 0; x < (x1 - x0); x++) {
+                GLubyte *px = firstRow + (size_t)x * 4u;
+                px[0] = clear[0];
+                px[1] = clear[1];
+                px[2] = clear[2];
+                px[3] = clear[3];
+            }
+            for (GLint y = y0 + 1; y < y1; y++) {
+                memcpy(texture->rgb10a2_shadow + (size_t)y * stride + (size_t)x0 * 4u,
+                       firstRow,
+                       rowBytes);
+            }
+        } else {
+            for (GLint y = y0; y < y1; y++) {
+                for (GLint x = x0; x < x1; x++) {
+                    GLubyte *pixel = texture->rgb10a2_shadow + ((size_t)y * texture->width + x) * 4u;
+                    if (ctx->state.var.color_writemask[slot][2]) pixel[0] = clear[0];
+                    if (ctx->state.var.color_writemask[slot][1]) pixel[1] = clear[1];
+                    if (ctx->state.var.color_writemask[slot][0]) pixel[2] = clear[2];
+                    if (ctx->state.var.color_writemask[slot][3]) pixel[3] = clear[3];
+                }
             }
         }
     }

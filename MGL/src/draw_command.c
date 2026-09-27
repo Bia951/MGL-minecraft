@@ -1790,6 +1790,43 @@ static uint64_t mglTrackPendingBufferMapReads(GLMContext ctx,
     return activeCount;
 }
 
+/* Plain (loose) uniforms live in per-Program Buffer objects.  When a
+ * pipeline is bound, ctx->state.program may be NULL while the pipeline's
+ * stage programs still own plain-uniform buffers that pending deferred
+ * draws read at replay time.  Track those stages too, otherwise a
+ * glUniform* routed to a stage program would not flush the draws that
+ * depend on its previous contents. */
+static void mglTrackPipelinePlainUniformReads(GLMContext ctx, uint64_t *activeCount)
+{
+    if (!ctx || !activeCount) return;
+
+    ProgramPipeline *pipeline = ctx->state.program_pipeline;
+    if (!pipeline && ctx->state.var.program_pipeline_binding != 0u) {
+        pipeline = (ProgramPipeline *)searchHashTable(&ctx->state.program_pipeline_table,
+                                                      ctx->state.var.program_pipeline_binding);
+    }
+    if (!pipeline) return;
+
+    for (int stage = 0; stage < _MAX_SHADER_TYPES; stage++) {
+        Program *program = pipeline->stage_programs[stage];
+        if (!program) continue;
+
+        for (int i = 0; i < MAX_BINDABLE_BUFFERS; i++) {
+            BufferBaseTarget *binding = &program->plain_uniform_buffers[i];
+            if (!binding->buf) continue;
+            (*activeCount)++;
+            if (binding->size > 0 && binding->offset >= 0) {
+                mglTrackPendingReadBytes(ctx,
+                                         binding->buf,
+                                         (uint64_t)binding->offset,
+                                         (uint64_t)binding->size);
+            } else {
+                mglTrackPendingReadWholeBuffer(ctx, binding->buf);
+            }
+        }
+    }
+}
+
 static void mglTrackPendingBaseBufferReads(GLMContext ctx)
 {
     if (!ctx) return;
@@ -1824,6 +1861,7 @@ static void mglTrackPendingBaseBufferReads(GLMContext ctx)
                 }
             }
         }
+        mglTrackPipelinePlainUniformReads(ctx, &activeCount);
 
         MGL_PERF_ADD(g_mglHazardActiveBindingsSinceSwap, activeCount);
         return;
@@ -1870,6 +1908,7 @@ static void mglTrackPendingBaseBufferReads(GLMContext ctx)
             }
         }
     }
+    mglTrackPipelinePlainUniformReads(ctx, &activeCount);
 
     MGL_PERF_ADD(g_mglHazardActiveBindingsSinceSwap, activeCount);
 }
@@ -2167,13 +2206,25 @@ static bool mglPrepareStreamMergeCandidate(GLMContext ctx,
 {
     if (!ctx || !cmd || !out) return false;
     {
-        static bool sStreamMergeDisabled = false;
-        static bool sStreamMergeDisableChecked = false;
-        if (!sStreamMergeDisableChecked) {
-            sStreamMergeDisabled = (getenv("MGL_DISABLE_STREAM_MERGE") != NULL);
-            sStreamMergeDisableChecked = true;
+        /* Stream-merge default OFF: concatenating vertex/index data across
+         * draws rewrites gl_VertexID values and per-draw buffer offsets.
+         * Exact-layout exclusions (kStreamMergeExcludedLayouts) failed to
+         * track mod vertex-format changes (Sodium 0.9.x), letting terrain
+         * merges through and producing misplaced/garbled chunk geometry.
+         * Opt back in explicitly with MGL_ENABLE_STREAM_MERGE=1 once the
+         * merge is structurally sound (see MGL_DISABLE_STREAM_MERGE_EXCLUSIONS
+         * for the old escape hatch). */
+        static bool sStreamMergeEnabled = false;
+        static bool sStreamMergeChecked = false;
+        if (!sStreamMergeChecked) {
+            const char *enable = getenv("MGL_ENABLE_STREAM_MERGE");
+            const char *disable = getenv("MGL_DISABLE_STREAM_MERGE");
+            sStreamMergeEnabled =
+                (enable != NULL && enable[0] != '\0' && strcmp(enable, "0") != 0) &&
+                !(disable != NULL && disable[0] != '\0');
+            sStreamMergeChecked = true;
         }
-        if (sStreamMergeDisabled) return false;
+        if (!sStreamMergeEnabled) return false;
     }
     if (cmd->mode != GL_TRIANGLES || cmd->count <= 0) return false;
     if (cmd->instanceCount != 1 || cmd->baseInstance != 0) return false;

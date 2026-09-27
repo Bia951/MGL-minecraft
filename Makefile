@@ -144,6 +144,7 @@ help:
 		'  make lib              Build the runtime dylibs.' \
 		'  make bench            Build the MGL benchmark.' \
 		'  make test-regression  Build the headless regression suite.' \
+		'  make test-mapped-vertex  Build the mapped VBO and fence regression test.' \
 		'  make clean            Remove local build outputs.'
 
 brew_prefix := $(shell brew --prefix)
@@ -435,6 +436,16 @@ test-regression: $(build_dir)/libmgl.dylib $(build_dir)/libglfw.dylib
 		-framework Metal -framework OpenGL \
 		-o $(build_dir)/test_regression
 	@echo "✅ Regression suite built: $(build_dir)/test_regression"
+
+test-mapped-vertex: $(build_dir)/libmgl.dylib $(build_dir)/libglfw.dylib
+	$(APPLE_CLANG) -O2 -arch $(shell uname -m) -DMGL_GL_CORE \
+		-isysroot $(SDK_ROOT) \
+		-IMGL/include -IMGL/include/GL \
+		-Iexternal/glfw/include -Iexternal/glfw/src \
+		test_regression/mapped_vertex_test.c \
+		-L$(build_dir) -lmgl -lglfw \
+		-framework Foundation -framework Metal -framework Cocoa \
+		-o $(build_dir)/test_mapped_vertex
 
 .PHONY: default help test dbg lib clean insall-pkgdeps test-make bench bench-system test-regression
 

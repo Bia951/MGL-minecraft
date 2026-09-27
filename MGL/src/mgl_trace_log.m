@@ -43,6 +43,7 @@ static pthread_mutex_t g_mglTraceLogMutex = PTHREAD_MUTEX_INITIALIZER;
 
 static BOOL mglTraceEnvFlag(const char *name)
 {
+    mglLoadEnvFileNextToDylibOnce();
     const char *value = name ? getenv(name) : NULL;
     if (!value || value[0] == '\0') {
         return NO;
@@ -57,6 +58,65 @@ static BOOL mglTraceEnvFlag(const char *name)
 }
 
 /* === Core implementation === */
+
+/* Debug env-file injection.
+ *
+ * Launcher env-var delivery to the JVM process proved unreliable (HMCL
+ * instance-game-settings environmentVariables is silently dropped in some
+ * schema versions).  To keep debug flags (MGL_TRACE_LOG, MGL_FORCE_SYNC_STRICT,
+ * ...) controllable without the launcher, this helper reads an optional
+ * "mgl.env" file located next to the loaded dylib and injects each KEY=VALUE
+ * line via setenv() *without* overriding variables already present in the
+ * process environment.  Absent file = zero behavior change.
+ *
+ * INVOKED LAZILY (not via __attribute__((constructor))): other dylib
+ * initializers (ObjC +load et al.) can consume one-shot init before any
+ * constructor runs, which silently disabled the whole mechanism.  Every
+ * env-flag helper calls this first, so ordering no longer matters.
+ */
+void mglLoadEnvFileNextToDylibOnce(void)
+{
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        Dl_info info;
+        if (dladdr((const void *)&mglLoadEnvFileNextToDylibOnce, &info) == 0 ||
+            !info.dli_fname ||
+            info.dli_fname[0] == '\0') {
+            return;
+        }
+
+        char dirPath[PATH_MAX] = {0};
+        snprintf(dirPath, sizeof(dirPath), "%s", info.dli_fname);
+        char *dirName = dirname(dirPath);
+        if (!dirName || dirName[0] == '\0') {
+            return;
+        }
+
+        char envPath[PATH_MAX] = {0};
+        snprintf(envPath, sizeof(envPath), "%s/mgl.env", dirName);
+
+        FILE *f = fopen(envPath, "r");
+        if (!f) {
+            return;
+        }
+
+        char line[512];
+        while (fgets(line, sizeof(line), f)) {
+            char *nl = strpbrk(line, "\r\n");
+            if (nl) {
+                *nl = '\0';
+            }
+            char *eq = strchr(line, '=');
+            if (!eq || eq == line) {
+                continue;
+            }
+            *eq = '\0';
+            /* overwrite=0: the real process environment always wins */
+            setenv(line, eq + 1, 0);
+        }
+        fclose(f);
+    });
+}
 
 BOOL mglTraceEnvFlagEnabled(const char *name)
 {

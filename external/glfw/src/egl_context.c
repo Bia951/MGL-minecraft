@@ -849,3 +849,19 @@ GLFWAPI EGLSurface glfwGetEGLSurface(GLFWwindow* handle)
     return window->context.egl.surface;
 }
 
+// LWJGL 3.4.1 binds glfwGetEGLConfig via GLFWNativeEGL; provide the entry
+// point so the class can initialize even when EGL is not in use.
+GLFWAPI EGLConfig glfwGetEGLConfig(GLFWwindow* handle)
+{
+    _GLFWwindow* window = (_GLFWwindow*) handle;
+    _GLFW_REQUIRE_INIT_OR_RETURN(NULL);
+
+    if (window->context.source != GLFW_EGL_CONTEXT_API)
+    {
+        _glfwInputError(GLFW_NO_WINDOW_CONTEXT, NULL);
+        return NULL;
+    }
+
+    return window->context.egl.config;
+}
+

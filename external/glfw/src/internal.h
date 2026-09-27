@@ -532,6 +532,7 @@ struct _GLFWwindow
     GLFWbool            mousePassthrough;
     GLFWbool            shouldClose;
     void*               userPointer;
+    char*               title;
     GLFWbool            doublebuffer;
     GLFWvidmode         videoMode;
     _GLFWmonitor*       monitor;
@@ -551,6 +552,9 @@ struct _GLFWwindow
     double              virtualCursorPosX, virtualCursorPosY;
     GLFWbool            rawMouseMotion;
 
+    // Last preedit cursor rectangle set via glfwSetPreeditCursorRectangle
+    int                 preeditRect[4];
+
     _GLFWcontext        context;
 
     struct {
@@ -568,9 +572,12 @@ struct _GLFWwindow
         GLFWcursorenterfun        cursorEnter;
         GLFWscrollfun             scroll;
         GLFWkeyfun                key;
-        GLFWcharfun               character;
-        GLFWcharmodsfun           charmods;
-        GLFWdropfun               drop;
+        GLFWcharfun                character;
+        GLFWcharmodsfun            charmods;
+        GLFWdropfun                drop;
+        GLFWpreeditfun             preedit;
+        GLFWpreeditcandidatefun    preeditCandidate;
+        GLFWimestatusfun           imeStatus;
     } callbacks;
 
     // This is defined in platform.h

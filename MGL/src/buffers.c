@@ -824,6 +824,8 @@ void bufferStorage(GLMContext ctx, Buffer *ptr, GLenum target, GLuint index, GLs
 
     /* MGL_SYNC_STRICT: 强制 full flush + commit + waitUntilCompleted，用于排查回归 */
     if (ctx->sync_strict) {
+        mglTraceLogExternal("MGL TRACE SYNC_STRICT BufferSubData buffer=%u off=0 size=0 strict=1",
+                            ptr ? ptr->name : 0u);
         mglFlushCommandBuffer(ctx);
         ctx->mtl_funcs.mtlFlush(ctx, true);
     }
@@ -872,6 +874,17 @@ void bufferStorage(GLMContext ctx, Buffer *ptr, GLenum target, GLuint index, GLs
     ptr->mapped_length = 0;
     ptr->mapped_ptr = NULL;
     ptr->storage_flags = storage_flags;
+
+    if (mglTraceLogIsEnabled()) {
+        mglTraceLogExternal("MGL TRACE BufferStorage buffer=%u size=%lld flags=0x%x persistent=%d coherent=%d clientStorage=%d dynamic=%d",
+                            ptr->name,
+                            (long long)ptr->size,
+                            (unsigned)storage_flags,
+                            (storage_flags & GL_MAP_PERSISTENT_BIT) ? 1 : 0,
+                            (storage_flags & GL_MAP_COHERENT_BIT) ? 1 : 0,
+                            (storage_flags & GL_CLIENT_STORAGE_BIT) ? 1 : 0,
+                            (storage_flags & GL_DYNAMIC_STORAGE_BIT) ? 1 : 0);
+    }
 
     ptr->data.dirty_bits = DIRTY_BUFFER_ADDR;
 
@@ -1002,6 +1015,8 @@ bool clearBufferData(GLMContext ctx, Buffer *ptr, GLenum internalformat, GLintpt
 
     /* MGL_SYNC_STRICT: 强制 full flush + commit + waitUntilCompleted，用于排查回归 */
     if (ctx->sync_strict) {
+        mglTraceLogExternal("MGL TRACE SYNC_STRICT BufferSubData buffer=%u off=0 size=0 strict=1",
+                            ptr ? ptr->name : 0u);
         mglFlushCommandBuffer(ctx);
         ctx->mtl_funcs.mtlFlush(ctx, true);
     }
@@ -1673,6 +1688,8 @@ kern_return_t initBufferData(GLMContext ctx, Buffer *ptr, GLsizeiptr size, const
 
     /* MGL_SYNC_STRICT: 强制 full flush + commit + waitUntilCompleted，用于排查回归 */
     if (ctx->sync_strict) {
+        mglTraceLogExternal("MGL TRACE SYNC_STRICT BufferSubData buffer=%u off=0 size=0 strict=1",
+                            ptr ? ptr->name : 0u);
         mglFlushCommandBuffer(ctx);
         ctx->mtl_funcs.mtlFlush(ctx, true);
     }
@@ -1689,7 +1706,7 @@ kern_return_t initBufferData(GLMContext ctx, Buffer *ptr, GLsizeiptr size, const
                 if (data)
                 {
                     memcpy((void *)ptr->data.buffer_data, data, size);
-                    
+
                     ptr->data.dirty_bits |= DIRTY_BUFFER_DATA;
                     mglBufferMarkWrite(ptr,
                                        kInitBufferDataCopy,
@@ -1702,7 +1719,7 @@ kern_return_t initBufferData(GLMContext ctx, Buffer *ptr, GLsizeiptr size, const
                 {
                     mglBufferMarkAllocatedUninitialized(ptr, kInitBufferDataNull);
                 }
-                
+
                 return 0;
             }
         }
@@ -2009,26 +2026,14 @@ void mglBufferSubData(GLMContext ctx, GLenum target, GLintptr offset, GLsizeiptr
 
     /* MGL_SYNC_STRICT: 强制 full flush + commit + waitUntilCompleted，用于排查回归 */
     if (ctx->sync_strict) {
+        mglTraceLogExternal("MGL TRACE SYNC_STRICT BufferSubData buffer=%u off=0 size=0 strict=1",
+                            ptr ? ptr->name : 0u);
         mglFlushCommandBuffer(ctx);
         ctx->mtl_funcs.mtlFlush(ctx, true);
     }
 
     if (ptr->storage_flags & (GL_CLIENT_STORAGE_BIT | GL_DYNAMIC_STORAGE_BIT))
     {
-        bool trace = mglTraceLogIsEnabled() &&
-                     mglShouldTraceBufferMutation(call, target, size);
-        uint64_t src_hash = 0ull;
-        uint64_t dst_before_hash = 0ull;
-        char src_preview[64];
-        char dst_before_preview[64];
-        src_preview[0] = '\0';
-        dst_before_preview[0] = '\0';
-
-        if (trace) {
-            src_hash = src_hash_for_meta;
-            mglTraceFormatBytes(data, (size_t)size, src_preview, sizeof(src_preview));
-        }
-
         // CRITICAL SECURITY FIX: Proper NULL pointer check with correct type handling
         // buffer_data is vm_address_t (unsigned long), not void*
         if (ptr->data.buffer_data == 0)  // Compare to 0 for vm_address_t
@@ -2044,51 +2049,34 @@ void mglBufferSubData(GLMContext ctx, GLenum target, GLintptr offset, GLsizeiptr
             ERROR_RETURN(GL_INVALID_VALUE);
         }
 
-        if (trace) {
-            const void *dst_before = (const void *)((uintptr_t)ptr->data.buffer_data + (uintptr_t)offset);
-            dst_before_hash = mglTraceHashBytes(dst_before, (size_t)size);
-            mglTraceFormatBytes(dst_before, (size_t)size, dst_before_preview, sizeof(dst_before_preview));
-            mglTraceLogExternal("MGL TRACE BufferSubData.begin call=%" PRIu64 " target=0x%x buffer=%u off=%lld size=%lld srcHash=0x%016" PRIx64 " srcHead=%s dstBeforeHash=0x%016" PRIx64 " dstBeforeHead=%s dirty=0x%x",
-                                call,
-                                target,
-                                ptr->name,
-                                (long long)offset,
-                                (long long)size,
-                                src_hash,
-                                src_preview,
-                                dst_before_hash,
-                                dst_before_preview,
-                                ptr->data.dirty_bits);
-        }
-        
+        /* Route through the original path: write the CPU shadow and push the
+         * range straight into the existing Metal backing.  The dirty-bit
+         * scheme alone is NOT sufficient for CLIENT_STORAGE/DYNAMIC buffers
+         * used as vertex attributes — the attrib/draw path never consumes
+         * DIRTY_BUFFER_DATA (only the uniform base-buffer list does), so any
+         * update left as dirty would silently never reach the GPU (Sodium's
+         * flower/cross-quad mesh corruption).  Mirror the named/DSA path
+         * (mglNamedBufferSubData) which already calls mtlBufferSubData when
+         * a Metal buffer exists. */
         memcpy((char*)ptr->data.buffer_data + offset, data, size);
-        ptr->data.dirty_bits |= DIRTY_BUFFER_DATA;
-        ctx->state.dirty_bits |= DIRTY_BUFFER;
+        if (ptr->data.mtl_data)
+        {
+            if (ctx->mtl_funcs.mtlBufferSubData)
+            {
+                ctx->mtl_funcs.mtlBufferSubData(ctx, ptr, offset, size, data);
+            }
+        }
+        else
+        {
+            ptr->data.dirty_bits |= DIRTY_BUFFER_DATA;
+            ctx->state.dirty_bits |= DIRTY_BUFFER;
+        }
         mglBufferMarkWrite(ptr,
                            kInitBufferSubData,
                            offset,
                            size,
                            data,
                            src_hash_for_meta);
-
-        if (trace) {
-            const void *dst_after = (const void *)((uintptr_t)ptr->data.buffer_data + (uintptr_t)offset);
-            uint64_t dst_after_hash = mglTraceHashBytes(dst_after, (size_t)size);
-            char dst_after_preview[64];
-            dst_after_preview[0] = '\0';
-            mglTraceFormatBytes(dst_after, (size_t)size, dst_after_preview, sizeof(dst_after_preview));
-
-            mglTraceLogExternal("MGL TRACE BufferSubData.end call=%" PRIu64 " target=0x%x buffer=%u off=%lld size=%lld dstAfterHash=0x%016" PRIx64 " dstAfterHead=%s dirty=0x%x stateDirty=0x%x",
-                                call,
-                                target,
-                                ptr->name,
-                                (long long)offset,
-                                (long long)size,
-                                dst_after_hash,
-                                dst_after_preview,
-                                ptr->data.dirty_bits,
-                                ctx->state.dirty_bits);
-        }
     }
     else
     {
@@ -2174,6 +2162,8 @@ void mglNamedBufferSubData(GLMContext ctx, GLuint buffer, GLintptr offset, GLsiz
 
     /* MGL_SYNC_STRICT: 强制 full flush + commit + waitUntilCompleted，用于排查回归 */
     if (ctx->sync_strict) {
+        mglTraceLogExternal("MGL TRACE SYNC_STRICT BufferSubData buffer=%u off=0 size=0 strict=1",
+                            ptr ? ptr->name : 0u);
         mglFlushCommandBuffer(ctx);
         ctx->mtl_funcs.mtlFlush(ctx, true);
     }
@@ -2193,12 +2183,11 @@ void mglNamedBufferSubData(GLMContext ctx, GLuint buffer, GLintptr offset, GLsiz
 
         if (!mgl_range_ok_size_t(offset, size, ptr->data.buffer_size))
         {
-            fprintf(stderr, "MGL Error: mglNamedBufferSubData out of backing store bounds: offset %ld size %ld backing %ld\n",
-                    offset, size, (long)ptr->data.buffer_size);
+            fprintf(stderr, "MGL Error: mglNamedBufferSubData out of backing store bounds: offset %ld size %ld backing %ld\n", offset, size, (long)ptr->data.buffer_size);
             ERROR_RETURN(GL_INVALID_VALUE);
             return;
         }
-        
+
         // copy it to the backing and use processGLState to upload new data
         memcpy((char*)ptr->data.buffer_data + offset, data, size);
         mglBufferMarkWrite(ptr,
@@ -2317,6 +2306,9 @@ void copyBufferSubData(GLMContext ctx, Buffer *src_buf, Buffer *dst_buf, GLintpt
 
     /* MGL_SYNC_STRICT: 强制 full flush + commit + waitUntilCompleted，用于排查回归 */
     if (ctx->sync_strict) {
+        mglTraceLogExternal("MGL TRACE SYNC_STRICT CopyBufferSubData src=%u dst=%u size=0 strict=1",
+                            src_buf ? src_buf->name : 0u,
+                            dst_buf ? dst_buf->name : 0u);
         mglFlushCommandBuffer(ctx);
         ctx->mtl_funcs.mtlFlush(ctx, true);
     }
@@ -2665,6 +2657,18 @@ GLboolean mglUnmapBuffer(GLMContext ctx, GLenum target)
 
     if (persistent_map)
     {
+        /* Publish the mapped range into the Metal backing on unmap.
+         * FLUSH_EXPLICIT clients already flushed sub-ranges (eager in-place
+         * copies in mtlFlushMappedBufferRange), so copying the whole mapped
+         * range again is idempotent; it also covers clients that rely on
+         * unmap (or COHERENT mappings without explicit flushes) to publish
+         * writes.  The dirty-bit fallback alone is not consumed by the
+         * attrib/draw path (see mglBufferSubData note). */
+        if (ctx->mtl_funcs.mtlMapUnmapBuffer)
+        {
+            ctx->mtl_funcs.mtlMapUnmapBuffer(ctx, ptr, unmap_offset, unmap_length, unmap_access, false);
+        }
+
         mglBufferMarkMapWrite(ptr);
 
         // this will cause the buffer to be flushed on next draw command
@@ -2738,7 +2742,11 @@ GLboolean mglUnmapNamedBuffer(GLMContext ctx, GLuint buffer)
         ERROR_RETURN_VALUE(GL_INVALID_OPERATION, GL_FALSE);
     }
 
-    if (!(ptr->storage_flags & GL_MAP_PERSISTENT_BIT) && ctx->mtl_funcs.mtlMapUnmapBuffer)
+    /* Publish the mapped range into the Metal backing on unmap — including
+     * persistent mappings (idempotent with FLUSH_EXPLICIT sub-range copies;
+     * required for clients relying on unmap/COHERENT to publish writes).
+     * See mglUnmapBuffer's persistent branch for rationale. */
+    if (ctx->mtl_funcs.mtlMapUnmapBuffer)
     {
         ctx->mtl_funcs.mtlMapUnmapBuffer(ctx,
                                          ptr,
@@ -2908,6 +2916,14 @@ void *mglMapBufferRange(GLMContext ctx, GLenum target, GLintptr offset, GLsizeip
 
             // return a pointer to the backing data and keep mapped state for flush/unmap semantics
             mapped_ptr = (void *)((uint8_t *)(uintptr_t)ptr->data.buffer_data + (size_t)offset);
+            mglTraceLogExternal("MGL TRACE MapBufferRange.persistent buffer=%u size=%lld off=%lld len=%lld access=0x%x clientStorage=%d ptr=%p",
+                                ptr->name,
+                                (long long)ptr->size,
+                                (long long)offset,
+                                (long long)length,
+                                access_flags,
+                                (ptr->storage_flags & GL_CLIENT_STORAGE_BIT) ? 1 : 0,
+                                mapped_ptr);
             if (trace_map) {
                 fprintf(stderr,
                         "MGL TRACE MapBufferRange.return persistent target=0x%x buffer=%u mappedPtr=%p\n",
@@ -3173,8 +3189,25 @@ void mglFlushMappedBufferRange(GLMContext ctx, GLenum target, GLintptr offset, G
             ERROR_RETURN(GL_INVALID_OPERATION);
             return;
         }
+
+        /* MGL_SYNC_STRICT: commit + waitUntilCompleted BEFORE publishing the
+         * flushed range (see mglFlushMappedNamedBufferRange for rationale). */
+        if (ctx->sync_strict) {
+            mglTraceLogExternal("MGL TRACE SYNC_STRICT FlushMappedRange buffer=%u off=%lld len=%lld",
+                                ptr->name,
+                                (long long)(ptr->mapped_offset + offset),
+                                (long long)length);
+            mglFlushCommandBuffer(ctx);
+            ctx->mtl_funcs.mtlFlush(ctx, true);
+        }
+
         GLintptr absolute_offset = ptr->mapped_offset + offset;
         ctx->mtl_funcs.mtlFlushBufferRange(ctx, ptr, absolute_offset, length);
+        mglTraceLogExternal("MGL TRACE FlushMappedRange buffer=%u off=%lld len=%lld clientStorage=%d",
+                            ptr->name,
+                            (long long)absolute_offset,
+                            (long long)length,
+                            (ptr->storage_flags & GL_CLIENT_STORAGE_BIT) ? 1 : 0);
         mglBufferMarkWrite(ptr, kInitMapWrite, absolute_offset, length,
                            (const uint8_t *)(uintptr_t)ptr->data.buffer_data + absolute_offset,
                            mglTraceHashBytes((const uint8_t *)(uintptr_t)ptr->data.buffer_data + absolute_offset, (size_t)length));
@@ -3233,8 +3266,25 @@ void mglFlushMappedNamedBufferRange(GLMContext ctx, GLuint buffer, GLintptr offs
         return;
     }
 
+    /* MGL_SYNC_STRICT: commit + waitUntilCompleted BEFORE publishing the
+     * flushed range, eliminating any CPU/GPU race on the destination buffer
+     * (decisive diagnostic for chunk-misplacement / pixel-twitch triage). */
+    if (ctx->sync_strict) {
+        mglTraceLogExternal("MGL TRACE SYNC_STRICT FlushMappedNamedRange buffer=%u off=%lld len=%lld",
+                            ptr->name,
+                            (long long)(ptr->mapped_offset + offset),
+                            (long long)length);
+        mglFlushCommandBuffer(ctx);
+        ctx->mtl_funcs.mtlFlush(ctx, true);
+    }
+
     GLintptr absolute_offset = ptr->mapped_offset + offset;
     ctx->mtl_funcs.mtlFlushBufferRange(ctx, ptr, absolute_offset, length);
+    mglTraceLogExternal("MGL TRACE FlushMappedNamedRange buffer=%u off=%lld len=%lld clientStorage=%d",
+                        ptr->name,
+                        (long long)absolute_offset,
+                        (long long)length,
+                        (ptr->storage_flags & GL_CLIENT_STORAGE_BIT) ? 1 : 0);
     mglBufferMarkWrite(ptr, kInitMapWrite, absolute_offset, length,
                        (const uint8_t *)(uintptr_t)ptr->data.buffer_data + absolute_offset,
                        mglTraceHashBytes((const uint8_t *)(uintptr_t)ptr->data.buffer_data + absolute_offset, (size_t)length));

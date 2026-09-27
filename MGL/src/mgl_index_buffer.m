@@ -8,9 +8,75 @@
 
 #import "mgl_index_buffer.h"
 #import "mgl_safety.h"   /* mglPointerRangeIsReadable — in MGL/src/ */
+#import "mgl_byte_hash.h"
 
 #include <stdlib.h>
 #include <string.h>
+
+/* MGL_VERIFY_VBO_STALE: draw-time EBO stale verification (flower/cross-quad
+ * corruption triage). Compares the CPU shadow against the Metal contents for
+ * persistent/client-storage element buffers; bounded log budget. */
+static void mglVerifyElementBufferStale(Buffer *glElementBuffer,
+                                        id<MTLBuffer> metalElementBuffer)
+{
+    static uint32_t mismatchBudget = 96;
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("MGL_VERIFY_VBO_STALE") ? 1 : 0;
+    }
+    if (!enabled || mismatchBudget == 0 ||
+        !glElementBuffer || !metalElementBuffer || !metalElementBuffer.contents) {
+        return;
+    }
+    if (!(glElementBuffer->storage_flags & (GL_CLIENT_STORAGE_BIT | GL_MAP_PERSISTENT_BIT))) {
+        return;
+    }
+
+    const uint8_t *cpuBase = (const uint8_t *)(uintptr_t)glElementBuffer->data.buffer_data;
+    const uint8_t *mtlBase = (const uint8_t *)metalElementBuffer.contents;
+    size_t cmpLen = (size_t)metalElementBuffer.length;
+    if (glElementBuffer->size > 0 && (size_t)glElementBuffer->size < cmpLen) {
+        cmpLen = (size_t)glElementBuffer->size;
+    }
+    if (glElementBuffer->data.buffer_size > 0 && (size_t)glElementBuffer->data.buffer_size < cmpLen) {
+        cmpLen = (size_t)glElementBuffer->data.buffer_size;
+    }
+    if (!cpuBase || (uintptr_t)cpuBase < 0x1000u || cmpLen == 0 || cpuBase == mtlBase) {
+        return;
+    }
+
+    uint64_t cpuHash = mglTraceHashBytes(cpuBase, cmpLen);
+    uint64_t mtlHash = mglTraceHashBytes(mtlBase, cmpLen);
+    if (cpuHash == mtlHash) {
+        return;
+    }
+
+    mismatchBudget--;
+    size_t firstDiff = (size_t)-1;
+    size_t diffCount = 0;
+    for (size_t i = 0; i < cmpLen; i++) {
+        if (cpuBase[i] != mtlBase[i]) {
+            if (firstDiff == (size_t)-1) {
+                firstDiff = i;
+            }
+            diffCount++;
+            if (diffCount >= 16) {
+                break;
+            }
+        }
+    }
+
+    NSLog(@"MGL VERIFY EBO-STALE buffer=%u size=%ld cmpLen=%zu firstDiff=%zu diffCount16+=%zu cpuHash=0x%016llx mtlHash=0x%016llx storage=0x%x dirty=0x%x",
+          glElementBuffer->name,
+          (long)glElementBuffer->size,
+          cmpLen,
+          firstDiff,
+          diffCount,
+          (unsigned long long)cpuHash,
+          (unsigned long long)mtlHash,
+          glElementBuffer->storage_flags,
+          glElementBuffer->data.dirty_bits);
+}
 
 id<MTLBuffer> mglNewTriangleFanArrayIndexBuffer(id<MTLDevice> device,
                                                 NSUInteger vertexCount,
@@ -617,6 +683,8 @@ id<MTLBuffer> mglPreparedElementIndexBuffer(id<MTLDevice> device,
         }
     }
     if (glIndexType != GL_UNSIGNED_BYTE) {
+        /* MGL_VERIFY_VBO_STALE: verify the element buffer GPU contents before draw */
+        mglVerifyElementBufferStale(glElementBuffer, metalElementBuffer);
         return metalElementBuffer;
     }
 

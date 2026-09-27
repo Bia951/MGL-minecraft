@@ -278,23 +278,26 @@ static bool mglGeometryShaderIsPassthrough(const Shader *shader)
             return;
         }
 
-        id<MTLBuffer> buffer = [_device newBufferWithBytesNoCopy:(void *)(ptr->data.buffer_data)
-                                                           length:ptr->size
-                                                          options:options
-                                                      deallocator:^(void *pointer, NSUInteger length)
-                              {
-                                  kern_return_t err;
-                                  err = vm_deallocate((vm_map_t) mach_task_self(),
-                                                      (vm_address_t) pointer,
-                                                      length);
-                                  if (err != 0) {
-                                      NSLog(@"MGL WARNING: vm_deallocate failed for Metal no-copy buffer err=%d ptr=%p len=%lu",
-                                            err,
-                                            pointer,
-                                            (unsigned long)length);
-                                  }
-                              }];
+        /*
+         * CLIENT_STORAGE buffers (Sodium 16MB streaming VBO, etc.) must NOT
+         * wrap the CPU VM allocation with newBufferWithBytesNoCopy — deferred
+         * draws race with persistent-map CPU writes (chunk misplacement,
+         * cross-quad pixel twitching).  Create a private Metal buffer and
+         * copy the initial data; subsequent flush-range and dirty-bit updates
+         * mirror CPU writes into this private backing via
+         * mglSnapshotSharedBufferRange / mglSnapshotSharedDirtyBuffer.
+         * The CPU memory is managed by MGL's buffer management code
+         * (vm_deallocate in deleteBuffer), not by the Metal buffer.
+         */
+        id<MTLBuffer> buffer = [_device newBufferWithLength:ptr->size options:options];
+        if (!buffer) {
+            NSLog(@"MGL ERROR: Failed to create private Metal buffer for CLIENT_STORAGE buffer %u (size=%zu)",
+                  ptr->name, (size_t)ptr->size);
+            ptr->data.mtl_data = NULL;
+            return;
+        }
 
+        memcpy(buffer.contents, (void *)(uintptr_t)ptr->data.buffer_data, ptr->size);
         ptr->data.mtl_data = (void *)CFBridgingRetain(buffer);
     }
     else
@@ -1487,9 +1490,10 @@ static bool mglGeometryShaderIsPassthrough(const Shader *shader)
         state->framebuffer == NULL &&
         !state->caps.depth_test &&
         [self getProgramBindingCount:_FRAGMENT_SHADER type:SPVC_RESOURCE_TYPE_SAMPLED_IMAGE] > 0;
-    BOOL rtSampledCopyDraw = _currentDrawUsesRTSampledCopy;
-
-    if (state->caps.cull_face && !defaultFramebufferSampledPass && !rtSampledCopyDraw)
+    /* Sampling a render-target copy does not change GL culling. The terrain
+     * atlas uses such a copy, and cutout plant quads still need back-face
+     * culling to avoid drawing coincident front and back faces. */
+    if (state->caps.cull_face && !defaultFramebufferSampledPass)
     {
         MTLCullMode cull_mode;
 
@@ -1535,24 +1539,6 @@ static bool mglGeometryShaderIsPassthrough(const Shader *shader)
                       (unsigned long long)hit,
                       (unsigned)(ctx ? state->program_name : 0u),
                       (unsigned)(ctx ? state->draw_buffer : 0u));
-            }
-        }
-        if (state->caps.cull_face && rtSampledCopyDraw) {
-            static uint64_t s_rtSampledCopyCullBypassCount = 0;
-            uint64_t hit = ++s_rtSampledCopyCullBypassCount;
-            if (hit <= 64ull || (hit % 256ull) == 0ull) {
-                mglTraceLog("RT_SAMPLE_COPY_CULL_BYPASS hit=%llu program=%u pipelineProgram=%u fbo=%u rpFbo=%u depth(test=%d write=%d func=0x%x) blend=%d cullFace=0x%x frontFace=0x%x",
-                            (unsigned long long)hit,
-                            (unsigned)(ctx ? mglCurrentRenderProgramKey(ctx) : 0u),
-                            (unsigned)_pipelineProgramName,
-                            (unsigned)(ctx ? mglRendererSafeFramebufferName(ctx) : 0u),
-                            (unsigned)_renderPassFramebufferName,
-                            (ctx && state->caps.depth_test) ? 1 : 0,
-                            (ctx && state->var.depth_writemask) ? 1 : 0,
-                            (unsigned)(ctx ? state->var.depth_func : 0u),
-                            (ctx && state->caps.blend) ? 1 : 0,
-                            (unsigned)(ctx ? state->var.cull_face_mode : 0u),
-                            (unsigned)(ctx ? state->var.front_face : 0u));
             }
         }
     }
@@ -2805,11 +2791,20 @@ static bool mglGeometryShaderIsPassthrough(const Shader *shader)
                 _renderPassDescriptor.renderTargetHeight == 0 ||
                 _renderPassDescriptor.renderTargetWidth > texWidth ||
                 _renderPassDescriptor.renderTargetHeight > texHeight) {
-                NSLog(@"MGL INFO: Normalizing renderTarget size from %lux%lu to %lux%lu",
-                      (unsigned long)_renderPassDescriptor.renderTargetWidth,
-                      (unsigned long)_renderPassDescriptor.renderTargetHeight,
-                      (unsigned long)texWidth,
-                      (unsigned long)texHeight);
+                /* Hot path: fires on nearly every encoder creation because the
+                 * descriptor defaults to 0x0. An unconditional NSLog here used to
+                 * emit one line per frame (60+/s), which floods launcher
+                 * console pipes (HMCL) and can back-pressure the render thread
+                 * into a full stall. Rate-limit: first 8 hits only. */
+                static uint32_t s_normalizeLogBudget = 8;
+                if (s_normalizeLogBudget > 0) {
+                    s_normalizeLogBudget--;
+                    NSLog(@"MGL INFO: Normalizing renderTarget size from %lux%lu to %lux%lu",
+                          (unsigned long)_renderPassDescriptor.renderTargetWidth,
+                          (unsigned long)_renderPassDescriptor.renderTargetHeight,
+                          (unsigned long)texWidth,
+                          (unsigned long)texHeight);
+                }
                 _renderPassDescriptor.renderTargetWidth = texWidth;
                 _renderPassDescriptor.renderTargetHeight = texHeight;
             }

@@ -5,6 +5,79 @@
 #import "MGLRenderer+ArgumentBuffer_Private.h"
 #import "MGLRenderer+Draw_Private.h"
 #import "mgl_frame_activity.h"
+#import "mgl_byte_hash.h"
+
+/* MGL_VERIFY_VBO_STALE: draw-time CPU-shadow vs Metal-contents verification
+ * for persistent/client-storage buffers (flower/cross-quad corruption triage).
+ * Logs hash mismatches with a bounded budget to avoid log storms. */
+static BOOL mglVerifyVboStaleEnabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("MGL_VERIFY_VBO_STALE") ? 1 : 0;
+    }
+    return enabled ? YES : NO;
+}
+
+static void mglVerifyBufferStale(Buffer *glBuffer,
+                                 id<MTLBuffer> metalBuffer,
+                                 const char *kind)
+{
+    static uint32_t mismatchBudget = 96;
+    if (!mglVerifyVboStaleEnabled() || mismatchBudget == 0 ||
+        !glBuffer || !metalBuffer || !metalBuffer.contents) {
+        return;
+    }
+
+    const uint8_t *cpuBase = (const uint8_t *)(uintptr_t)glBuffer->data.buffer_data;
+    const uint8_t *mtlBase = (const uint8_t *)metalBuffer.contents;
+    size_t cmpLen = (size_t)metalBuffer.length;
+    if (glBuffer->size > 0 && (size_t)glBuffer->size < cmpLen) {
+        cmpLen = (size_t)glBuffer->size;
+    }
+    if (glBuffer->data.buffer_size > 0 && (size_t)glBuffer->data.buffer_size < cmpLen) {
+        cmpLen = (size_t)glBuffer->data.buffer_size;
+    }
+    if (cmpLen > (4u * 1024u * 1024u)) {
+        cmpLen = 4u * 1024u * 1024u;
+    }
+    if (!cpuBase || (uintptr_t)cpuBase < 0x1000u || cmpLen == 0 || cpuBase == mtlBase) {
+        return;
+    }
+
+    uint64_t cpuHash = mglTraceHashBytes(cpuBase, cmpLen);
+    uint64_t mtlHash = mglTraceHashBytes(mtlBase, cmpLen);
+    if (cpuHash == mtlHash) {
+        return;
+    }
+
+    mismatchBudget--;
+    size_t firstDiff = (size_t)-1;
+    size_t diffCount = 0;
+    for (size_t i = 0; i < cmpLen; i++) {
+        if (cpuBase[i] != mtlBase[i]) {
+            if (firstDiff == (size_t)-1) {
+                firstDiff = i;
+            }
+            diffCount++;
+            if (diffCount >= 16 && firstDiff != (size_t)-1) {
+                break;
+            }
+        }
+    }
+
+    NSLog(@"MGL VERIFY %s-STALE buffer=%u size=%ld cmpLen=%zu firstDiff=%zu diffCount16+=%zu cpuHash=0x%016llx mtlHash=0x%016llx storage=0x%x dirty=0x%x",
+          kind,
+          glBuffer->name,
+          (long)glBuffer->size,
+          cmpLen,
+          firstDiff,
+          diffCount,
+          (unsigned long long)cpuHash,
+          (unsigned long long)mtlHash,
+          glBuffer->storage_flags,
+          glBuffer->data.dirty_bits);
+}
 
 /* === Static C helpers used only by Draw methods === */
 
@@ -995,6 +1068,11 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
             NSLog(@"MGL VBIND skip attrib=%u buffer=%u: Metal bridge failed",
                   attrib, attribBuffer->name);
             continue;
+        }
+
+        /* MGL_VERIFY_VBO_STALE: detect stale GPU-side VBO contents at draw time */
+        if (attribBuffer->storage_flags & (GL_CLIENT_STORAGE_BIT | GL_MAP_PERSISTENT_BIT)) {
+            mglVerifyBufferStale(attribBuffer, attribMetalBuffer, "VBO");
         }
 
         NSUInteger attribBindingOffset = (NSUInteger)resolved.binding_offset;

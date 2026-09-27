@@ -1125,6 +1125,7 @@ extern "C" {
 #define GLFW_STICKY_MOUSE_BUTTONS   0x00033003
 #define GLFW_LOCK_KEY_MODS          0x00033004
 #define GLFW_RAW_MOUSE_MOTION       0x00033005
+#define GLFW_IME                    0x00033007
 
 #define GLFW_CURSOR_NORMAL          0x00034001
 #define GLFW_CURSOR_HIDDEN          0x00034002
@@ -1901,6 +1902,30 @@ typedef void (* GLFWcharmodsfun)(GLFWwindow* window, unsigned int codepoint, int
  *  @ingroup input
  */
 typedef void (* GLFWdropfun)(GLFWwindow* window, int path_count, const char* paths[]);
+
+/*! @brief The function pointer type for preedit text callbacks.
+ *
+ *  This is the function pointer type for preedit text callbacks.
+ *
+ *  @ingroup input
+ */
+typedef void (* GLFWpreeditfun)(GLFWwindow* window, int composing, const char* text, int start, int end);
+
+/*! @brief The function pointer type for preedit candidate callbacks.
+ *
+ *  This is the function pointer type for preedit candidate callbacks.
+ *
+ *  @ingroup input
+ */
+typedef void (* GLFWpreeditcandidatefun)(GLFWwindow* window, int count, int selected, int index);
+
+/*! @brief The function pointer type for IME status callbacks.
+ *
+ *  This is the function pointer type for IME status callbacks.
+ *
+ *  @ingroup input
+ */
+typedef void (* GLFWimestatusfun)(GLFWwindow* window, int enabled);
 
 /*! @brief The function pointer type for monitor configuration callbacks.
  *
@@ -3235,6 +3260,58 @@ GLFWAPI void glfwSetWindowShouldClose(GLFWwindow* window, int value);
  *  @ingroup window
  */
 GLFWAPI void glfwSetWindowTitle(GLFWwindow* window, const char* title);
+
+/*! @brief Returns the title of the specified window.
+ *
+ *  @param[in] window The window to query.
+ *
+ *  @return The UTF-8 encoded window title.
+ *
+ *  @ingroup window
+ */
+GLFWAPI const char* glfwGetWindowTitle(GLFWwindow* window);
+
+/*! @brief Sets the preedit text callback.
+ *
+ *  @ingroup input
+ */
+GLFWAPI GLFWpreeditfun glfwSetPreeditCallback(GLFWwindow* window, GLFWpreeditfun callback);
+
+/*! @brief Sets the preedit candidate callback.
+ *
+ *  @ingroup input
+ */
+GLFWAPI GLFWpreeditcandidatefun glfwSetPreeditCandidateCallback(GLFWwindow* window, GLFWpreeditcandidatefun callback);
+
+/*! @brief Sets the IME status callback.
+ *
+ *  @ingroup input
+ */
+GLFWAPI GLFWimestatusfun glfwSetIMEStatusCallback(GLFWwindow* window, GLFWimestatusfun callback);
+
+/*! @brief Sets the preedit cursor rectangle.
+ *
+ *  @ingroup input
+ */
+GLFWAPI void glfwSetPreeditCursorRectangle(GLFWwindow* window, int x, int y, int width, int height);
+
+/*! @brief Retrieves the preedit cursor rectangle.
+ *
+ *  @ingroup input
+ */
+GLFWAPI void glfwGetPreeditCursorRectangle(GLFWwindow* window, int* x, int* y, int* width, int* height);
+
+/*! @brief Resets the preedit text.
+ *
+ *  @ingroup input
+ */
+GLFWAPI void glfwResetPreeditText(GLFWwindow* window);
+
+/*! @brief Retrieves a preedit candidate.
+ *
+ *  @ingroup input
+ */
+GLFWAPI const int* glfwGetPreeditCandidate(GLFWwindow* window, int index, int* candidate);
 
 /*! @brief Sets the icon for the specified window.
  *
