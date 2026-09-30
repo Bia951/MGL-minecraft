@@ -959,169 +959,79 @@ char *mglAppendArrayZeroSuffix(const char *name, unsigned num_dims)
  * - Array: alignment = element alignment
  * - Struct: max of member alignments
  */
+static GLuint mglMetalScalarSize(spvc_type type)
+{
+    /* SPIRV-Cross emits boolean struct members as short/shortN. */
+    if (spvc_type_get_basetype(type) == SPVC_BASETYPE_BOOLEAN) return 2;
+    unsigned bits = spvc_type_get_bit_width(type);
+    return bits ? bits / 8u : 4u;
+}
+
+/* UniformConstant structs use native MSL layout. Buffer blocks with explicit
+ * SPIR-V offsets retain those offsets, including packed vectors emitted by
+ * SPIRV-Cross. A vec3 occupies a padded vector, also inside a matrix or array. */
 GLuint mglMetalTypeAlignmentFromSPVC(spvc_compiler compiler, spvc_type type)
 {
-    if (!type) {
-        return 16;
-    }
-
-    spvc_basetype base = spvc_type_get_basetype(type);
-    unsigned bit_width = spvc_type_get_bit_width(type);
-    unsigned vec_size = spvc_type_get_vector_size(type);
-    unsigned columns = spvc_type_get_columns(type);
-    unsigned array_dims = spvc_type_get_num_array_dimensions(type);
-
-    /* For arrays, alignment = element alignment (resolve to base type) */
-    if (array_dims > 0) {
-        spvc_type_id elem_type_id = spvc_type_get_base_type_id(type);
-        spvc_type elem_type = elem_type_id
-            ? spvc_compiler_get_type_handle(compiler, elem_type_id) : NULL;
-        return mglMetalTypeAlignmentFromSPVC(compiler, elem_type);
-    }
-
-    /* For structs, alignment = max of member alignments */
-    if (base == SPVC_BASETYPE_STRUCT) {
-        unsigned member_count = spvc_type_get_num_member_types(type);
-        GLuint max_align = 4;
-        for (unsigned i = 0; i < member_count; i++) {
-            spvc_type_id mt_id = spvc_type_get_member_type(type, i);
-            spvc_type mt = spvc_compiler_get_type_handle(compiler, mt_id);
-            GLuint align = mglMetalTypeAlignmentFromSPVC(compiler, mt);
-            if (align > max_align) {
-                max_align = align;
-            }
+    if (!type) return 0;
+    if (spvc_type_get_basetype(type) == SPVC_BASETYPE_STRUCT) {
+        GLuint alignment = 1;
+        for (unsigned i = 0; i < spvc_type_get_num_member_types(type); i++) {
+            spvc_type member = spvc_compiler_get_type_handle(
+                compiler, spvc_type_get_member_type(type, i));
+            GLuint member_alignment = mglMetalTypeAlignmentFromSPVC(compiler, member);
+            if (member_alignment > alignment) alignment = member_alignment;
         }
-        return max_align;
+        return alignment;
     }
-
-    /* For matrices, alignment = column vector alignment */
-    if (columns > 1) {
-        /* Matrix: columns of vectors. Alignment = vector alignment. */
-        if (vec_size == 2) return 8;
-        return 16; /* vec3 and vec4 both align to 16 */
-    }
-
-    /* Scalar and vector types */
-    GLuint base_align = (bit_width == 64) ? 8 : 4;
-
-    if (vec_size == 1) {
-        return base_align; /* scalar */
-    } else if (vec_size == 2) {
-        return 8; /* 2-component vector */
-    } else {
-        return 16; /* 3 and 4-component vectors align to 16 */
-    }
+    unsigned width = spvc_type_get_vector_size(type);
+    return mglMetalScalarSize(type) * (width == 3 ? 4 : (width ? width : 1));
 }
 
-/* Compute MSL struct member offset by iterating over preceding members.
- * Used for plain struct uniforms (UniformConstant storage class) which
- * don't have Offset decorations in SPIR-V.  The offset follows C struct
- * layout rules: each member is placed at the next offset aligned to its
- * type alignment. */
-GLuint mglComputeMSLStructMemberOffset(spvc_compiler compiler,
-                                               spvc_type struct_type,
-                                               unsigned member_index)
+static GLuint mglMetalTypeSizeFromSPVC(spvc_compiler compiler, spvc_type type)
 {
-    if (!struct_type || member_index == 0) {
-        return 0;
+    if (!type) return 0;
+    GLuint size;
+    if (spvc_type_get_basetype(type) == SPVC_BASETYPE_STRUCT) {
+        size = mglComputeMSLStructSize(compiler, type);
+    } else {
+        unsigned columns = spvc_type_get_columns(type);
+        size = mglMetalTypeAlignmentFromSPVC(compiler, type) * (columns ? columns : 1);
     }
-
-    GLuint running = 0;
-    unsigned member_count = spvc_type_get_num_member_types(struct_type);
-
-    for (unsigned i = 0; i < member_index && i < member_count; i++) {
-        spvc_type_id mt_id = spvc_type_get_member_type(struct_type, i);
-        spvc_type mt = spvc_compiler_get_type_handle(compiler, mt_id);
-        if (!mt) {
-            continue;
-        }
-
-        GLuint align = mglMetalTypeAlignmentFromSPVC(compiler, mt);
-        if (align == 0) align = 4;
-
-        /* Align running to member alignment */
-        running = (running + align - 1) & ~(align - 1);
-
-        /* Get member size */
-        size_t member_size = 0;
-        if (spvc_compiler_get_declared_struct_member_size(
-                compiler, struct_type, i, &member_size) != SPVC_SUCCESS || member_size == 0) {
-            /* Fallback: estimate from type */
-            unsigned bit_width = spvc_type_get_bit_width(mt);
-            unsigned vec_size = spvc_type_get_vector_size(mt);
-            unsigned columns = spvc_type_get_columns(mt);
-            unsigned array_dims = spvc_type_get_num_array_dimensions(mt);
-            GLuint elem_size = (bit_width == 64) ? 8 : 4;
-            if (vec_size > 1) elem_size *= vec_size;
-            if (columns > 1) elem_size *= columns;
-            GLuint array_size = 1;
-            if (array_dims > 0) {
-                for (unsigned d = 0; d < array_dims; d++) {
-                    array_size *= (GLuint)spvc_type_get_array_dimension(mt, d);
-                }
-            }
-            member_size = elem_size * array_size;
-        }
-
-        running += (GLuint)member_size;
+    for (unsigned d = 0; d < spvc_type_get_num_array_dimensions(type); d++) {
+        GLuint count = (GLuint)spvc_type_get_array_dimension(type, d);
+        if (!count || size > UINT32_MAX / count) return 0;
+        size *= count;
     }
-
-    /* Align to this member's alignment */
-    spvc_type_id mt_id = spvc_type_get_member_type(struct_type, member_index);
-    spvc_type mt = spvc_compiler_get_type_handle(compiler, mt_id);
-    GLuint align = mt ? mglMetalTypeAlignmentFromSPVC(compiler, mt) : 16;
-    if (align == 0) align = 4;
-    running = (running + align - 1) & ~(align - 1);
-
-    return running;
+    return size;
 }
 
-/* Compute the total MSL struct size using Metal/C alignment rules.
- * The struct size = (offset after last member) padded to struct alignment. */
+GLuint mglComputeMSLStructMemberOffset(spvc_compiler compiler,
+                                      spvc_type struct_type, unsigned member_index)
+{
+    GLuint offset = 0;
+    for (unsigned i = 0; i <= member_index; i++) {
+        spvc_type member = spvc_compiler_get_type_handle(
+            compiler, spvc_type_get_member_type(struct_type, i));
+        GLuint alignment = mglMetalTypeAlignmentFromSPVC(compiler, member);
+        if (!alignment) return 0;
+        offset = (offset + alignment - 1) & ~(alignment - 1);
+        if (i == member_index) return offset;
+        offset += mglMetalTypeSizeFromSPVC(compiler, member);
+    }
+    return offset;
+}
+
 GLuint mglComputeMSLStructSize(spvc_compiler compiler, spvc_type struct_type)
 {
     if (!struct_type) return 0;
-    unsigned member_count = spvc_type_get_num_member_types(struct_type);
-    if (member_count == 0) return 0;
-
-    GLuint running = 0;
-    GLuint max_align = 4;
-
-    for (unsigned i = 0; i < member_count; i++) {
-        spvc_type_id mt_id = spvc_type_get_member_type(struct_type, i);
-        spvc_type mt = spvc_compiler_get_type_handle(compiler, mt_id);
-        if (!mt) continue;
-
-        GLuint align = mglMetalTypeAlignmentFromSPVC(compiler, mt);
-        if (align == 0) align = 4;
-        if (align > max_align) max_align = align;
-
-        running = (running + align - 1) & ~(align - 1);
-
-        size_t member_size = 0;
-        if (spvc_compiler_get_declared_struct_member_size(
-                compiler, struct_type, i, &member_size) != SPVC_SUCCESS || member_size == 0) {
-            unsigned bit_width = spvc_type_get_bit_width(mt);
-            unsigned vec_size = spvc_type_get_vector_size(mt);
-            unsigned columns = spvc_type_get_columns(mt);
-            unsigned array_dims = spvc_type_get_num_array_dimensions(mt);
-            GLuint elem_size = (bit_width == 64) ? 8 : 4;
-            if (vec_size > 1) elem_size *= vec_size;
-            if (columns > 1) elem_size *= columns;
-            GLuint array_size = 1;
-            if (array_dims > 0) {
-                for (unsigned d = 0; d < array_dims; d++) {
-                    array_size *= (GLuint)spvc_type_get_array_dimension(mt, d);
-                }
-            }
-            member_size = elem_size * array_size;
-        }
-        running += (GLuint)member_size;
-    }
-
-    /* Pad struct size to max member alignment */
-    running = (running + max_align - 1) & ~(max_align - 1);
-    return running;
+    unsigned count = spvc_type_get_num_member_types(struct_type);
+    if (!count) return 0;
+    spvc_type last = spvc_compiler_get_type_handle(
+        compiler, spvc_type_get_member_type(struct_type, count - 1));
+    GLuint size = mglComputeMSLStructMemberOffset(compiler, struct_type, count - 1) +
+                  mglMetalTypeSizeFromSPVC(compiler, last);
+    GLuint alignment = mglMetalTypeAlignmentFromSPVC(compiler, struct_type);
+    return (size + alignment - 1) & ~(alignment - 1);
 }
 
 GLboolean mglSpvcStructMemberOffset(spvc_compiler compiler,
@@ -1138,7 +1048,7 @@ GLboolean mglSpvcStructMemberOffset(spvc_compiler compiler,
     }
     value = spvc_compiler_get_member_decoration(
         compiler, struct_type_id, member_index, SpvDecorationOffset);
-    if (value > 0) {
+    if (spvc_compiler_has_member_decoration(compiler, struct_type_id, member_index, SpvDecorationOffset)) {
         *out = value;
         return GL_TRUE;
     }
@@ -1159,8 +1069,15 @@ GLint mglSpvcStructMemberMatrixStride(spvc_compiler compiler,
             compiler, struct_type, member_index, &value) == SPVC_SUCCESS) {
         return (GLint)value;
     }
-    return (GLint)spvc_compiler_get_member_decoration(
-        compiler, struct_type_id, member_index, SpvDecorationMatrixStride);
+    if (spvc_compiler_has_member_decoration(compiler, struct_type_id, member_index,
+                                           SpvDecorationMatrixStride)) {
+        return (GLint)spvc_compiler_get_member_decoration(
+            compiler, struct_type_id, member_index, SpvDecorationMatrixStride);
+    }
+    spvc_type member = spvc_compiler_get_type_handle(
+        compiler, spvc_type_get_member_type(struct_type, member_index));
+    return member && spvc_type_get_columns(member) > 1
+        ? (GLint)mglMetalTypeAlignmentFromSPVC(compiler, member) : 0;
 }
 
 GLint mglSpvcStructMemberArrayStride(spvc_compiler compiler,
@@ -1173,8 +1090,17 @@ GLint mglSpvcStructMemberArrayStride(spvc_compiler compiler,
             compiler, struct_type, member_index, &value) == SPVC_SUCCESS) {
         return (GLint)value;
     }
-    return (GLint)spvc_compiler_get_member_decoration(
-        compiler, struct_type_id, member_index, SpvDecorationArrayStride);
+    if (spvc_compiler_has_member_decoration(compiler, struct_type_id, member_index,
+                                           SpvDecorationArrayStride)) {
+        return (GLint)spvc_compiler_get_member_decoration(
+            compiler, struct_type_id, member_index, SpvDecorationArrayStride);
+    }
+    spvc_type member = spvc_compiler_get_type_handle(
+        compiler, spvc_type_get_member_type(struct_type, member_index));
+    unsigned dims = member ? spvc_type_get_num_array_dimensions(member) : 0;
+    if (!dims) return 0;
+    GLuint count = (GLuint)spvc_type_get_array_dimension(member, dims - 1);
+    return count ? (GLint)(mglMetalTypeSizeFromSPVC(compiler, member) / count) : 0;
 }
 
 GLint mglGLTypeLocationCount(GLuint gl_type, GLint array_size)
@@ -2507,8 +2433,11 @@ static bool mglIsSynthesizedLooseUniformStruct(const SpirvResource *res)
 static const char *mglLooseUniformLeafName(const SpirvUBOMember *member)
 {
     const char *name = member->query_name ? member->query_name : member->name;
-    const char *dot = name ? strrchr(name, '.') : NULL;
-    return dot ? dot + 1 : name;
+    if (name && strncmp(name, "_mgl_loose_", 11) == 0) {
+        const char *dot = strchr(name, '.');
+        return dot ? dot + 1 : name;
+    }
+    return name;
 }
 
 static void mglUnifySynthesizedLooseUniformLocations(Program *program)
@@ -2556,22 +2485,36 @@ static void mglUnifySynthesizedLooseUniformLocations(Program *program)
     }
     if (!found || count == 0) return;
 
-    GLint total = 0;
-    for (size_t i = 0; i < count; i++) {
-        offsets[i] = total;
-        total += sizes[i];
-    }
-    if (total > MAX_BINDABLE_BUFFERS) return;
-
-    GLint base = -1;
-    for (GLint candidate = 0; candidate <= MAX_BINDABLE_BUFFERS - total; candidate++) {
-        bool freeRange = true;
-        for (GLint loc = candidate; loc < candidate + total; loc++) {
-            if (occupied[loc]) { freeRange = false; break; }
+    /* The synthesized parent has no public GL identity. Its leaf locations
+     * belong to the linked program namespace, including uniforms that stayed
+     * independent in another stage. Keep those existing locations and allocate
+     * contiguous spans for each remaining array. */
+    for (size_t index = 0; index < count; index++) {
+        offsets[index] = -1;
+        for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++) {
+            SpirvResourceList *resources =
+                &program->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT];
+            for (GLuint i = 0; resources->list && i < resources->count; i++) {
+                SpirvResource *res = &resources->list[i];
+                if (mglIsSynthesizedLooseUniformStruct(res) || !res->name ||
+                    mglProgramResourceLooksSamplerLike(res, SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT))
+                    continue;
+                if (strcmp(res->name, names[index]) == 0) offsets[index] = res->uniform_location;
+            }
         }
-        if (freeRange) { base = candidate; break; }
+        if (offsets[index] >= 0) continue;
+        for (GLint candidate = 0; candidate <= MAX_BINDABLE_BUFFERS - sizes[index]; candidate++) {
+            bool freeRange = true;
+            for (GLint loc = candidate; loc < candidate + sizes[index]; loc++) {
+                if (occupied[loc]) { freeRange = false; break; }
+            }
+            if (!freeRange) continue;
+            offsets[index] = candidate;
+            for (GLint loc = candidate; loc < candidate + sizes[index]; loc++) occupied[loc] = true;
+            break;
+        }
+        if (offsets[index] < 0) return;
     }
-    if (base < 0) return;
 
     for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++) {
         SpirvResourceList *resources =
@@ -2579,7 +2522,7 @@ static void mglUnifySynthesizedLooseUniformLocations(Program *program)
         for (GLuint i = 0; resources->list && i < resources->count; i++) {
             SpirvResource *res = &resources->list[i];
             if (!mglIsSynthesizedLooseUniformStruct(res)) continue;
-            res->uniform_location = base;
+            res->uniform_location = 0;
             for (GLuint m = 0; m < res->ubo_member_count; m++) {
                 SpirvUBOMember *member = &res->ubo_members[m];
                 const char *name = mglLooseUniformLeafName(member);
@@ -2593,8 +2536,10 @@ static void mglUnifySynthesizedLooseUniformLocations(Program *program)
             }
         }
     }
-    fprintf(stderr, "MGL LOOSE UNIFORMS: program=%u base=%d members=%zu slots=%d\n",
-            program->name, base, count, total);
+    if (getenv("MGL_DEBUG_UNIFORM_ABI")) {
+        fprintf(stderr, "MGL LOOSE UNIFORMS: program=%u members=%zu\n",
+                program->name, count);
+    }
 }
 
 void mglAssignPlainUniformLocations(Program *program)

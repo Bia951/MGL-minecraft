@@ -5189,16 +5189,7 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
              * the start of the variable, not the start of a single element).
              * Also store the struct size in required_size for render-time
              * struct buffer packing. */
-            size_t elem_byte_size = 0;
-            spvc_compiler_get_declared_struct_size(compiler_msl,
-                                                   elem_type,
-                                                   &elem_byte_size);
-            if (elem_byte_size == 0) {
-                /* Plain struct uniforms lack Offset decorations, so
-                 * spvc_compiler_get_declared_struct_size returns 0.
-                 * Compute the size using Metal/C alignment rules. */
-                elem_byte_size = mglComputeMSLStructSize(compiler_msl, elem_type);
-            }
+            size_t elem_byte_size = mglComputeMSLStructSize(compiler_msl, elem_type);
             res->required_size = elem_byte_size;
 
             res->ubo_members = NULL;

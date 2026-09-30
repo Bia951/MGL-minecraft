@@ -3602,125 +3602,65 @@ static GLuint mglPlainStructLocStep(const SpirvResource *res)
     return step > 0 ? step : 1;
 }
 
-typedef struct {
-    char name[128];
-    size_t offset;
-    size_t size;
-    bool mat3;
-} MGLLooseMetalMember;
-
-/* Aggregated loose uniforms are reflected with the GLSL struct layout, but
- * Metal pads mat3 columns to 16 bytes. Read the generated MSL member order so
- * the transient packed buffer matches the layout the GPU actually reads. */
-static bool mglLooseMetalTypeLayout(const char *type, size_t *size, size_t *align)
-{
-    if (!strcmp(type, "float4x4")) { *size = 64; *align = 16; }
-    else if (!strcmp(type, "float3x3")) { *size = 48; *align = 16; }
-    else if (!strcmp(type, "float4") || !strcmp(type, "int4") ||
-             !strcmp(type, "uint4") || !strcmp(type, "float3") ||
-             !strcmp(type, "int3") || !strcmp(type, "uint3")) {
-        *size = 16; *align = 16;
-    } else if (!strcmp(type, "float2") || !strcmp(type, "int2") ||
-               !strcmp(type, "uint2")) { *size = 8; *align = 8; }
-    else if (!strcmp(type, "float") || !strcmp(type, "int") ||
-             !strcmp(type, "uint")) { *size = 4; *align = 4; }
-    else if (!strcmp(type, "short") || !strcmp(type, "ushort")) {
-        *size = 2; *align = 2;
-    } else return false;
-    return true;
-}
-
-static bool mglLooseMetalLayout(const char *msl, const char *resourceName,
-                                MGLLooseMetalMember members[128],
-                                size_t *memberCount, size_t *structSize)
-{
-    if (!msl || !resourceName || strncmp(resourceName, "_mgl_loose_", 11)) return false;
-    char declaration[64];
-    snprintf(declaration, sizeof(declaration), "struct _MGLLooseUniforms%s", resourceName + 10);
-    const char *p = strstr(msl, declaration);
-    if (!p || !(p = strchr(p, '{'))) return false;
-    p++;
-    size_t count = 0, offset = 0, maxAlign = 1;
-    while (*p && *p != '}') {
-        const char *end = strchr(p, '\n');
-        if (!end) return false;
-        char line[256], type[32] = {0}, name[128] = {0};
-        size_t length = (size_t)(end - p);
-        if (length >= sizeof(line)) return false;
-        memcpy(line, p, length);
-        line[length] = '\0';
-        if (sscanf(line, " %31s %127[^;];", type, name) == 2) {
-            size_t size = 0, align = 0;
-            if (!mglLooseMetalTypeLayout(type, &size, &align) || count >= 128) return false;
-            size_t nameLen = strlen(name);
-            while (nameLen && isspace((unsigned char)name[nameLen - 1])) name[--nameLen] = '\0';
-            offset = (offset + align - 1) & ~(align - 1);
-            strncpy(members[count].name, name, sizeof(members[count].name) - 1);
-            members[count].name[sizeof(members[count].name) - 1] = '\0';
-            members[count].offset = offset;
-            members[count].size = size;
-            members[count].mat3 = !strcmp(type, "float3x3");
-            count++;
-            offset += size;
-            if (align > maxAlign) maxAlign = align;
-        }
-        p = end + 1;
-    }
-    if (!count) return false;
-    *memberCount = count;
-    *structSize = (offset + maxAlign - 1) & ~(maxAlign - 1);
-    return true;
-}
-
 /* Compute the byte size of one element of a GL uniform type.
  * Used as a fallback array stride for plain struct uniform members
  * that lack ArrayStride decorations in SPIR-V. */
-static GLuint mglGLTypeElementByteSize(GLuint gl_type)
+/* Copy one GL uniform value into its reflected native Metal layout. Uploads
+ * are column-major after glUniformMatrix transpose handling. mat3 uploads may
+ * already contain padded columns; all other matrices can arrive tightly packed. */
+static void mglPackPlainUniformElement(const SpirvUBOMember *member,
+                                      uint8_t *destination, size_t available,
+                                      const uint8_t *source, size_t sourceSize)
 {
-    switch (gl_type) {
-        case GL_FLOAT:
-        case GL_INT:
-        case GL_UNSIGNED_INT:
-        case GL_BOOL:
-            return 4;
-        case GL_FLOAT_VEC2:
-        case GL_INT_VEC2:
-        case GL_UNSIGNED_INT_VEC2:
-        case GL_BOOL_VEC2:
-            return 8;
-        case GL_FLOAT_VEC3:
-        case GL_INT_VEC3:
-        case GL_UNSIGNED_INT_VEC3:
-        case GL_BOOL_VEC3:
-            return 12;
-        case GL_FLOAT_VEC4:
-        case GL_INT_VEC4:
-        case GL_UNSIGNED_INT_VEC4:
-        case GL_BOOL_VEC4:
-            return 16;
-        case GL_FLOAT_MAT2:
-            return 8;   /* one column = vec2 */
-        case GL_FLOAT_MAT3:
-            return 12;  /* one column = vec3 */
-        case GL_FLOAT_MAT4:
-            return 16;  /* one column = vec4 */
-        case GL_FLOAT_MAT2x3:
-            return 12;
-        case GL_FLOAT_MAT2x4:
-            return 16;
-        case GL_FLOAT_MAT3x2:
-            return 8;
-        case GL_FLOAT_MAT3x4:
-            return 16;
-        case GL_FLOAT_MAT4x2:
-            return 8;
-        case GL_FLOAT_MAT4x3:
-            return 12;
-        case GL_DOUBLE:
-            return 8;
-        default:
-            return 4;
+    unsigned columns = 1, rows = 1, scalarSize = 4;
+    bool boolean = false;
+    switch (member->gl_type) {
+        case GL_FLOAT_MAT2: columns = rows = 2; break;
+        case GL_FLOAT_MAT3: columns = rows = 3; break;
+        case GL_FLOAT_MAT4: columns = rows = 4; break;
+        case GL_FLOAT_MAT2x3: columns = 2; rows = 3; break;
+        case GL_FLOAT_MAT2x4: columns = 2; rows = 4; break;
+        case GL_FLOAT_MAT3x2: columns = 3; rows = 2; break;
+        case GL_FLOAT_MAT3x4: columns = 3; rows = 4; break;
+        case GL_FLOAT_MAT4x2: columns = 4; rows = 2; break;
+        case GL_FLOAT_MAT4x3: columns = 4; rows = 3; break;
+        case GL_DOUBLE_MAT2: columns = rows = 2; scalarSize = 8; break;
+        case GL_DOUBLE_MAT3: columns = rows = 3; scalarSize = 8; break;
+        case GL_DOUBLE_MAT4: columns = rows = 4; scalarSize = 8; break;
+        case GL_DOUBLE_MAT2x3: columns = 2; rows = 3; scalarSize = 8; break;
+        case GL_DOUBLE_MAT2x4: columns = 2; rows = 4; scalarSize = 8; break;
+        case GL_DOUBLE_MAT3x2: columns = 3; rows = 2; scalarSize = 8; break;
+        case GL_DOUBLE_MAT3x4: columns = 3; rows = 4; scalarSize = 8; break;
+        case GL_DOUBLE_MAT4x2: columns = 4; rows = 2; scalarSize = 8; break;
+        case GL_DOUBLE_MAT4x3: columns = 4; rows = 3; scalarSize = 8; break;
+        case GL_BOOL: boolean = true; break;
+        case GL_BOOL_VEC2: boolean = true; rows = 2; break;
+        case GL_BOOL_VEC3: boolean = true; rows = 3; break;
+        case GL_BOOL_VEC4: boolean = true; rows = 4; break;
+        default: break;
     }
+    if (boolean) {
+        for (unsigned row = 0; row < rows && (row + 1u) * sizeof(int16_t) <= available; row++) {
+            GLint value = 0;
+            if ((row + 1u) * sizeof(value) > sourceSize) break;
+            memcpy(&value, source + row * sizeof(value), sizeof(value));
+            int16_t logical = value != 0;
+            memcpy(destination + row * sizeof(logical), &logical, sizeof(logical));
+        }
+        return;
+    }
+    if (columns > 1 && member->matrix_stride > 0) {
+        size_t rowBytes = rows * scalarSize;
+        size_t stride = (size_t)member->matrix_stride;
+        size_t sourceStride = sourceSize == columns * stride ? stride : rowBytes;
+        for (unsigned col = 0; col < columns; col++) {
+            size_t srcOffset = col * sourceStride, dstOffset = col * stride;
+            if (srcOffset + rowBytes > sourceSize || dstOffset + rowBytes > available) break;
+            memcpy(destination + dstOffset, source + srcOffset, rowBytes);
+        }
+        return;
+    }
+    memcpy(destination, source, MIN(available, sourceSize));
 }
 
 static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment)
@@ -4012,11 +3952,6 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
                     }
                     GLuint array_size = mglStageBufferResourceElementCount(spvc_type, resource);
                     size_t struct_size = resource->required_size;
-                    MGLLooseMetalMember metalMembers[128];
-                    size_t metalMemberCount = 0;
-                    bool useMetalLayout = mglLooseMetalLayout(
-                        program->spirv[stage].msl_str, resource->name,
-                        metalMembers, &metalMemberCount, &struct_size);
                     bool allowFallback = fallbackBuffers &&
                         mglPlainUniformAllowsGlobalFallback(resource);
 
@@ -4052,18 +3987,6 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
                             if (member_offset >= elem_byte_start) {
                                 member_offset -= elem_byte_start;
                             }
-                            const MGLLooseMetalMember *metalMember = NULL;
-                            if (useMetalLayout && member->name) {
-                                const char *memberName = strrchr(member->name, '.');
-                                memberName = memberName ? memberName + 1 : member->name;
-                                for (size_t mi = 0; mi < metalMemberCount; mi++) {
-                                    if (!strcmp(metalMembers[mi].name, memberName)) {
-                                        metalMember = &metalMembers[mi];
-                                        member_offset = (GLuint)metalMember->offset;
-                                        break;
-                                    }
-                                }
-                            }
                             if (member_offset >= struct_size) {
                                 continue;
                             }
@@ -4080,13 +4003,9 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
                                 /* Array member: each element stored at a
                                  * separate location (CTS convention: 1
                                  * location per leaf element). */
-                                GLuint elem_stride = (GLuint)member->array_stride;
-                                if (elem_stride == 0) {
-                                    /* Plain struct uniforms lack ArrayStride
-                                     * decorations; derive stride from the
-                                     * member's GL type (per-element byte size). */
-                                    elem_stride = mglGLTypeElementByteSize(member->gl_type);
-                                }
+                                GLuint elem_stride = member->array_stride > 0
+                                    ? (GLuint)member->array_stride : 0;
+                                if (!elem_stride) continue;
                                 for (GLint ai = 0; ai < member->size; ai++) {
                                     GLint elem_loc = member_loc + ai;
                                     if (elem_loc < 0 || elem_loc >= (GLint)MAX_BINDABLE_BUFFERS) {
@@ -4107,20 +4026,12 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
                                     if (!mbuf || !mbuf->data.buffer_data || mbuf->size <= 0) {
                                         continue;
                                     }
-                                    size_t copy_size = (size_t)mbuf->size;
-                                    if (copy_size > (size_t)elem_stride) {
-                                        copy_size = (size_t)elem_stride;
-                                    }
-                                    GLuint dest_off = member_offset +
-                                        (GLuint)(ai * elem_stride);
-                                    if ((size_t)dest_off + copy_size > struct_size) {
-                                        copy_size = struct_size - (size_t)dest_off;
-                                    }
-                                    if (copy_size > 0) {
-                                        memcpy(packed + dest_off,
-                                               (const void *)(uintptr_t)mbuf->data.buffer_data,
-                                               copy_size);
-                                    }
+                                    size_t dest_off = member_offset + (size_t)ai * elem_stride;
+                                    if (dest_off >= struct_size) continue;
+                                    mglPackPlainUniformElement(member, packed + dest_off,
+                                        MIN((size_t)elem_stride, struct_size - dest_off),
+                                        (const uint8_t *)(uintptr_t)mbuf->data.buffer_data,
+                                        (size_t)mbuf->size);
                                 }
                             } else {
                                 /* Scalar / vector / matrix member: all data
@@ -4140,31 +4051,10 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
                                 if (!mbuf || !mbuf->data.buffer_data || mbuf->size <= 0) {
                                     continue;
                                 }
-                                if (metalMember && metalMember->mat3 && mbuf->size >= 36 &&
-                                    (size_t)member_offset + 48 <= struct_size) {
-                                    const uint8_t *src = (const uint8_t *)(uintptr_t)mbuf->data.buffer_data;
-                                    if (mbuf->size >= 48) {
-                                        memcpy(packed + member_offset, src, 48);
-                                    } else {
-                                        for (size_t col = 0; col < 3; col++) {
-                                            memcpy(packed + member_offset + col * 16,
-                                                   src + col * 12, 12);
-                                        }
-                                    }
-                                    continue;
-                                }
-                                size_t copy_size = (size_t)mbuf->size;
-                                if (metalMember && copy_size > metalMember->size) {
-                                    copy_size = metalMember->size;
-                                }
-                                if ((size_t)member_offset + copy_size > struct_size) {
-                                    copy_size = struct_size - (size_t)member_offset;
-                                }
-                                if (copy_size > 0) {
-                                    memcpy(packed + member_offset,
-                                           (const void *)(uintptr_t)mbuf->data.buffer_data,
-                                           copy_size);
-                                }
+                                mglPackPlainUniformElement(member, packed + member_offset,
+                                    struct_size - member_offset,
+                                    (const uint8_t *)(uintptr_t)mbuf->data.buffer_data,
+                                    (size_t)mbuf->size);
                             }
                         }
 
