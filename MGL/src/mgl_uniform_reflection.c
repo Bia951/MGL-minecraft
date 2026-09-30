@@ -8,6 +8,7 @@
  * See mgl_uniform_reflection.h for details.
  */
 
+#include "mgl_trace_log.h"
 #include "mgl_uniform_reflection.h"
 
 #include <stdio.h>
@@ -654,6 +655,58 @@ char *mglGLSLAccessPathForUBOMember(const char *glsl_src,
 }
 
 /* ---- Group A.2: SPIRV-Cross Type/Location/Size Query Helpers ---- */
+
+GLuint mglGLImageTypeFromSPVCType(spvc_compiler compiler, spvc_type type)
+{
+    if (!type) return 0;
+    spvc_basetype base = spvc_type_get_basetype(type);
+    if (base == SPVC_BASETYPE_SAMPLER) return GL_SAMPLER_2D;
+    if (base != SPVC_BASETYPE_IMAGE && base != SPVC_BASETYPE_SAMPLED_IMAGE) return 0;
+    spvc_type scalar = spvc_compiler_get_type_handle(compiler, spvc_type_get_image_sampled_type(type));
+    spvc_basetype scalarBase = scalar ? spvc_type_get_basetype(scalar) : SPVC_BASETYPE_FP32;
+    unsigned kind = scalarBase == SPVC_BASETYPE_INT32 ? 1u :
+                    scalarBase == SPVC_BASETYPE_UINT32 ? 2u : 0u;
+    bool arrayed = spvc_type_get_image_arrayed(type);
+    bool storage = spvc_type_get_image_is_storage(type);
+    bool depth = spvc_type_get_image_is_depth(type);
+    SpvDim dim = spvc_type_get_image_dimension(type);
+    if (dim == SpvDim2D && spvc_type_get_image_multisampled(type)) {
+        const GLuint samplerMS[2][3] = {
+            {GL_SAMPLER_2D_MULTISAMPLE, GL_INT_SAMPLER_2D_MULTISAMPLE, GL_UNSIGNED_INT_SAMPLER_2D_MULTISAMPLE},
+            {GL_SAMPLER_2D_MULTISAMPLE_ARRAY, GL_INT_SAMPLER_2D_MULTISAMPLE_ARRAY, GL_UNSIGNED_INT_SAMPLER_2D_MULTISAMPLE_ARRAY}};
+        const GLuint imageMS[2][3] = {
+            {GL_IMAGE_2D_MULTISAMPLE, GL_INT_IMAGE_2D_MULTISAMPLE, GL_UNSIGNED_INT_IMAGE_2D_MULTISAMPLE},
+            {GL_IMAGE_2D_MULTISAMPLE_ARRAY, GL_INT_IMAGE_2D_MULTISAMPLE_ARRAY, GL_UNSIGNED_INT_IMAGE_2D_MULTISAMPLE_ARRAY}};
+        return storage ? imageMS[arrayed][kind] : samplerMS[arrayed][kind];
+    }
+#define MGL_IMAGE_TYPES(D, A) {GL_##D, GL_INT_##D, GL_UNSIGNED_INT_##D}, {GL_##A, GL_INT_##A, GL_UNSIGNED_INT_##A}
+    static const GLuint samplers[][2][3] = {
+        {MGL_IMAGE_TYPES(SAMPLER_1D, SAMPLER_1D_ARRAY)},
+        {MGL_IMAGE_TYPES(SAMPLER_2D, SAMPLER_2D_ARRAY)},
+        {MGL_IMAGE_TYPES(SAMPLER_3D, SAMPLER_3D)},
+        {MGL_IMAGE_TYPES(SAMPLER_CUBE, SAMPLER_CUBE_MAP_ARRAY)},
+        {MGL_IMAGE_TYPES(SAMPLER_2D_RECT, SAMPLER_2D_RECT)},
+        {MGL_IMAGE_TYPES(SAMPLER_BUFFER, SAMPLER_BUFFER)}};
+    static const GLuint images[][2][3] = {
+        {MGL_IMAGE_TYPES(IMAGE_1D, IMAGE_1D_ARRAY)},
+        {MGL_IMAGE_TYPES(IMAGE_2D, IMAGE_2D_ARRAY)},
+        {MGL_IMAGE_TYPES(IMAGE_3D, IMAGE_3D)},
+        {MGL_IMAGE_TYPES(IMAGE_CUBE, IMAGE_CUBE_MAP_ARRAY)},
+        {MGL_IMAGE_TYPES(IMAGE_2D_RECT, IMAGE_2D_RECT)},
+        {MGL_IMAGE_TYPES(IMAGE_BUFFER, IMAGE_BUFFER)}};
+#undef MGL_IMAGE_TYPES
+    if (!storage && depth && kind == 0u) {
+        switch (dim) {
+            case SpvDim1D: return arrayed ? GL_SAMPLER_1D_ARRAY_SHADOW : GL_SAMPLER_1D_SHADOW;
+            case SpvDim2D: return arrayed ? GL_SAMPLER_2D_ARRAY_SHADOW : GL_SAMPLER_2D_SHADOW;
+            case SpvDimCube: return arrayed ? GL_SAMPLER_CUBE_MAP_ARRAY_SHADOW : GL_SAMPLER_CUBE_SHADOW;
+            case SpvDimRect: return GL_SAMPLER_2D_RECT_SHADOW;
+            default: return 0;
+        }
+    }
+    if ((unsigned)dim >= sizeof(samplers)/sizeof(samplers[0])) return 0;
+    return storage ? images[dim][arrayed][kind] : samplers[dim][arrayed][kind];
+}
 
 GLuint mglGLTypeFromSPVCType(spvc_type type)
 {
@@ -1748,7 +1801,7 @@ GLboolean mglReflectUBOStructMember(Program *program,
                                                location_offset,
                                                top_level_array_size,
                                                top_level_array_stride);
-    if (ok && getenv("MGL_DEBUG_UBO_REFLECT")) {
+    if (ok && mglTraceEnvFlagEnabled("MGL_DEBUG_UBO_REFLECT")) {
         fprintf(stderr,
                 "MGL UBO MEMBER program=%u stage=%d ubo=%s member=%u finalName=%s queryName=%s offset=%u\n",
                 program ? program->name : 0,
@@ -2260,16 +2313,6 @@ bool mglIsSamplerResourceType(int res_type)
            res_type == SPVC_RESOURCE_TYPE_STORAGE_IMAGE;
 }
 
-bool mglUniformNameLooksSamplerLike(const char *name)
-{
-    if (!name || !*name) {
-        return false;
-    }
-
-    return strstr(name, "Sampler") != NULL ||
-           strcmp(name, "CloudFaces") == 0;
-}
-
 bool mglUniformConstantBaseTypeIsSamplerLike(spvc_basetype basetype)
 {
     return basetype == SPVC_BASETYPE_IMAGE ||
@@ -2290,9 +2333,7 @@ bool mglProgramResourceLooksSamplerLike(const SpirvResource *res, int res_type)
         case SPVC_RESOURCE_TYPE_STORAGE_IMAGE:
             return true;
         case SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT:
-            return res->image_dim != 0u ||
-                   res->uniform_location >= MGL_SYNTHETIC_SAMPLER_LOCATION_BASE ||
-                   mglUniformNameLooksSamplerLike(res->name);
+            return res->is_opaque_uniform == GL_TRUE;
         default:
             return false;
     }
@@ -2536,7 +2577,7 @@ static void mglUnifySynthesizedLooseUniformLocations(Program *program)
             }
         }
     }
-    if (getenv("MGL_DEBUG_UNIFORM_ABI")) {
+    if (mglTraceEnvFlagEnabled("MGL_DEBUG_UNIFORM_ABI")) {
         fprintf(stderr, "MGL LOOSE UNIFORMS: program=%u members=%zu\n",
                 program->name, count);
     }
@@ -2642,13 +2683,15 @@ void mglAssignPlainUniformLocations(Program *program)
 
             res->uniform_location = preferred;
             used[preferred] = true;
-            fprintf(stderr,
-                    "MGL PLAIN UNIFORM FIX: program=%u stage=%d name=%s loc=%d metal=%u\n",
-                    program->name,
-                    stage,
-                    res->name ? res->name : "(null)",
-                    preferred,
-                    (unsigned)res->binding);
+            if (mglTraceEnvFlagEnabled("MGL_DEBUG_RESOURCE_ABI")) {
+                fprintf(stderr,
+                        "MGL PLAIN UNIFORM FIX: program=%u stage=%d name=%s loc=%d metal=%u\n",
+                        program->name,
+                        stage,
+                        res->name ? res->name : "(null)",
+                        preferred,
+                        (unsigned)res->binding);
+            }
         }
     }
     mglUnifySynthesizedLooseUniformLocations(program);

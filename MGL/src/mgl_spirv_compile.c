@@ -24,6 +24,7 @@
  * the header.
  */
 
+#include "mgl_trace_log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -330,14 +331,16 @@ void applyMSLResourceBindings(Program *pptr, int stage, char **msl_ptr)
             }
 
             if (res->binding != metal_index) {
-                fprintf(stderr,
-                        "MGL RESOURCE FIX: program=%u stage=%d type=%d %s texture binding %u -> %u\n",
-                        pptr->name,
-                        stage,
-                        res_type,
-                        res->name,
-                        (unsigned)res->binding,
-                        (unsigned)metal_index);
+                if (mglTraceEnvFlagEnabled("MGL_DEBUG_RESOURCE_ABI")) {
+                    fprintf(stderr,
+                            "MGL RESOURCE FIX: program=%u stage=%d type=%d %s texture binding %u -> %u\n",
+                            pptr->name,
+                            stage,
+                            res_type,
+                            res->name,
+                            (unsigned)res->binding,
+                            (unsigned)metal_index);
+                }
                 res->binding = metal_index;
             }
             GLint msl_array_size =
@@ -527,15 +530,17 @@ void applyMSLResourceBindings(Program *pptr, int stage, char **msl_ptr)
             }
 
             if (res->binding != metal_index) {
-                fprintf(stderr,
-                        "MGL RESOURCE FIX: program=%u stage=%d type=%d %s buffer binding %u -> %u (gl=%u)\n",
-                        pptr->name,
-                        stage,
-                        res_type,
-                        res->name,
-                        (unsigned)res->binding,
-                        (unsigned)metal_index,
-                        (unsigned)res->gl_binding);
+                if (mglTraceEnvFlagEnabled("MGL_DEBUG_RESOURCE_ABI")) {
+                    fprintf(stderr,
+                            "MGL RESOURCE FIX: program=%u stage=%d type=%d %s buffer binding %u -> %u (gl=%u)\n",
+                            pptr->name,
+                            stage,
+                            res_type,
+                            res->name,
+                            (unsigned)res->binding,
+                            (unsigned)metal_index,
+                            (unsigned)res->gl_binding);
+                }
                 res->binding = metal_index;
             }
         }
@@ -551,14 +556,16 @@ void applyMSLResourceBindings(Program *pptr, int stage, char **msl_ptr)
             continue;
         }
         if (res->binding != metal_index) {
-            fprintf(stderr,
-                    "MGL RESOURCE FIX: program=%u stage=%d type=%d %s sampler binding %u -> %u\n",
-                    pptr->name,
-                    stage,
-                    SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS,
-                    res->name,
-                    (unsigned)res->binding,
-                    (unsigned)metal_index);
+            if (mglTraceEnvFlagEnabled("MGL_DEBUG_RESOURCE_ABI")) {
+                fprintf(stderr,
+                        "MGL RESOURCE FIX: program=%u stage=%d type=%d %s sampler binding %u -> %u\n",
+                        pptr->name,
+                        stage,
+                        SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS,
+                        res->name,
+                        (unsigned)res->binding,
+                        (unsigned)metal_index);
+            }
             res->binding = metal_index;
         }
     }
@@ -3464,7 +3471,7 @@ void applyMSLUniformBufferPacking(Program *pptr, int stage)
     unsigned struct_dep_count = 0;
     char patch_struct_names[256][128];
     unsigned patch_struct_count = 0;
-    GLboolean debug_pack = getenv("MGL_DEBUG_MSL_PACK") ? GL_TRUE : GL_FALSE;
+    GLboolean debug_pack = mglTraceEnvFlagEnabled("MGL_DEBUG_MSL_PACK") ? GL_TRUE : GL_FALSE;
 
     mglMSLCollectStructDeps(src,
                             struct_deps,
@@ -4176,7 +4183,7 @@ static GLboolean mglConfigureArgumentBuffers(Program *program,
         &program->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT];
     for (GLuint i = 0; i < uniformConstants->count; i++) {
         SpirvResource *resource = &uniformConstants->list[i];
-        if (resource->image_dim != 0u || resource->uniform_location >= 0) {
+        if (mglProgramResourceLooksSamplerLike(resource, SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT)) {
             spvc_compiler_set_decoration(compiler, resource->_id,
                                          SpvDecorationDescriptorSet, 2u);
             resource->set = 2u;
@@ -4637,8 +4644,7 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
 
             bool uniform_constant_sampler_like =
                 (res_type == SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT) &&
-                (mglUniformConstantBaseTypeIsSamplerLike(reflected_basetype) ||
-                 mglUniformNameLooksSamplerLike(list[i].name));
+                mglUniformConstantBaseTypeIsSamplerLike(reflected_basetype);
 
             ptr->spirv_resources_list[stage][res_type].list[i]._id = list[i].id;
             ptr->spirv_resources_list[stage][res_type].list[i].base_type_id = list[i].base_type_id;
@@ -4683,7 +4689,10 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
                 GLuint ac_offset = spvc_compiler_get_decoration(compiler_msl, list[i].id, SpvDecorationOffset);
                 ptr->spirv_resources_list[stage][res_type].list[i].location = ac_offset;
             }
-            ptr->spirv_resources_list[stage][res_type].list[i].gl_type = mglGLTypeFromSPVCType(reflected_type);
+            ptr->spirv_resources_list[stage][res_type].list[i].gl_type =
+                mglUniformConstantBaseTypeIsSamplerLike(reflected_basetype)
+                ? mglGLImageTypeFromSPVCType(compiler_msl, reflected_type)
+                : mglGLTypeFromSPVCType(reflected_type);
             ptr->spirv_resources_list[stage][res_type].list[i].gl_array_size = mglGLArraySizeFromSPVCType(reflected_type);
             ptr->spirv_resources_list[stage][res_type].list[i].is_array =
                 (reflected_type && spvc_type_get_num_array_dimensions(reflected_type) > 0) ? GL_TRUE : GL_FALSE;
@@ -4706,6 +4715,8 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
             ptr->spirv_resources_list[stage][res_type].list[i].sampler_unit = -1;
             ptr->spirv_resources_list[stage][res_type].list[i].sampler_unit_explicit = GL_FALSE;
             ptr->spirv_resources_list[stage][res_type].list[i].required_size = 0;
+            ptr->spirv_resources_list[stage][res_type].list[i].is_opaque_uniform =
+                mglUniformConstantBaseTypeIsSamplerLike(reflected_basetype);
             ptr->spirv_resources_list[stage][res_type].list[i].image_dim = 0;
             ptr->spirv_resources_list[stage][res_type].list[i].image_arrayed = 0;
             ptr->spirv_resources_list[stage][res_type].list[i].image_multisampled = 0;
@@ -5049,7 +5060,7 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
                 continue;
             }
 
-            if (getenv("MGL_DEBUG_UBO_REFLECT")) {
+            if (mglTraceEnvFlagEnabled("MGL_DEBUG_UBO_REFLECT")) {
                 fprintf(stderr,
                         "MGL UBO REFLECT program=%u stage=%d ubo=%s id=%u type=%u base=%u structType=%u structName=%s\n",
                         ptr->name,
@@ -5142,8 +5153,7 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
 
             /* Skip samplers/images that happen to live in the uniform-constant
              * list; only genuine structs are reflected here. */
-            if (mglUniformConstantBaseTypeIsSamplerLike(spvc_type_get_basetype(elem_type)) ||
-                mglUniformNameLooksSamplerLike(res->name)) {
+            if (mglProgramResourceLooksSamplerLike(res, SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT)) {
                 continue;
             }
 
@@ -5502,7 +5512,7 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
     }
     mglFinalizeArgumentBufferBindings(ptr, stage, compiler_msl);
 
-    if (getenv("MGL_DUMP_MSL")) {
+    if (mglTraceEnvFlagEnabled("MGL_DUMP_MSL")) {
         fprintf(stderr, "MGL DBG MSL DUMP (program=%u stage=%d):\n%.8000s\n", ptr->name, stage, result);
     }
     DEBUG_PRINT("\n%s\n", result);
@@ -5536,7 +5546,7 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
             mslPipelineDestroy(&pipeline);
         }
 
-        if (getenv("MGL_DUMP_MSL") && str_ret) {
+        if (mglTraceEnvFlagEnabled("MGL_DUMP_MSL") && str_ret) {
             char dumpPath[512];
             snprintf(dumpPath, sizeof(dumpPath),
                      "/tmp/mgl_program_%u_stage_%d.msl",
@@ -6512,7 +6522,7 @@ bool compileStageFromLinkedProgram(GLMContext ctx, Program *pptr, glslang_progra
         return true;
     }
     applyMSLUniformBufferPacking(pptr, stage);
-    if (getenv("MGL_DUMP_MSL_POST_PACK") && pptr->spirv[stage].msl_str) {
+    if (mglTraceEnvFlagEnabled("MGL_DUMP_MSL_POST_PACK") && pptr->spirv[stage].msl_str) {
         char dump_path[256];
         snprintf(dump_path, sizeof(dump_path),
                  "/tmp/mgl_program_%u_stage_%d_post_pack.msl",

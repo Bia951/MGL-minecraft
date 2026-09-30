@@ -92,6 +92,7 @@ GLboolean mglGLSLContainsToken(const char *src, const char *token);
 
 /* ---- Group A.2: SPIRV-Cross Type/Location/Size Query Helpers ---- */
 
+GLuint mglGLImageTypeFromSPVCType(spvc_compiler compiler, spvc_type type);
 GLuint mglGLTypeFromSPVCType(spvc_type type);
 GLint mglGLArraySizeFromSPVCType(spvc_type type);
 GLuint mglGLBoolTypeForVectorSize(unsigned vec_size);
@@ -232,7 +233,6 @@ GLint mglSamplerUniformLocationFromReflection(GLuint reflected_location,
                                               const char *glsl_src,
                                               const char *resource_name);
 bool mglIsSamplerResourceType(int res_type);
-bool mglUniformNameLooksSamplerLike(const char *name);
 bool mglUniformConstantBaseTypeIsSamplerLike(spvc_basetype basetype);
 bool mglProgramResourceLooksSamplerLike(const SpirvResource *res, int res_type);
 bool mglSamplerResourceNamesMatch(const char *a, const char *b);

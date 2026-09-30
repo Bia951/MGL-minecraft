@@ -32,6 +32,7 @@
 #include "glm_context.h"
 #include "mgl_safety.h"
 #include "draw_command.h"
+#include "mgl_uniform_reflection.h"
 
 #pragma mark uniforms
 
@@ -174,37 +175,6 @@ static GLboolean mglSafeCStringEquals(const char *lhs, const char *rhs)
     return memcmp(lhs, rhs, lhsLength + 1u) == 0 ? GL_TRUE : GL_FALSE;
 }
 
-static GLboolean mglSafeCStringContains(const char *haystack, const char *needle)
-{
-    size_t hay_len = 0u;
-    size_t needle_len = 0u;
-
-    if (!mglSafeCStringLength(haystack, &hay_len) ||
-        !mglSafeCStringLength(needle, &needle_len)) {
-        return GL_FALSE;
-    }
-    if (needle_len == 0u) {
-        return GL_TRUE;
-    }
-    if (needle_len > hay_len) {
-        return GL_FALSE;
-    }
-
-    for (size_t i = 0; i <= hay_len - needle_len; i++) {
-        GLboolean match = GL_TRUE;
-        for (size_t j = 0; j < needle_len; j++) {
-            if (haystack[i + j] != needle[j]) {
-                match = GL_FALSE;
-                break;
-            }
-        }
-        if (match) {
-            return GL_TRUE;
-        }
-    }
-
-    return GL_FALSE;
-}
 
 static const char *mglSafeCStringForLog(const char *str)
 {
@@ -320,123 +290,9 @@ static Program *mglUniformGetNamedProgram(GLMContext ctx, GLuint program, const 
     return mglUniformValidateProgramPointer(ctx, getProgram(ctx, program), func);
 }
 
-static GLint mglKnownPlainUniformLocation(const char *name)
+static GLboolean mglUniformResourceLooksSamplerLike(const SpirvResource *res, int type)
 {
-    if (!name) {
-        return -1;
-    }
-
-    if (!mglSafeCStringLength(name, NULL)) {
-        return -1;
-    }
-
-    if (mglSafeCStringEquals(name, "ModelViewMat")) {
-        return 0;
-    }
-    if (mglSafeCStringEquals(name, "ProjMat")) {
-        return 1;
-    }
-    if (mglSafeCStringEquals(name, "TextureMat")) {
-        return 2;
-    }
-    if (mglSafeCStringEquals(name, "ColorModulator")) {
-        return 3;
-    }
-    if (mglSafeCStringEquals(name, "FogStart")) {
-        return 4;
-    }
-    if (mglSafeCStringEquals(name, "FogEnd")) {
-        return 5;
-    }
-    if (mglSafeCStringEquals(name, "FogColor")) {
-        return 6;
-    }
-    if (mglSafeCStringEquals(name, "FogShape")) {
-        return 7;
-    }
-    if (mglSafeCStringEquals(name, "GameTime")) {
-        return 8;
-    }
-    if (mglSafeCStringEquals(name, "ScreenSize")) {
-        return 9;
-    }
-    if (mglSafeCStringEquals(name, "LineWidth")) {
-        return 10;
-    }
-    if (mglSafeCStringEquals(name, "IViewRotMat")) {
-        return 11;
-    }
-    if (mglSafeCStringEquals(name, "ChunkOffset")) {
-        return 12;
-    }
-    if (mglSafeCStringEquals(name, "u_ProjectionMatrix")) {
-        return 0;
-    }
-    if (mglSafeCStringEquals(name, "u_ModelViewMatrix")) {
-        return 1;
-    }
-    if (mglSafeCStringEquals(name, "u_RegionOffset")) {
-        return 2;
-    }
-    if (mglSafeCStringEquals(name, "u_TexCoordShrink")) {
-        return 3;
-    }
-    if (mglSafeCStringEquals(name, "u_FogColor")) {
-        return 4;
-    }
-    if (mglSafeCStringEquals(name, "u_EnvironmentFog")) {
-        return 5;
-    }
-    if (mglSafeCStringEquals(name, "u_RenderFog")) {
-        return 6;
-    }
-
-    /* 1.21.11 new plain uniforms */
-    if (mglSafeCStringEquals(name, "CameraBlockPos")) {
-        return 13;
-    }
-    if (mglSafeCStringEquals(name, "CameraOffset")) {
-        return 14;
-    }
-    if (mglSafeCStringEquals(name, "UseRgss")) {
-        return 15;
-    }
-    if (mglSafeCStringEquals(name, "ChunkVisibility")) {
-        return 16;
-    }
-
-    return -1;
-}
-
-static GLboolean mglUniformNameLooksSamplerLike(const char *name)
-{
-    if (!name || !mglSafeCStringLength(name, NULL)) {
-        return GL_FALSE;
-    }
-
-    return (mglSafeCStringContains(name, "Sampler") ||
-            mglSafeCStringEquals(name, "CloudFaces")) ? GL_TRUE : GL_FALSE;
-}
-
-static GLboolean mglUniformResourceLooksSamplerLike(const SpirvResource *res, int res_type)
-{
-    if (!res) {
-        return GL_FALSE;
-    }
-
-    switch (res_type) {
-        case SPVC_RESOURCE_TYPE_SAMPLED_IMAGE:
-        case SPVC_RESOURCE_TYPE_SEPARATE_IMAGE:
-        case SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS:
-        case SPVC_RESOURCE_TYPE_STORAGE_IMAGE:
-            return GL_TRUE;
-        case SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT:
-            return (res->image_dim != 0u ||
-                    res->uniform_location >= MGL_SYNTHETIC_SAMPLER_LOCATION_BASE ||
-                    mglUniformNameLooksSamplerLike(res->name)) ? GL_TRUE : GL_FALSE;
-        default:
-            return GL_FALSE;
-    }
+    return mglProgramResourceLooksSamplerLike(res, type) ? GL_TRUE : GL_FALSE;
 }
 
 static const int mglActiveUniformResourceTypes[] = {
@@ -758,84 +614,13 @@ GLint mglProgramActiveUniformIndexByName(Program *program, const GLchar *name)
     return -1;
 }
 
-static GLint mglKnownPlainUniformType(const char *name)
-{
-    if (!name || !mglSafeCStringLength(name, NULL)) {
-        return GL_FLOAT;
-    }
-
-    if (mglSafeCStringEquals(name, "ModelViewMat") ||
-        mglSafeCStringEquals(name, "ProjMat") ||
-        mglSafeCStringEquals(name, "TextureMat") ||
-        mglSafeCStringEquals(name, "u_ProjectionMatrix") ||
-        mglSafeCStringEquals(name, "u_ModelViewMatrix")) {
-        return GL_FLOAT_MAT4;
-    }
-    if (mglSafeCStringEquals(name, "IViewRotMat")) {
-        return GL_FLOAT_MAT3;
-    }
-    if (mglSafeCStringEquals(name, "ColorModulator") ||
-        mglSafeCStringEquals(name, "FogColor") ||
-        mglSafeCStringEquals(name, "u_FogColor") ||
-        mglSafeCStringEquals(name, "u_TexCoordShrink")) {
-        return GL_FLOAT_VEC4;
-    }
-    if (mglSafeCStringEquals(name, "ScreenSize")) {
-        return GL_FLOAT_VEC2;
-    }
-    if (mglSafeCStringEquals(name, "ChunkOffset") ||
-        mglSafeCStringEquals(name, "u_RegionOffset")) {
-        return GL_FLOAT_VEC3;
-    }
-    if (mglSafeCStringEquals(name, "FogShape") ||
-        mglSafeCStringEquals(name, "u_EnvironmentFog") ||
-        mglSafeCStringEquals(name, "u_RenderFog")) {
-        return GL_INT;
-    }
-
-    return GL_FLOAT;
-}
-
-static GLint mglSamplerUniformGLType(const SpirvResource *res, int res_type)
-{
-    if (!res) {
-        return 0;
-    }
-
-    if (res_type == SPVC_RESOURCE_TYPE_STORAGE_IMAGE) {
-        return (res->image_dim == 5u) ? GL_INT_IMAGE_BUFFER : GL_INT_IMAGE_2D;
-    }
-
-    if (res_type == SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS) {
-        return GL_SAMPLER_2D;
-    }
-
-    if (res_type == SPVC_RESOURCE_TYPE_SAMPLED_IMAGE ||
-        res_type == SPVC_RESOURCE_TYPE_SEPARATE_IMAGE ||
-        mglUniformResourceLooksSamplerLike(res, res_type)) {
-        switch (res->image_dim) {
-            case 0: return res->image_arrayed ? GL_SAMPLER_1D_ARRAY : GL_SAMPLER_1D;
-            case 1: return res->image_arrayed ? GL_SAMPLER_2D_ARRAY : GL_SAMPLER_2D;
-            case 2: return GL_SAMPLER_3D;
-            case 3: return res->image_arrayed ? GL_SAMPLER_CUBE_MAP_ARRAY : GL_SAMPLER_CUBE;
-            case 5: return GL_INT_SAMPLER_BUFFER;
-            default: return GL_SAMPLER_2D;
-        }
-    }
-
-    return 0;
-}
-
 GLint mglProgramActiveUniformGLType(const SpirvResource *res, int res_type)
 {
-    GLint sampler_type = mglSamplerUniformGLType(res, res_type);
-    if (sampler_type != 0) {
-        return sampler_type;
-    }
+    (void)res_type;
     if (res && res->gl_type != 0) {
         return (GLint)res->gl_type;
     }
-    return mglKnownPlainUniformType(res ? res->name : NULL);
+    return 0;
 }
 
 GLint mglProgramActiveUniformSize(const SpirvResource *res, int res_type)
@@ -972,10 +757,6 @@ static GLint mglPlainUniformResourceLocation(const SpirvResource *res)
         return -1;
     }
 
-    GLint known = mglKnownPlainUniformLocation(res->name);
-    if (known >= 0) {
-        return known;
-    }
     if (res->uniform_location >= 0) {
         return res->uniform_location;
     }
@@ -1950,8 +1731,8 @@ GLuint  mglGetUniformBlockIndex(GLMContext ctx, GLuint program, const GLchar *un
         }
     }
 
-    fprintf(stderr, "MGL WARNING: uniform block '%s' binding not found, returning GL_INVALID_INDEX\n",
-            mglSafeCStringForLog(uniformBlockName));
+    mglTraceLogExternal("UNIFORM_BLOCK_NOT_ACTIVE name=%s",
+                        mglSafeCStringForLog(uniformBlockName));
     return (GLuint)-1;
 }
 

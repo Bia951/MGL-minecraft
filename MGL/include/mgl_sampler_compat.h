@@ -59,24 +59,12 @@ bool mglProgramHasResourceNamed(Program *program,
                                 const char *name);
 
 /* === Binding-trace gating ===
- *
- * Identifies programs whose bind-time state changes are worth tracing for
- * debugging Minecraft rendering issues (ChunkSection terrain, Sampler1/2
- * entity textures). */
+ * Traces explicitly selected programs or all resources when requested. */
 bool mglProgramNeedsBindingTrace(Program *program);
 
 /* === Sampler-like resource classification === */
 
-/* Heuristic: does the resource name look like a GL sampler uniform that
- * SPIRV-Cross will lower to a Metal texture+sampler pair?  Covers names
- * containing "Sampler" and the Minecraft "CloudFaces" texel-buffer
- * workaround. */
-bool mglRendererSamplerNameLooksSamplerLike(const char *name);
-
-/* Heuristic: does the SPIR-V resource look like a sampler that must be
- * bound to a Metal texture+sampler pair?  Considers resource type and,
- * for SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT, image_dim / uniform_location
- * / name heuristics. */
+/* Uses the shared reflected SPIR-V resource class and opaque-type flag. */
 bool mglRendererResourceLooksSamplerLike(const SpirvResource *res, int resType);
 
 /* Finds the SpirvResource for a given Metal binding in a stage, considering
@@ -97,6 +85,9 @@ SpirvResource *mglFindSamplerResourceForMetalBinding(Program *program,
  * attachment texture left bound after glTexImage2D).
  *
  * Returns false if `program` is NULL or has no sampler-like resources. */
+GLint mglSamplerResourceTextureUnit(Program *program, const SpirvResource *resource,
+                                   int stage, int resourceType);
+
 bool mglProgramSamplesTextureUnit(Program *program, GLuint unit);
 
 #ifdef __cplusplus

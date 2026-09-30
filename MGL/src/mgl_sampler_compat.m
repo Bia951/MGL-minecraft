@@ -24,6 +24,8 @@
  */
 
 #import "mgl_sampler_compat.h"
+#include "mgl_uniform_reflection.h"
+#include "mgl_trace_strategy.h"
 #import <Foundation/Foundation.h>
 #import "spirv_cross_c.h"
 #include <string.h>
@@ -126,39 +128,15 @@ bool mglProgramNeedsBindingTrace(Program *program)
         return false;
     }
 
-    return mglProgramHasAnyResourceName(program, "ChunkSection") ||
-           mglProgramHasAnyResourceName(program, "Sampler1") ||
-           mglProgramHasAnyResourceName(program, "Sampler2");
+    return mglTraceLogIsEnabled() &&
+           (mglTraceLogResourcesVerbose() || mglTraceLogProgramListContains(program->name));
 }
 
 /* === Sampler-like resource classification === */
 
-bool mglRendererSamplerNameLooksSamplerLike(const char *name)
+bool mglRendererResourceLooksSamplerLike(const SpirvResource *res, int type)
 {
-    return name &&
-           (strstr(name, "Sampler") ||
-            !strcmp(name, "CloudFaces"));
-}
-
-bool mglRendererResourceLooksSamplerLike(const SpirvResource *res, int resType)
-{
-    if (!res) {
-        return false;
-    }
-
-    switch (resType) {
-        case SPVC_RESOURCE_TYPE_SAMPLED_IMAGE:
-        case SPVC_RESOURCE_TYPE_SEPARATE_IMAGE:
-        case SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS:
-        case SPVC_RESOURCE_TYPE_STORAGE_IMAGE:
-            return true;
-        case SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT:
-            return res->image_dim != 0u ||
-                   res->uniform_location >= 0x4000 ||
-                   mglRendererSamplerNameLooksSamplerLike(res->name);
-        default:
-            return false;
-    }
+    return mglProgramResourceLooksSamplerLike(res, type);
 }
 
 SpirvResource *mglFindSamplerResourceForMetalBinding(Program *program,
@@ -196,17 +174,16 @@ SpirvResource *mglFindSamplerResourceForMetalBinding(Program *program,
  * mirroring MGLRenderer -textureUnitForSampledResource:metalBinding:stage:
  * but operating purely on the Program struct.  Returns the resolved unit
  * (0-based), or -1 if the resource is not sampler-like. */
-static GLint mglResolveSamplerResourceUnit(Program *program,
-                                           SpirvResource *res,
+GLint mglSamplerResourceTextureUnit(Program *program,
+                                           const SpirvResource *res,
                                            int stage,
                                            int resType)
 {
     if (!program || !res) return -1;
     if (!mglRendererResourceLooksSamplerLike(res, resType)) return -1;
 
-    /* 1. Per-resource explicit assignment (glUniform1i). */
-    if (res->sampler_unit_explicit &&
-        res->sampler_unit >= 0 &&
+    /* A GL resource owns its initial or explicitly assigned sampler value. */
+    if (res->sampler_unit >= 0 &&
         res->sampler_unit < (GLint)TEXTURE_UNITS) {
         return res->sampler_unit;
     }
@@ -277,7 +254,7 @@ bool mglProgramSamplesTextureUnit(Program *program, GLuint unit)
             if (resType < 0 || resType >= _MAX_SPIRV_RES) continue;
             SpirvResourceList *resources = &program->spirv_resources_list[stage][resType];
             for (GLuint i = 0; resources->list && i < resources->count; i++) {
-                GLint resolved = mglResolveSamplerResourceUnit(program,
+                GLint resolved = mglSamplerResourceTextureUnit(program,
                                                                &resources->list[i],
                                                                stage,
                                                                resType);
