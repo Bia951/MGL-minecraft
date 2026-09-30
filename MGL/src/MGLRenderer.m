@@ -1946,6 +1946,12 @@ NSUInteger mglRendererBuildCurrentVertexAttribBytes(GLMContext ctx,
 
     bzero(bytes, 16);
     const CurrentVertexAttrib *current = &ctx->state.current_vertex_attrib[attribute];
+    Program *vertexProgram = mglResolveProgramForStageFromState(ctx, _VERTEX_SHADER);
+    SpirvResource *input = mglRendererProgramVertexAttribResource(vertexProgram, attribute);
+    if (input && input->gl_type == GL_INT_VEC3 && attrib->type == GL_FLOAT) {
+        memcpy(bytes, current->i, sizeof(current->i));
+        return sizeof(current->i);
+    }
     GLuint size = attrib->size;
     if (size == 0u || size > 4u) {
         size = 4u;
@@ -3596,6 +3602,76 @@ static GLuint mglPlainStructLocStep(const SpirvResource *res)
     return step > 0 ? step : 1;
 }
 
+typedef struct {
+    char name[128];
+    size_t offset;
+    size_t size;
+    bool mat3;
+} MGLLooseMetalMember;
+
+/* Aggregated loose uniforms are reflected with the GLSL struct layout, but
+ * Metal pads mat3 columns to 16 bytes. Read the generated MSL member order so
+ * the transient packed buffer matches the layout the GPU actually reads. */
+static bool mglLooseMetalTypeLayout(const char *type, size_t *size, size_t *align)
+{
+    if (!strcmp(type, "float4x4")) { *size = 64; *align = 16; }
+    else if (!strcmp(type, "float3x3")) { *size = 48; *align = 16; }
+    else if (!strcmp(type, "float4") || !strcmp(type, "int4") ||
+             !strcmp(type, "uint4") || !strcmp(type, "float3") ||
+             !strcmp(type, "int3") || !strcmp(type, "uint3")) {
+        *size = 16; *align = 16;
+    } else if (!strcmp(type, "float2") || !strcmp(type, "int2") ||
+               !strcmp(type, "uint2")) { *size = 8; *align = 8; }
+    else if (!strcmp(type, "float") || !strcmp(type, "int") ||
+             !strcmp(type, "uint")) { *size = 4; *align = 4; }
+    else if (!strcmp(type, "short") || !strcmp(type, "ushort")) {
+        *size = 2; *align = 2;
+    } else return false;
+    return true;
+}
+
+static bool mglLooseMetalLayout(const char *msl, const char *resourceName,
+                                MGLLooseMetalMember members[128],
+                                size_t *memberCount, size_t *structSize)
+{
+    if (!msl || !resourceName || strncmp(resourceName, "_mgl_loose_", 11)) return false;
+    char declaration[64];
+    snprintf(declaration, sizeof(declaration), "struct _MGLLooseUniforms%s", resourceName + 10);
+    const char *p = strstr(msl, declaration);
+    if (!p || !(p = strchr(p, '{'))) return false;
+    p++;
+    size_t count = 0, offset = 0, maxAlign = 1;
+    while (*p && *p != '}') {
+        const char *end = strchr(p, '\n');
+        if (!end) return false;
+        char line[256], type[32] = {0}, name[128] = {0};
+        size_t length = (size_t)(end - p);
+        if (length >= sizeof(line)) return false;
+        memcpy(line, p, length);
+        line[length] = '\0';
+        if (sscanf(line, " %31s %127[^;];", type, name) == 2) {
+            size_t size = 0, align = 0;
+            if (!mglLooseMetalTypeLayout(type, &size, &align) || count >= 128) return false;
+            size_t nameLen = strlen(name);
+            while (nameLen && isspace((unsigned char)name[nameLen - 1])) name[--nameLen] = '\0';
+            offset = (offset + align - 1) & ~(align - 1);
+            strncpy(members[count].name, name, sizeof(members[count].name) - 1);
+            members[count].name[sizeof(members[count].name) - 1] = '\0';
+            members[count].offset = offset;
+            members[count].size = size;
+            members[count].mat3 = !strcmp(type, "float3x3");
+            count++;
+            offset += size;
+            if (align > maxAlign) maxAlign = align;
+        }
+        p = end + 1;
+    }
+    if (!count) return false;
+    *memberCount = count;
+    *structSize = (offset + maxAlign - 1) & ~(maxAlign - 1);
+    return true;
+}
+
 /* Compute the byte size of one element of a GL uniform type.
  * Used as a fallback array stride for plain struct uniform members
  * that lack ArrayStride decorations in SPIR-V. */
@@ -3936,6 +4012,11 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
                     }
                     GLuint array_size = mglStageBufferResourceElementCount(spvc_type, resource);
                     size_t struct_size = resource->required_size;
+                    MGLLooseMetalMember metalMembers[128];
+                    size_t metalMemberCount = 0;
+                    bool useMetalLayout = mglLooseMetalLayout(
+                        program->spirv[stage].msl_str, resource->name,
+                        metalMembers, &metalMemberCount, &struct_size);
                     bool allowFallback = fallbackBuffers &&
                         mglPlainUniformAllowsGlobalFallback(resource);
 
@@ -3970,6 +4051,18 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
                             GLuint member_offset = member->offset;
                             if (member_offset >= elem_byte_start) {
                                 member_offset -= elem_byte_start;
+                            }
+                            const MGLLooseMetalMember *metalMember = NULL;
+                            if (useMetalLayout && member->name) {
+                                const char *memberName = strrchr(member->name, '.');
+                                memberName = memberName ? memberName + 1 : member->name;
+                                for (size_t mi = 0; mi < metalMemberCount; mi++) {
+                                    if (!strcmp(metalMembers[mi].name, memberName)) {
+                                        metalMember = &metalMembers[mi];
+                                        member_offset = (GLuint)metalMember->offset;
+                                        break;
+                                    }
+                                }
                             }
                             if (member_offset >= struct_size) {
                                 continue;
@@ -4047,7 +4140,23 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
                                 if (!mbuf || !mbuf->data.buffer_data || mbuf->size <= 0) {
                                     continue;
                                 }
+                                if (metalMember && metalMember->mat3 && mbuf->size >= 36 &&
+                                    (size_t)member_offset + 48 <= struct_size) {
+                                    const uint8_t *src = (const uint8_t *)(uintptr_t)mbuf->data.buffer_data;
+                                    if (mbuf->size >= 48) {
+                                        memcpy(packed + member_offset, src, 48);
+                                    } else {
+                                        for (size_t col = 0; col < 3; col++) {
+                                            memcpy(packed + member_offset + col * 16,
+                                                   src + col * 12, 12);
+                                        }
+                                    }
+                                    continue;
+                                }
                                 size_t copy_size = (size_t)mbuf->size;
+                                if (metalMember && copy_size > metalMember->size) {
+                                    copy_size = metalMember->size;
+                                }
                                 if ((size_t)member_offset + copy_size > struct_size) {
                                     copy_size = struct_size - (size_t)member_offset;
                                 }
@@ -4375,8 +4484,18 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
                                                        (GLuint)att,
                                                        "mapGLBuffersToMTLBufferMap",
                                                        &resolved)) {
-                NSLog(@"MGL WARNING: mapGLBuffersToMTLBufferMap: enabled attrib %d has invalid/NULL buffer, skipping attrib",
-                      att);
+                static uint64_t invalidAttribHits = 0;
+                uint64_t hit = ++invalidAttribHits;
+                if (hit <= 16ull || hit % 4096ull == 0ull) {
+                    GLuint bindingIndex = vao->attrib[att].buffer_bindingindex;
+                    const BufferBinding *binding = bindingIndex < MGL_MAX_VERTEX_ATTRIB_BINDINGS
+                        ? &vao->bindings[bindingIndex] : NULL;
+                    NSLog(@"MGL WARNING: mapGLBuffersToMTLBufferMap: attrib %d has invalid/NULL buffer, skipping hit=%llu program=%u vao=%u enabled=0x%x attribBuffer=%p bindingIndex=%u bindingBuffer=%p stageInputs=%d",
+                          att, (unsigned long long)hit,
+                          activeProgram ? activeProgram->name : 0u, vao->name,
+                          vao->enabled_attribs, vao->attrib[att].buffer, bindingIndex,
+                          binding ? binding->buffer : NULL, count);
+                }
                 continue;
             }
             Buffer *gl_buffer = resolved.buffer;
@@ -4540,6 +4659,17 @@ static BOOL mglSnapshotSharedDirtyBuffer(id<MTLDevice> device,
         return YES;
     }
 
+    if (getenv("MGL_CAPTURE_SWAP_FRAMES")) {
+        static uint64_t snapshotCalls = 0;
+        uint64_t call = ++snapshotCalls;
+        if (call <= 8ull || (call % 4096ull) == 0ull) {
+            NSLog(@"MGL snapshot call=%llu ptr=%p buffer=%u length=%lu storage=0x%x access=0x%x accessFlags=0x%x mapped=%lld dirty=0x%x",
+                  (unsigned long long)call, ptr, ptr->name, (unsigned long)snapshotLength,
+                  ptr->storage_flags, ptr->access, ptr->access_flags,
+                  (long long)ptr->mapped_length, ptr->data.dirty_bits);
+        }
+    }
+
     MTLResourceOptions options = MTLResourceStorageModeShared;
     if (buffer.cpuCacheMode == MTLCPUCacheModeWriteCombined) {
         options |= MTLResourceCPUCacheModeWriteCombined;
@@ -4687,7 +4817,7 @@ static BOOL mglSnapshotSharedBufferRange(id<MTLDevice> device,
                 }
             }
 
-            if (ptr->access & GL_MAP_COHERENT_BIT) {
+            if (ptr->access_flags & GL_MAP_COHERENT_BIT) {
                 ptr->data.dirty_bits = DIRTY_BUFFER_DATA;
             } else {
                 ptr->data.dirty_bits &= ~(DIRTY_BUFFER_DATA | DIRTY_BUFFER_ADDR);
@@ -4777,9 +4907,10 @@ static BOOL mglSnapshotSharedBufferRange(id<MTLDevice> device,
         // clear dirty bits if not mapped as coherent
         // this will cause us to keep loading the buffer and keep the GPU
         // contents in check for EVERY drawing operation
-        BOOL coherentMapped =
-            ((ptr->access_flags & GL_MAP_COHERENT_BIT) != 0) ||
-            ((ptr->access & GL_MAP_COHERENT_BIT) != 0);
+        // access is the legacy GL_READ_ONLY/GL_WRITE_ONLY/GL_READ_WRITE enum,
+        // not a bitfield. GL_READ_WRITE (0x88BA) happens to overlap the
+        // GL_MAP_COHERENT_BIT bit and must never keep this buffer dirty.
+        BOOL coherentMapped = (ptr->access_flags & GL_MAP_COHERENT_BIT) != 0;
         if (coherentMapped)
         {
             NSUInteger modifyOffset = 0;
@@ -5296,7 +5427,9 @@ static BOOL mglSnapshotSharedBufferRange(id<MTLDevice> device,
         return NULL;
     }
 
-    if (tex->params.swizzled && !expandsSingleChannelSwizzle)
+    /* Metal rejects a swizzled descriptor with RenderTarget usage. Iris sets
+     * swizzles on depth attachments, so keep the renderable base unswizzled. */
+    if (tex->params.swizzled && !expandsSingleChannelSwizzle && !tex->is_render_target)
     {
         [self swizzleTexDesc:tex_desc forTex:tex];
     }
@@ -5520,6 +5653,37 @@ static BOOL mglSnapshotSharedBufferRange(id<MTLDevice> device,
 
     NSUInteger bytesPerRow = texWidth * bytesPerTexel;
     NSUInteger packedBytes = bytesPerRow * texHeight;
+    // Iris rebinds identical large texel buffers many times per frame. Reuse
+    // the immutable Metal upload when the format, shape, and all source bytes
+    // match. NSData equality checks the full contents, including hash matches.
+    static NSCache<NSData *, id<MTLTexture>> *texelBufferCache;
+    static dispatch_once_t texelBufferCacheOnce;
+    dispatch_once(&texelBufferCacheOnce, ^{
+        texelBufferCache = [NSCache new];
+        texelBufferCache.countLimit = 16;
+        texelBufferCache.totalCostLimit = 64u * 1024u * 1024u;
+    });
+    struct {
+        uintptr_t device;
+        NSUInteger format;
+        NSUInteger width;
+        NSUInteger height;
+        NSUInteger length;
+    } cacheHeader = {0};
+    cacheHeader.device = (uintptr_t)(__bridge void *)_device;
+    cacheHeader.format = (NSUInteger)bufferPixelFormat;
+    cacheHeader.width = texWidth;
+    cacheHeader.height = texHeight;
+    cacheHeader.length = (NSUInteger)tex->texture_buffer_size;
+    NSMutableData *cacheKey = [NSMutableData dataWithCapacity:sizeof(cacheHeader) + cacheHeader.length];
+    [cacheKey appendBytes:&cacheHeader length:sizeof(cacheHeader)];
+    [cacheKey appendBytes:sourceBytes length:cacheHeader.length];
+    id<MTLTexture> cachedTexture = [texelBufferCache objectForKey:cacheKey];
+    if (cachedTexture) {
+        tex->dirty_bits = 0;
+        sourceBuffer->data.dirty_bits = 0;
+        return cachedTexture;
+    }
     NSMutableData *packedData = nil;
     const uint8_t *uploadBytes = sourceBytes;
 
@@ -5597,15 +5761,6 @@ static BOOL mglSnapshotSharedBufferRange(id<MTLDevice> device,
         uploadBytes = (const uint8_t *)packedData.bytes;
     }
 
-    uint64_t sourceHash = mglTraceHashBytes(sourceBytes, (size_t)tex->texture_buffer_size);
-    uint64_t uploadHash = mglTraceHashBytes(uploadBytes, packedBytes);
-    char sourceHead[64];
-    char uploadHead[64];
-    sourceHead[0] = '\0';
-    uploadHead[0] = '\0';
-    mglTraceFormatBytes(sourceBytes, (size_t)MIN((NSUInteger)tex->texture_buffer_size, (NSUInteger)64), sourceHead, sizeof(sourceHead));
-    mglTraceFormatBytes(uploadBytes, (size_t)MIN(packedBytes, (NSUInteger)64), uploadHead, sizeof(uploadHead));
-
     MTLTextureDescriptor *bufferDesc =
         [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:bufferPixelFormat
                                                            width:texWidth
@@ -5643,36 +5798,26 @@ static BOOL mglSnapshotSharedBufferRange(id<MTLDevice> device,
     tex->dirty_bits = 0;
     sourceBuffer->data.dirty_bits = 0;
 
-    NSMutableData *readbackData = [NSMutableData dataWithLength:packedBytes];
-    uint64_t readbackHash = 0ull;
-    char readbackHead[64];
-    readbackHead[0] = '\0';
-    if (readbackData.mutableBytes) {
-        [bufferTexture getBytes:readbackData.mutableBytes
-                    bytesPerRow:bytesPerRow
-                     fromRegion:MTLRegionMake2D(0, 0, texWidth, texHeight)
-                    mipmapLevel:0];
-        readbackHash = mglTraceHashBytes(readbackData.bytes, packedBytes);
-        mglTraceFormatBytes(readbackData.bytes, (size_t)MIN(packedBytes, (NSUInteger)64), readbackHead, sizeof(readbackHead));
-    }
+    [texelBufferCache setObject:bufferTexture forKey:cacheKey cost:packedBytes + cacheKey.length];
 
-    NSLog(@"MGL TEXBUFFER CREATE tex=%u buffer=%u internal=0x%x mtlFormat=%lu texels=%lu packed=%lux%lu rowBytes=%lu bytes=%lld offset=%lld as=texture2d sourceHash=0x%016llx uploadHash=0x%016llx readbackHash=0x%016llx sourceHead=%s uploadHead=%s readbackHead=%s",
-          tex->name,
-          sourceBuffer->name,
-          tex->internalformat,
-          (unsigned long)bufferPixelFormat,
-          (unsigned long)texelCount,
-          (unsigned long)texWidth,
-          (unsigned long)texHeight,
-          (unsigned long)bytesPerRow,
-          (long long)tex->texture_buffer_size,
-          (long long)tex->texture_buffer_offset,
-          (unsigned long long)sourceHash,
-          (unsigned long long)uploadHash,
-          (unsigned long long)readbackHash,
-          sourceHead,
-          uploadHead,
-          readbackHead);
+    if (getenv("MGL_TEXBUFFER_DIAGNOSTICS")) {
+        uint64_t sourceHash = mglTraceHashBytes(sourceBytes, cacheHeader.length);
+        uint64_t uploadHash = mglTraceHashBytes(uploadBytes, packedBytes);
+        NSMutableData *readbackData = [NSMutableData dataWithLength:packedBytes];
+        uint64_t readbackHash = 0ull;
+        if (readbackData.mutableBytes) {
+            [bufferTexture getBytes:readbackData.mutableBytes
+                        bytesPerRow:bytesPerRow
+                         fromRegion:MTLRegionMake2D(0, 0, texWidth, texHeight)
+                        mipmapLevel:0];
+            readbackHash = mglTraceHashBytes(readbackData.bytes, packedBytes);
+        }
+        NSLog(@"MGL TEXBUFFER CREATE tex=%u buffer=%u internal=0x%x packed=%lux%lu sourceHash=0x%016llx uploadHash=0x%016llx readbackHash=0x%016llx",
+              tex->name, sourceBuffer->name, tex->internalformat,
+              (unsigned long)texWidth, (unsigned long)texHeight,
+              (unsigned long long)sourceHash, (unsigned long long)uploadHash,
+              (unsigned long long)readbackHash);
+    }
 
     [self recordGPUSuccess];
     return bufferTexture;
@@ -9096,9 +9241,64 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
 
         id<MTLTexture> rpColor0 = _renderPassDescriptor ? _renderPassDescriptor.colorAttachments[0].texture : nil;
         id<MTLTexture> drawableTexture = _drawable ? _drawable.texture : nil;
+        if (getenv("MGL_CAPTURE_SWAP_FRAMES") &&
+            (swapCall <= 5ull || swapCall % 300ull <= 2ull)) {
+            NSLog(@"MGL swap targets call=%llu self=%p drawable=%p texture=%p renderPassColor=%p defaultWritten=%d commandBuffer=%p",
+                  (unsigned long long)swapCall, self, _drawable, drawableTexture,
+                  rpColor0, _defaultDrawableWrittenSinceLastSwap ? 1 : 0,
+                  _currentCommandBuffer);
+        }
         [self copyRenderPassColorToDrawableIfNeeded:rpColor0 drawableTexture:drawableTexture swapCall:swapCall traceSwap:traceSwap];
 
         [self scheduleSwapTextureSampleDiagnostics:rpColor0 drawableTexture:drawableTexture swapCall:swapCall];
+
+        // Opt-in capture of the actual presented pixels for visual debugging.
+        static BOOL captureSwapFrames = NO;
+        static dispatch_once_t captureSwapFramesOnce;
+        dispatch_once(&captureSwapFramesOnce, ^{
+            captureSwapFrames = getenv("MGL_CAPTURE_SWAP_FRAMES") != NULL;
+        });
+        if (captureSwapFrames && swapCall <= 3ull) {
+            NSLog(@"MGL capture swap call=%llu format=%lu drawable=%p size=%lux%lu",
+                  (unsigned long long)swapCall, (unsigned long)drawableTexture.pixelFormat,
+                  drawableTexture, (unsigned long)drawableTexture.width,
+                  (unsigned long)drawableTexture.height);
+        }
+        if (captureSwapFrames && drawableTexture &&
+            (swapCall <= 3ull || (swapCall <= 600ull && swapCall % 30ull == 0ull) ||
+             (swapCall > 600ull && swapCall <= 9000ull && swapCall % 300ull == 0ull)) &&
+            (drawableTexture.pixelFormat == MTLPixelFormatBGRA8Unorm ||
+             drawableTexture.pixelFormat == MTLPixelFormatBGRA8Unorm_sRGB)) {
+            NSUInteger width = drawableTexture.width;
+            NSUInteger height = drawableTexture.height;
+            NSUInteger rowBytes = (width * 4u + 255u) & ~255u;
+            id<MTLBuffer> captureBuffer = [_device newBufferWithLength:rowBytes * height
+                                                               options:MTLResourceStorageModeShared];
+            id<MTLBlitCommandEncoder> captureBlit = [_currentCommandBuffer blitCommandEncoder];
+            [captureBlit copyFromTexture:drawableTexture
+                             sourceSlice:0 sourceLevel:0
+                            sourceOrigin:MTLOriginMake(0, 0, 0)
+                              sourceSize:MTLSizeMake(width, height, 1)
+                                toBuffer:captureBuffer destinationOffset:0
+                       destinationBytesPerRow:rowBytes
+                     destinationBytesPerImage:rowBytes * height];
+            [captureBlit endEncoding];
+            uint64_t capturedCall = swapCall;
+            [_currentCommandBuffer addCompletedHandler:^(id<MTLCommandBuffer> commandBuffer) {
+                if (commandBuffer.status != MTLCommandBufferStatusCompleted) return;
+                NSString *path = [NSString stringWithFormat:@"/Volumes/HDData/Development/mgl-diagnostics/mgl-drawable-%llu-%lux%lu.bgra",
+                                  (unsigned long long)capturedCall,
+                                  (unsigned long)width, (unsigned long)height];
+                FILE *file = fopen(path.fileSystemRepresentation, "wb");
+                if (!file) return;
+                const uint8_t *bytes = captureBuffer.contents;
+                for (NSUInteger row = 0; row < height; row++) {
+                    fwrite(bytes + row * rowBytes, 1, width * 4u, file);
+                }
+                fclose(file);
+                NSLog(@"MGL captured drawable call=%llu path=%@", (unsigned long long)capturedCall, path);
+            }];
+        }
 
         if (_layer == NULL) {
             NSLog(@"MGL ERROR: Metal layer is NULL, cannot present drawable");
@@ -9273,6 +9473,16 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
             (rpColor0.pixelFormat == drawableTexture.pixelFormat ||
              (rpColor0.pixelFormat == MTLPixelFormatRGBA8Unorm && drawableTexture.pixelFormat == MTLPixelFormatBGRA8Unorm) ||
              (rpColor0.pixelFormat == MTLPixelFormatBGRA8Unorm && drawableTexture.pixelFormat == MTLPixelFormatRGBA8Unorm));
+        if (getenv("MGL_CAPTURE_SWAP_FRAMES") &&
+            (swapCall <= 3ull || swapCall % 300ull == 0ull)) {
+            NSLog(@"MGL copy to drawable call=%llu src=%p fmt=%lu usage=%lu size=%lux%lu dst=%p fmt=%lu size=%lux%lu canCopy=%d",
+                  (unsigned long long)swapCall, rpColor0,
+                  (unsigned long)rpColor0.pixelFormat, (unsigned long)rpColor0.usage,
+                  (unsigned long)rpColor0.width, (unsigned long)rpColor0.height,
+                  drawableTexture, (unsigned long)drawableTexture.pixelFormat,
+                  (unsigned long)drawableTexture.width, (unsigned long)drawableTexture.height,
+                  canShaderCopyToDrawable ? 1 : 0);
+        }
         if (canShaderCopyToDrawable) {
                 id<MTLRenderPipelineState> pipeline = [self scaledBlitPipelineForPixelFormat:drawableTexture.pixelFormat];
                 id<MTLSamplerState> sampler = [self scaledBlitSamplerForFilter:GL_NEAREST];

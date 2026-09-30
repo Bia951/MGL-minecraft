@@ -3281,7 +3281,13 @@ create_new_command_buffer:
             }
         }
 
-        _currentCommandBuffer = [_commandQueue commandBuffer];
+        if (getenv("MGL_TRACE_ENCODER_FAILURE")) {
+            MTLCommandBufferDescriptor *descriptor = [MTLCommandBufferDescriptor new];
+            descriptor.errorOptions = MTLCommandBufferErrorOptionEncoderExecutionStatus;
+            _currentCommandBuffer = [_commandQueue commandBufferWithDescriptor:descriptor];
+        } else {
+            _currentCommandBuffer = [_commandQueue commandBuffer];
+        }
         if (!_currentCommandBuffer) {
             NSLog(@"MGL AGX ERROR: Failed to create Metal command buffer - command queue may be in error state");
             [self recordGPUError];
@@ -3940,6 +3946,16 @@ create_new_command_buffer:
                                              normalized);
             }
 
+            /* Iris can leave a floating current-value declaration at the
+             * entity slot while the active shader consumes an ivec3. Metal
+             * requires the descriptor to match the shader's integer type.
+             * The current value is uploaded as integers when bound. */
+            SpirvResource *shaderInput = mglRendererProgramVertexAttribResource(activeProgram, i);
+            if (usesCurrentValue && shaderInput && shaderInput->gl_type == GL_INT_VEC3 &&
+                vao->attrib[i].type == GL_FLOAT && vao->attrib[i].size >= 3) {
+                format = MTLVertexFormatInt3;
+            }
+
             if (format == MTLVertexFormatInvalid)
             {
                 NSLog(@"MGL PIPELINE DESC fail: unable to map attrib %u type/size/normalize to MTL format", i);
@@ -4014,7 +4030,12 @@ create_new_command_buffer:
                 vertexDescriptor.layouts[mapped_buffer_index].stride = resolved.stride;
             }
 
-            if (!usesCurrentValue && resolved.divisor)
+            if (usesCurrentValue)
+            {
+                vertexDescriptor.layouts[mapped_buffer_index].stepRate = 0;
+                vertexDescriptor.layouts[mapped_buffer_index].stepFunction = MTLVertexStepFunctionConstant;
+            }
+            else if (resolved.divisor)
             {
                 vertexDescriptor.layouts[mapped_buffer_index].stepRate = resolved.divisor;
                 vertexDescriptor.layouts[mapped_buffer_index].stepFunction = MTLVertexStepFunctionPerInstance;
@@ -4879,6 +4900,12 @@ create_new_command_buffer:
     @try {
         if (!_lastBoundValid || _lastPipelineState != _pipelineState) {
             [_currentRenderEncoder setRenderPipelineState:_pipelineState];
+            if (getenv("MGL_TRACE_ENCODER_FAILURE")) {
+                [_currentRenderEncoder insertDebugSignpost:
+                    [NSString stringWithFormat:@"program=%u fbo=%u",
+                     (unsigned)ctx->state.program_name,
+                     (unsigned)(ctx->state.framebuffer ? ctx->state.framebuffer->name : 0u)]];
+            }
             _lastPipelineState = _pipelineState;
             MGL_PERF_INC(g_mglSetRenderPipelineStateCallsSinceSwap);
         } else {
@@ -5506,7 +5533,20 @@ stencil_format_ok:;
                 _pipelineState = [_device newRenderPipelineStateWithDescriptor:pipelineStateDescriptor error:&error];
 
                 if (!_pipelineState) {
-                    NSLog(@"MGL PIPELINE CREATE fail error=%@", error);
+                    NSLog(@"MGL PIPELINE CREATE fail program=%u error=%@", (unsigned)currentProgramName, error);
+                    if ([error.localizedDescription containsString:@"Vertex attribute"]) {
+                        Program *vertexProgram = mglResolveProgramForStageFromState(ctx, _VERTEX_SHADER);
+                        for (GLuint ai = 0; ai < 16u; ai++) {
+                            SpirvResource *ar = mglRendererProgramVertexAttribResource(vertexProgram, ai);
+                            if (!ar) continue;
+                            NSLog(@"MGL PIPELINE ATTR program=%u loc=%u name=%s glType=0x%x vaoType=0x%x vaoSize=%d integer=%d metalFormat=%lu",
+                                  (unsigned)currentProgramName, (unsigned)ai,
+                                  ar->name ? ar->name : "?", ar->gl_type,
+                                  currentVAO->attrib[ai].type, currentVAO->attrib[ai].size,
+                                  currentVAO->attrib[ai].integer,
+                                  (unsigned long)vertexDescriptor.attributes[ai].format);
+                        }
+                    }
                     NSLog(@"MGL ERROR: Pipeline creation failed: %@", error);
 
                     NSString *errDesc = error.localizedDescription ?: @"";

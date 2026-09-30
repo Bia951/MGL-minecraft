@@ -116,7 +116,7 @@ bool mglShouldSkipStageBufferResource(Program *program,
 bool mglShouldSkipStageTextureResource(Program *program,
                                        int stage,
                                        int resourceType,
-                                       const SpirvResource *resource);
+                                       SpirvResource *resource);
 
 bool mglShouldSkipStageSamplerResource(Program *program,
                                        int stage,

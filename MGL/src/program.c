@@ -835,6 +835,14 @@ void mglLinkProgram(GLMContext ctx, GLuint program)
     pptr->vertexAttribUsageMask = 0u;
     memset(pptr->msl_named_argument_cache, 0, sizeof(pptr->msl_named_argument_cache));
     pptr->msl_named_argument_cache_next = 0u;
+    for (int stage = 0; stage < _MAX_SHADER_TYPES; stage++) {
+        for (int type = 0; type < _MAX_SPIRV_RES; type++) {
+            SpirvResourceList *resources = &pptr->spirv_resources_list[stage][type];
+            for (GLuint i = 0; i < resources->count; i++) {
+                resources->list[i].msl_texture_argument_state = 0u;
+            }
+        }
+    }
     memset(pptr->validated_resource_lists, 0, sizeof(pptr->validated_resource_lists));
     memset(pptr->validated_resource_list_storage, 0, sizeof(pptr->validated_resource_list_storage));
     memset(pptr->validated_resource_list_counts, 0, sizeof(pptr->validated_resource_list_counts));

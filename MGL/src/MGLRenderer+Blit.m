@@ -2224,6 +2224,50 @@ typedef struct MGLBlitColorState {
         return;
     }
 
+    // Read back the source of the final framebuffer blit alongside the
+    // drawable capture, so a frozen source can be distinguished from a bad copy.
+    static uint64_t s_captureDefaultBlit = 0;
+    if (getenv("MGL_CAPTURE_SWAP_FRAMES") && drawfbo == NULL &&
+        (++s_captureDefaultBlit % 300ull) == 0ull && s_captureDefaultBlit <= 9000ull &&
+        readtexid.pixelFormat == MTLPixelFormatRGBA8Unorm && readSubresource.level == 0 &&
+        readtexid.textureType == MTLTextureType2D) {
+        NSUInteger captureWidth = readtexid.width;
+        NSUInteger captureHeight = readtexid.height;
+        NSUInteger captureRowBytes = (captureWidth * 4u + 255u) & ~255u;
+        id<MTLBuffer> captureBuffer = [_device newBufferWithLength:captureRowBytes * captureHeight
+                                                           options:MTLResourceStorageModeShared];
+        id<MTLBlitCommandEncoder> captureEncoder = [_currentCommandBuffer blitCommandEncoder];
+        [captureEncoder copyFromTexture:readtexid sourceSlice:readSubresource.slice
+                             sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+                              sourceSize:MTLSizeMake(captureWidth, captureHeight, 1)
+                                toBuffer:captureBuffer destinationOffset:0
+                       destinationBytesPerRow:captureRowBytes
+                     destinationBytesPerImage:captureRowBytes * captureHeight];
+        [captureEncoder endEncoding];
+        uint64_t captureCall = s_captureDefaultBlit;
+        [_currentCommandBuffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+            if (cb.status != MTLCommandBufferStatusCompleted) return;
+            NSString *path = [NSString stringWithFormat:@"/Volumes/HDData/Development/mgl-diagnostics/mgl-blit-source-%llu-%lux%lu.rgba",
+                              (unsigned long long)captureCall,
+                              (unsigned long)captureWidth, (unsigned long)captureHeight];
+            FILE *file = fopen(path.fileSystemRepresentation, "wb");
+            if (!file) return;
+            const uint8_t *bytes = captureBuffer.contents;
+            for (NSUInteger row = 0; row < captureHeight; row++) {
+                fwrite(bytes + row * captureRowBytes, 1, captureWidth * 4u, file);
+            }
+            fclose(file);
+            NSLog(@"MGL captured blit source call=%llu path=%@", (unsigned long long)captureCall, path);
+        }];
+    }
+    if (getenv("MGL_CAPTURE_SWAP_FRAMES") && drawfbo == NULL &&
+        s_captureDefaultBlit <= 9000ull &&
+        (s_captureDefaultBlit <= 5ull || s_captureDefaultBlit % 300ull <= 2ull)) {
+        NSLog(@"MGL default blit call=%llu self=%p drawable=%p source=%p destination=%p commandBuffer=%p",
+              (unsigned long long)s_captureDefaultBlit, self, _drawable,
+              readtexid, drawtexid, _currentCommandBuffer);
+    }
+
     BOOL needsFormatConversionBlit = NO;
     if (readtexid.pixelFormat != drawtexid.pixelFormat) {
         BOOL rgbaBgraPair =

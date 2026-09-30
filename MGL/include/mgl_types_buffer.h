@@ -125,7 +125,10 @@ typedef struct BufferBaseTarget_t {
     Buffer      *buf;
 } BufferBaseTarget;
 
-#define MAX_BINDABLE_BUFFERS    84
+/* Logical GL slots also back plain uniform locations. Iris shaderpacks can
+ * expose more than 84 struct members; keep this above their location range.
+ * Metal argument slots remain independently capped by the renderer. */
+#define MAX_BINDABLE_BUFFERS    512
 #define MGL_MAX_VERTEX_ATTRIB_BINDINGS MAX_VERTEX_BUFFER_BINDINGS
 #define MGL_BUFFER_SIZE_BUFFER_INDEX 25u  /* Metal buffer slot for spvBufferSizeConstants */
 typedef struct BufferBase_t {

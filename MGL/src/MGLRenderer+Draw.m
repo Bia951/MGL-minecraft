@@ -752,15 +752,8 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
                 NSLog(@"MGL VBIND skip attrib=%u: failed to build current vertex attrib bytes", attrib);
                 continue;
             }
-            static const NSUInteger kMGLCurrentAttribRepeatCount = 4096u;
-            if (attribStride > NSUIntegerMax / kMGLCurrentAttribRepeatCount) {
-                NSLog(@"MGL VBIND skip attrib=%u: current vertex attrib stream size overflow stride=%lu",
-                      attrib,
-                      (unsigned long)attribStride);
-                continue;
-            }
-
-            NSUInteger streamLength = kMGLCurrentAttribRepeatCount * attribStride;
+            /* Constant vertex step reads this value for every vertex. */
+            NSUInteger streamLength = attribStride;
             NSUInteger valueBytes = MIN((NSUInteger)sizeof(attribBytes), attribStride);
             id<MTLBuffer> currentAttribBuffer = _currentVertexAttribBuffers[attrib];
             BOOL cacheHit =
@@ -784,18 +777,8 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
                     continue;
                 }
 
-                /* Build one stride, then duplicate the initialized prefix by
-                 * powers of two.  This replaces 4096 tiny memcpy calls and
-                 * avoids an intermediate NSMutableData allocation. */
                 memset(dst, 0, attribStride);
                 memcpy(dst, attribBytes, valueBytes);
-                NSUInteger initialized = attribStride;
-                while (initialized < streamLength) {
-                    NSUInteger copyLength = MIN(initialized,
-                                                streamLength - initialized);
-                    memcpy(dst + initialized, dst, copyLength);
-                    initialized += copyLength;
-                }
 
                 _currentVertexAttribBuffers[attrib] = currentAttribBuffer;
                 _currentVertexAttribStrides[attrib] = attribStride;

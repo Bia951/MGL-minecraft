@@ -2496,6 +2496,107 @@ GLint mglFirstFreePlainUniformLocation(const bool used[MAX_BINDABLE_BUFFERS])
     return -1;
 }
 
+static bool mglIsSynthesizedLooseUniformStruct(const SpirvResource *res)
+{
+    return res && res->name &&
+           strncmp(res->name, "_mgl_loose_", strlen("_mgl_loose_")) == 0 &&
+           res->ubo_members && res->ubo_member_count > 0 &&
+           res->gl_array_size <= 1;
+}
+
+static const char *mglLooseUniformLeafName(const SpirvUBOMember *member)
+{
+    const char *name = member->query_name ? member->query_name : member->name;
+    const char *dot = name ? strrchr(name, '.') : NULL;
+    return dot ? dot + 1 : name;
+}
+
+static void mglUnifySynthesizedLooseUniformLocations(Program *program)
+{
+    const char *names[MAX_BINDABLE_BUFFERS];
+    GLint sizes[MAX_BINDABLE_BUFFERS];
+    GLint offsets[MAX_BINDABLE_BUFFERS];
+    size_t count = 0;
+    bool occupied[MAX_BINDABLE_BUFFERS] = {false};
+    bool found = false;
+
+    for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++) {
+        SpirvResourceList *resources =
+            &program->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT];
+        for (GLuint i = 0; resources->list && i < resources->count; i++) {
+            SpirvResource *res = &resources->list[i];
+            if (mglProgramResourceLooksSamplerLike(res, SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT))
+                continue;
+            if (!mglIsSynthesizedLooseUniformStruct(res)) {
+                if (res->uniform_location >= 0 && res->uniform_location < MAX_BINDABLE_BUFFERS) {
+                    GLint span = res->gl_array_size > 0 ? res->gl_array_size : 1;
+                    for (GLint loc = res->uniform_location;
+                         loc < res->uniform_location + span && loc < MAX_BINDABLE_BUFFERS; loc++)
+                        occupied[loc] = true;
+                }
+                continue;
+            }
+            found = true;
+            for (GLuint m = 0; m < res->ubo_member_count; m++) {
+                const SpirvUBOMember *member = &res->ubo_members[m];
+                const char *name = mglLooseUniformLeafName(member);
+                if (!name) continue;
+                size_t index = 0;
+                while (index < count && strcmp(names[index], name) != 0) index++;
+                GLint size = member->size > 0 ? member->size : 1;
+                if (index == count) {
+                    if (count >= MAX_BINDABLE_BUFFERS) return;
+                    names[count] = name;
+                    sizes[count++] = size;
+                } else if (sizes[index] < size) {
+                    sizes[index] = size;
+                }
+            }
+        }
+    }
+    if (!found || count == 0) return;
+
+    GLint total = 0;
+    for (size_t i = 0; i < count; i++) {
+        offsets[i] = total;
+        total += sizes[i];
+    }
+    if (total > MAX_BINDABLE_BUFFERS) return;
+
+    GLint base = -1;
+    for (GLint candidate = 0; candidate <= MAX_BINDABLE_BUFFERS - total; candidate++) {
+        bool freeRange = true;
+        for (GLint loc = candidate; loc < candidate + total; loc++) {
+            if (occupied[loc]) { freeRange = false; break; }
+        }
+        if (freeRange) { base = candidate; break; }
+    }
+    if (base < 0) return;
+
+    for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++) {
+        SpirvResourceList *resources =
+            &program->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT];
+        for (GLuint i = 0; resources->list && i < resources->count; i++) {
+            SpirvResource *res = &resources->list[i];
+            if (!mglIsSynthesizedLooseUniformStruct(res)) continue;
+            res->uniform_location = base;
+            for (GLuint m = 0; m < res->ubo_member_count; m++) {
+                SpirvUBOMember *member = &res->ubo_members[m];
+                const char *name = mglLooseUniformLeafName(member);
+                if (!name) continue;
+                for (size_t index = 0; index < count; index++) {
+                    if (strcmp(names[index], name) == 0) {
+                        member->location_offset = offsets[index];
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    fprintf(stderr, "MGL LOOSE UNIFORMS: program=%u base=%d members=%zu slots=%d\n",
+            program->name, base, count, total);
+}
+
 void mglAssignPlainUniformLocations(Program *program)
 {
     if (!program) {
@@ -2605,6 +2706,7 @@ void mglAssignPlainUniformLocations(Program *program)
                     (unsigned)res->binding);
         }
     }
+    mglUnifySynthesizedLooseUniformLocations(program);
 }
 
 GLint mglDefaultSamplerUnitForProgramResource(Program *program, const SpirvResource *res)

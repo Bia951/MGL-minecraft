@@ -1169,6 +1169,12 @@ static int mglIsLooseUniformLine(const char *line_start, const char *line_end,
     memcpy(out_type, type_start, type_len);
     out_type[type_len] = '\0';
 
+    /* Signed/unsigned sampler and image types do not start with the plain
+     * "sampler" / "image" prefixes. They must remain texture resources;
+     * embedding one in a loose-uniform struct creates an unbound Metal
+     * texture handle when the shader reads it. */
+    if (strstr(out_type, "sampler") || strstr(out_type, "image")) return 0;
+
     while (p < line_end && (*p == ' ' || *p == '\t')) p++;
     if (p >= line_end) return 0;
 

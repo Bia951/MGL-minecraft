@@ -164,6 +164,16 @@ static void mglBufferMarkWrite(Buffer *ptr,
         return;
     }
 
+    if (getenv("MGL_CAPTURE_SWAP_FRAMES") && ptr->size > (1 << 20)) {
+        static uint64_t largeWrites = 0;
+        uint64_t call = ++largeWrites;
+        if (call <= 8ull || (call % 4096ull) == 0ull) {
+            fprintf(stderr, "MGL large buffer write call=%llu ptr=%p buffer=%u source=%d off=%lld size=%lld dirty=0x%x\n",
+                    (unsigned long long)call, (void *)ptr, ptr->name, source,
+                    (long long)offset, (long long)size, ptr->data.dirty_bits);
+        }
+    }
+
     ptr->ever_written = GL_TRUE;
     if (size > 0 &&
         offset >= 0 &&
@@ -2671,8 +2681,12 @@ GLboolean mglUnmapBuffer(GLMContext ctx, GLenum target)
 
         mglBufferMarkMapWrite(ptr);
 
-        // this will cause the buffer to be flushed on next draw command
-        ptr->data.dirty_bits |= DIRTY_BUFFER_DATA;
+        // mtlMapUnmapBuffer has already published the mapped range to the
+        // Metal backing. A dirty bit here recopies the entire buffer on the
+        // next draw, even when only a small chunk range changed.
+        if (!ctx->mtl_funcs.mtlMapUnmapBuffer) {
+            ptr->data.dirty_bits |= DIRTY_BUFFER_DATA;
+        }
 
         ptr->mapped = GL_FALSE;
         ptr->access = 0;
@@ -2698,7 +2712,7 @@ GLboolean mglUnmapBuffer(GLMContext ctx, GLenum target)
     }
 
     mglBufferMarkMapWrite(ptr);
-    if (mglBufferMapAllowsWrite(ptr)) {
+    if (mglBufferMapAllowsWrite(ptr) && !ctx->mtl_funcs.mtlMapUnmapBuffer) {
         ptr->data.dirty_bits |= DIRTY_BUFFER_DATA;
         ctx->state.dirty_bits |= DIRTY_BUFFER;
     }
@@ -2757,7 +2771,7 @@ GLboolean mglUnmapNamedBuffer(GLMContext ctx, GLuint buffer)
     }
 
     mglBufferMarkMapWrite(ptr);
-    if (mglBufferMapAllowsWrite(ptr)) {
+    if (mglBufferMapAllowsWrite(ptr) && !ctx->mtl_funcs.mtlMapUnmapBuffer) {
         ptr->data.dirty_bits |= DIRTY_BUFFER_DATA;
         ctx->state.dirty_bits |= DIRTY_BUFFER;
     }
@@ -2911,8 +2925,9 @@ void *mglMapBufferRange(GLMContext ctx, GLenum target, GLintptr offset, GLsizeip
         {
             ptr->access_flags = access_flags;
             ptr->mapped = GL_TRUE;
-
-            ptr->data.dirty_bits |= DIRTY_BUFFER_DATA;
+            if (access_flags & GL_MAP_COHERENT_BIT) {
+                ptr->data.dirty_bits |= DIRTY_BUFFER_DATA;
+            }
 
             // return a pointer to the backing data and keep mapped state for flush/unmap semantics
             mapped_ptr = (void *)((uint8_t *)(uintptr_t)ptr->data.buffer_data + (size_t)offset);
@@ -3089,7 +3104,9 @@ void *mglMapNamedBufferRange(GLMContext ctx, GLuint buffer, GLintptr offset, GLs
         {
             ptr->access_flags = access;
             ptr->mapped = GL_TRUE;
-            ptr->data.dirty_bits |= DIRTY_BUFFER_DATA;
+            if (access & GL_MAP_COHERENT_BIT) {
+                ptr->data.dirty_bits |= DIRTY_BUFFER_DATA;
+            }
             mapped_ptr = (void *)((uint8_t *)(uintptr_t)ptr->data.buffer_data + (size_t)offset);
             if (trace_map) {
                 fprintf(stderr,

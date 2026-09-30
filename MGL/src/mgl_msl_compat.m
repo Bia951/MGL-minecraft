@@ -504,7 +504,8 @@ bool mglShouldSkipStageBufferResource(Program *program,
         return false;
     }
 
-    if (resourceType != SPVC_RESOURCE_TYPE_UNIFORM_BUFFER) {
+    if (resourceType != SPVC_RESOURCE_TYPE_UNIFORM_BUFFER &&
+        resourceType != SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT) {
         return false;
     }
 
@@ -534,7 +535,7 @@ bool mglShouldSkipStageBufferResource(Program *program,
 bool mglShouldSkipStageTextureResource(Program *program,
                                        int stage,
                                        int resourceType,
-                                       const SpirvResource *resource)
+                                       SpirvResource *resource)
 {
     if (!program || !resource || !resource->name) {
         return false;
@@ -550,7 +551,12 @@ bool mglShouldSkipStageTextureResource(Program *program,
             return false;
     }
 
+    if (resource->msl_texture_argument_state != 0u) {
+        return resource->msl_texture_argument_state == 2u;
+    }
+
     if (mglStageMSLHasNamedTextureArgument(program, stage, resource->name, resource->binding)) {
+        resource->msl_texture_argument_state = 1u;
         return false;
     }
 
@@ -560,8 +566,11 @@ bool mglShouldSkipStageTextureResource(Program *program,
      * identifier before treating the resource as stale. */
     if (resource->name && strcmp(resource->name, "sampler") == 0 &&
         mglStageMSLHasNamedTextureArgument(program, stage, "mgl_sampler_tex", resource->binding)) {
+        resource->msl_texture_argument_state = 1u;
         return false;
     }
+
+    resource->msl_texture_argument_state = 2u;
 
     static uint64_t s_staleTextureResourceSkipLogs = 0;
     uint64_t hit = ++s_staleTextureResourceSkipLogs;
