@@ -845,7 +845,8 @@ void mglTraceTextureUnitState(GLMContext ctx,
 {
     static uint64_t s_texture_unit_trace_count = 0;
 
-    if (!ctx || unit >= TEXTURE_UNITS) {
+    if ((!MGL_VERBOSE_TEXTURE_BIND_LOGS && !mglTraceLogIsEnabled()) ||
+        !ctx || unit >= TEXTURE_UNITS) {
         return;
     }
 
@@ -856,24 +857,9 @@ void mglTraceTextureUnitState(GLMContext ctx,
     Texture *observed = bound ? bound : unit_active;
     GLenum observed_format = observed ? observed->internalformat : 0u;
     bool depth_or_stencil = mglTextureFormatLooksDepthOrStencil(observed_format);
-    bool dynamic_render_target_texture =
-        (texture >= 50u && texture <= 100u) ||
-        (mglTraceTextureNameC(unit_active) >= 50u && mglTraceTextureNameC(unit_active) <= 100u) ||
-        (mglTraceTextureNameC(unit_2d) >= 50u && mglTraceTextureNameC(unit_2d) <= 100u);
-
-    bool interesting =
-        unit == 0 ||
-        target == GL_TEXTURE_BUFFER ||
-        texture == 0 ||
-        texture == 10 ||
-        texture == 13 ||
-        texture == 4231 ||
-        dynamic_render_target_texture ||
-        depth_or_stencil ||
-        mglTraceTextureNameC(unit_active) == 4231 ||
-        mglTraceTextureNameC(unit_buffer) != 0 ||
-        mglTraceTextureNameC(unit_2d) == 4231 ||
-        mglTraceTextureNameC(unit_cube) == 10;
+    bool dynamic_render_target_texture = observed && observed->is_render_target;
+    bool interesting = unit == 0 || target == GL_TEXTURE_BUFFER || texture == 0 ||
+                       dynamic_render_target_texture || depth_or_stencil;
 
     if (!interesting) {
         return;

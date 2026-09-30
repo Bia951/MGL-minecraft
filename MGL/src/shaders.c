@@ -18,6 +18,7 @@
  *
  */
 
+#include "mgl_trace_log.h"
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -1340,8 +1341,10 @@ static void mglAggregateLooseUniforms(char *src, size_t src_capacity, GLuint sha
         memset(ls, ' ', le - ls);
     }
 
-    fprintf(stderr, "MGL AGGREGATE: packed %d loose uniforms into _MGLLooseUniforms struct\n",
-            uni_count);
+    if (mglTraceEnvFlagEnabled("MGL_DEBUG_RESOURCE_ABI")) {
+        fprintf(stderr, "MGL AGGREGATE: packed %d loose uniforms into _MGLLooseUniforms struct\n",
+                uni_count);
+    }
 }
 
 static const glslang_resource_t *mgl_glslang_resource(GLMContext ctx)
