@@ -1944,84 +1944,16 @@ NSUInteger mglRendererBuildCurrentVertexAttribBytes(GLMContext ctx,
         return 0u;
     }
 
-    bzero(bytes, 16);
     const CurrentVertexAttrib *current = &ctx->state.current_vertex_attrib[attribute];
-    Program *vertexProgram = mglResolveProgramForStageFromState(ctx, _VERTEX_SHADER);
-    SpirvResource *input = mglRendererProgramVertexAttribResource(vertexProgram, attribute);
-    if (input && input->gl_type == GL_INT_VEC3 && attrib->type == GL_FLOAT) {
-        memcpy(bytes, current->i, sizeof(current->i));
-        return sizeof(current->i);
-    }
-    GLuint size = attrib->size;
-    if (size == 0u || size > 4u) {
-        size = 4u;
-    }
-
-    switch (attrib->type) {
-        case GL_BYTE:
-        case GL_SHORT:
-        case GL_INT:
-        {
-            size_t componentBytes = (attrib->type == GL_BYTE) ? sizeof(int8_t) :
-                                    (attrib->type == GL_SHORT) ? sizeof(int16_t) :
-                                    sizeof(int32_t);
-            if (componentBytes == 0u || componentBytes * size > 16u) {
-                return 0u;
-            }
-            for (GLuint i = 0; i < size; i++) {
-                GLint value = current->i[i];
-                if (attrib->type == GL_BYTE) {
-                    int8_t packed = (int8_t)value;
-                    memcpy(bytes + i * componentBytes, &packed, componentBytes);
-                } else if (attrib->type == GL_SHORT) {
-                    int16_t packed = (int16_t)value;
-                    memcpy(bytes + i * componentBytes, &packed, componentBytes);
-                } else {
-                    int32_t packed = (int32_t)value;
-                    memcpy(bytes + i * componentBytes, &packed, componentBytes);
-                }
-            }
-            return 16u;
-        }
-        case GL_UNSIGNED_BYTE:
-        case GL_UNSIGNED_SHORT:
-        case GL_UNSIGNED_INT:
-        {
-            size_t componentBytes = (attrib->type == GL_UNSIGNED_BYTE) ? sizeof(uint8_t) :
-                                    (attrib->type == GL_UNSIGNED_SHORT) ? sizeof(uint16_t) :
-                                    sizeof(uint32_t);
-            if (componentBytes == 0u || componentBytes * size > 16u) {
-                return 0u;
-            }
-            for (GLuint i = 0; i < size; i++) {
-                GLuint value = current->u[i];
-                if (attrib->type == GL_UNSIGNED_BYTE) {
-                    uint8_t packed = (uint8_t)value;
-                    memcpy(bytes + i * componentBytes, &packed, componentBytes);
-                } else if (attrib->type == GL_UNSIGNED_SHORT) {
-                    uint16_t packed = (uint16_t)value;
-                    memcpy(bytes + i * componentBytes, &packed, componentBytes);
-                } else {
-                    uint32_t packed = (uint32_t)value;
-                    memcpy(bytes + i * componentBytes, &packed, componentBytes);
-                }
-            }
-            return 16u;
-        }
-        case GL_DOUBLE:
-        case GL_FLOAT:
-        default:
-        {
-            GLfloat packed[4] = {
-                current->f[0],
-                current->f[1],
-                current->f[2],
-                current->f[3],
-            };
-            memcpy(bytes, packed, sizeof(packed));
-            return sizeof(packed);
-        }
-    }
+    Program *program = mglResolveProgramForStageFromState(ctx, _VERTEX_SHADER);
+    SpirvResource *input = mglRendererProgramVertexAttribResource(program, attribute);
+    MGLVertexAttributePlan plan = mglVertexAttributePlan(attrib,
+        input ? input->gl_type : 0, true);
+    const void *values = plan.format == MTLVertexFormatInt4 ? (const void *)current->i :
+                         plan.format == MTLVertexFormatUInt4 ? (const void *)current->u :
+                         (const void *)current->f;
+    memcpy(bytes, values, 16);
+    return 16;
 }
 
 typedef enum MGLTCSStageInBaseType_t {
@@ -2506,157 +2438,6 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
 // Main class performing the rendering
 @implementation MGLRenderer
 
-MTLVertexFormat glTypeSizeToMtlType(GLuint type, GLuint size, bool normalized)
-{
-    switch(type)
-    {
-        case GL_UNSIGNED_BYTE:
-            if (normalized)
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatUCharNormalized;
-                    case 2: return MTLVertexFormatUChar2Normalized;
-                    case 3: return MTLVertexFormatUChar3Normalized;
-                    case 4: return MTLVertexFormatUChar4Normalized;
-                }
-            }
-            else
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatUChar;
-                    case 2: return MTLVertexFormatUChar2;
-                    case 3: return MTLVertexFormatUChar3;
-                    case 4: return MTLVertexFormatUChar4;
-                }
-            }
-            break;
-
-        case GL_BYTE:
-            if (normalized)
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatCharNormalized;
-                    case 2: return MTLVertexFormatChar2Normalized;
-                    case 3: return MTLVertexFormatChar3Normalized;
-                    case 4: return MTLVertexFormatChar4Normalized;
-                }
-            }
-            else
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatChar;
-                    case 2: return MTLVertexFormatChar2;
-                    case 3: return MTLVertexFormatChar3;
-                    case 4: return MTLVertexFormatChar4;
-                }
-            }
-            break;
-
-        case GL_UNSIGNED_SHORT:
-            if (normalized)
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatUShortNormalized;
-                    case 2: return MTLVertexFormatUShort2Normalized;
-                    case 3: return MTLVertexFormatUShort3Normalized;
-                    case 4: return MTLVertexFormatUShort4Normalized;
-                }
-            }
-            else
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatUShort;
-                    case 2: return MTLVertexFormatUShort2;
-                    case 3: return MTLVertexFormatUShort3;
-                    case 4: return MTLVertexFormatUShort4;
-                }
-            }
-            break;
-
-        case GL_SHORT:
-            if (normalized)
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatShortNormalized;
-                    case 2: return MTLVertexFormatShort2Normalized;
-                    case 3: return MTLVertexFormatShort3Normalized;
-                    case 4: return MTLVertexFormatShort4Normalized;
-                }
-            }
-            else
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatShort;
-                    case 2: return MTLVertexFormatShort2;
-                    case 3: return MTLVertexFormatShort3;
-                    case 4: return MTLVertexFormatShort4;
-                }
-            }
-            break;
-
-            case GL_HALF_FLOAT:
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatHalf;
-                    case 2: return MTLVertexFormatHalf2;
-                    case 3: return MTLVertexFormatHalf3;
-                    case 4: return MTLVertexFormatHalf4;
-                }
-                break;
-
-            case GL_FLOAT:
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatFloat;
-                    case 2: return MTLVertexFormatFloat2;
-                    case 3: return MTLVertexFormatFloat3;
-                    case 4: return MTLVertexFormatFloat4;
-                }
-                break;
-
-            case GL_INT:
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatInt;
-                    case 2: return MTLVertexFormatInt2;
-                    case 3: return MTLVertexFormatInt3;
-                    case 4: return MTLVertexFormatInt4;
-                }
-                break;
-
-            case GL_UNSIGNED_INT:
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatUInt;
-                    case 2: return MTLVertexFormatUInt2;
-                    case 3: return MTLVertexFormatUInt3;
-                    case 4: return MTLVertexFormatUInt4;
-                }
-                break;
-
-            case GL_RGB10:
-                if (normalized)
-                    return MTLVertexFormatInt1010102Normalized;
-                break;
-
-            case GL_UNSIGNED_INT_10_10_10_2:
-            case GL_UNSIGNED_INT_2_10_10_10_REV:
-                if (normalized)
-                    return MTLVertexFormatUInt1010102Normalized;
-                break;
-        }
-
-    return MTLVertexFormatInvalid;
-}
-
 /* mglVertexAttribComponentSize / mglVertexFormatName moved to mgl_vertex_format.h/.m. */
 
 bool mglShouldInspectDrawCall(uint64_t drawCall, GLuint programName)
@@ -2836,12 +2617,7 @@ void mglTraceDrawElementsAttrib(GLMContext ctx,
     size_t elemBytes = mglVertexAttribElementBytes(a->type, a->size);
     GLboolean effectiveNormalized = a->normalized;
     Program *program = mglResolveProgramForStageFromState(ctx, _VERTEX_SHADER);
-    if (!effectiveNormalized &&
-        a->type == GL_UNSIGNED_BYTE &&
-        a->size == 4 &&
-        mglRendererVertexAttribIsColorInput(program, attrib)) {
-        effectiveNormalized = GL_TRUE;
-    }
+
 
     if (elemBytes == 0u ||
         vertexOffset > (NSUInteger)vbo->size ||

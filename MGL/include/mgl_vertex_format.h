@@ -50,6 +50,22 @@
 extern "C" {
 #endif
 
+typedef enum {
+    MGLVertexConversionNone,
+    MGLVertexConversionFloat,
+    MGLVertexConversionInt,
+    MGLVertexConversionUInt
+} MGLVertexConversion;
+
+typedef struct {
+    MTLVertexFormat format;
+    MGLVertexConversion conversion;
+} MGLVertexAttributePlan;
+
+MTLVertexFormat glTypeSizeToMtlType(GLuint type, GLuint size, bool normalized);
+MGLVertexAttributePlan mglVertexAttributePlan(const VertexAttrib *attrib,
+                                             GLuint shaderType, bool currentValue);
+
 /* === Vertex format mapping (static inline, hot-path) === */
 
 /* GL vertex attribute component size in bytes (1/2/4/8).  Returns 0 for

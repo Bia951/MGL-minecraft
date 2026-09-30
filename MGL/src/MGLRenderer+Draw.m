@@ -731,7 +731,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
                                                                       &resolved);
         // When enabled_attribs tracking is empty but the program uses this attribute,
         // fall through and bind if a valid buffer exists (Sodium DSA path compatibility).
-        if (!attribsEnabledByApp && !hasAttribBinding) {
+        if (!attribsEnabledByApp && !hasAttribBinding && !usesCurrentValue) {
             continue;
         }
 
@@ -916,32 +916,14 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
                   resolved.uses_binding_table ? 1 : 0);
         }
 
-        bool needsIntToFloatConversion = (attribState->integer == 0 &&
-                                          (attribState->type == GL_INT ||
-                                           attribState->type == GL_UNSIGNED_INT));
-
-        /* glVertexAttribIFormat (integer==1): detect signedness mismatch
-         * between source type and shader's declared int/uint input. Metal
-         * rejects e.g. UChar/UShort/UInt feeding `int` shader inputs (and
-         * signed sources feeding `uint` inputs). When mismatched, convert
-         * the data on the CPU to the shader's 32-bit integer type. */
-        bool needsIntegerConversion = false;
-        BOOL integerConvDstIsInt = NO;
-        if (attribState->integer == 1 && attribState->type != GL_DOUBLE) {
-            SpirvResource *attrRes = mglRendererProgramVertexAttribResource(activeProgram, attrib);
-            GLuint shaderGlType = attrRes ? attrRes->gl_type : 0u;
-            MTLVertexFormat ignored = MTLVertexFormatInvalid;
-            if (mglIntegerAttribNeedsConversion(attribState->type,
-                                                shaderGlType,
-                                                attribState->size,
-                                                &ignored)) {
-                needsIntegerConversion = true;
-                integerConvDstIsInt = (shaderGlType == GL_INT ||
-                                       shaderGlType == GL_INT_VEC2 ||
-                                       shaderGlType == GL_INT_VEC3 ||
-                                       shaderGlType == GL_INT_VEC4);
-            }
-        }
+        SpirvResource *shaderInput = mglRendererProgramVertexAttribResource(activeProgram, attrib);
+        MGLVertexAttributePlan attributePlan = mglVertexAttributePlan(attribState,
+            shaderInput ? shaderInput->gl_type : 0, false);
+        bool needsIntToFloatConversion = attributePlan.conversion == MGLVertexConversionFloat &&
+                                         attribState->type != GL_DOUBLE;
+        bool needsIntegerConversion = attributePlan.conversion == MGLVertexConversionInt ||
+                                      attributePlan.conversion == MGLVertexConversionUInt;
+        BOOL integerConvDstIsInt = attributePlan.conversion == MGLVertexConversionInt;
 
         if (attribState->type != GL_DOUBLE && !needsIntToFloatConversion &&
             !needsIntegerConversion && anyBindingPresent[bindingIndex]) {
@@ -1087,12 +1069,6 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
                 mglShouldLogTraceFileBindingForProgram(activeProgram, &s_traceFileVertexAttribBindLogs)) {
                 SpirvResource *resource = mglRendererProgramVertexAttribResource(activeProgram, attrib);
                 GLboolean effectiveNormalized = attribState->normalized;
-                if (!effectiveNormalized &&
-                    attribState->type == GL_UNSIGNED_BYTE &&
-                    attribState->size == 4 &&
-                    mglRendererVertexAttribIsColorInput(activeProgram, attrib)) {
-                    effectiveNormalized = GL_TRUE;
-                }
                 MTLVertexFormat format = glTypeSizeToMtlType(attribState->type,
                                                              attribState->size,
                                                              effectiveNormalized);

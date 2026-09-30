@@ -245,3 +245,182 @@ MTLWinding mglMaybeInvertMTLWinding(MTLWinding winding, BOOL invert)
         ? MTLWindingCounterClockwise
         : MTLWindingClockwise;
 }
+
+MTLVertexFormat glTypeSizeToMtlType(GLuint type, GLuint size, bool normalized)
+{
+    switch(type)
+    {
+        case GL_UNSIGNED_BYTE:
+            if (normalized)
+            {
+                switch(size)
+                {
+                    case 1: return MTLVertexFormatUCharNormalized;
+                    case 2: return MTLVertexFormatUChar2Normalized;
+                    case 3: return MTLVertexFormatUChar3Normalized;
+                    case 4: return MTLVertexFormatUChar4Normalized;
+                }
+            }
+            else
+            {
+                switch(size)
+                {
+                    case 1: return MTLVertexFormatUChar;
+                    case 2: return MTLVertexFormatUChar2;
+                    case 3: return MTLVertexFormatUChar3;
+                    case 4: return MTLVertexFormatUChar4;
+                }
+            }
+            break;
+
+        case GL_BYTE:
+            if (normalized)
+            {
+                switch(size)
+                {
+                    case 1: return MTLVertexFormatCharNormalized;
+                    case 2: return MTLVertexFormatChar2Normalized;
+                    case 3: return MTLVertexFormatChar3Normalized;
+                    case 4: return MTLVertexFormatChar4Normalized;
+                }
+            }
+            else
+            {
+                switch(size)
+                {
+                    case 1: return MTLVertexFormatChar;
+                    case 2: return MTLVertexFormatChar2;
+                    case 3: return MTLVertexFormatChar3;
+                    case 4: return MTLVertexFormatChar4;
+                }
+            }
+            break;
+
+        case GL_UNSIGNED_SHORT:
+            if (normalized)
+            {
+                switch(size)
+                {
+                    case 1: return MTLVertexFormatUShortNormalized;
+                    case 2: return MTLVertexFormatUShort2Normalized;
+                    case 3: return MTLVertexFormatUShort3Normalized;
+                    case 4: return MTLVertexFormatUShort4Normalized;
+                }
+            }
+            else
+            {
+                switch(size)
+                {
+                    case 1: return MTLVertexFormatUShort;
+                    case 2: return MTLVertexFormatUShort2;
+                    case 3: return MTLVertexFormatUShort3;
+                    case 4: return MTLVertexFormatUShort4;
+                }
+            }
+            break;
+
+        case GL_SHORT:
+            if (normalized)
+            {
+                switch(size)
+                {
+                    case 1: return MTLVertexFormatShortNormalized;
+                    case 2: return MTLVertexFormatShort2Normalized;
+                    case 3: return MTLVertexFormatShort3Normalized;
+                    case 4: return MTLVertexFormatShort4Normalized;
+                }
+            }
+            else
+            {
+                switch(size)
+                {
+                    case 1: return MTLVertexFormatShort;
+                    case 2: return MTLVertexFormatShort2;
+                    case 3: return MTLVertexFormatShort3;
+                    case 4: return MTLVertexFormatShort4;
+                }
+            }
+            break;
+
+            case GL_HALF_FLOAT:
+                switch(size)
+                {
+                    case 1: return MTLVertexFormatHalf;
+                    case 2: return MTLVertexFormatHalf2;
+                    case 3: return MTLVertexFormatHalf3;
+                    case 4: return MTLVertexFormatHalf4;
+                }
+                break;
+
+            case GL_FLOAT:
+                switch(size)
+                {
+                    case 1: return MTLVertexFormatFloat;
+                    case 2: return MTLVertexFormatFloat2;
+                    case 3: return MTLVertexFormatFloat3;
+                    case 4: return MTLVertexFormatFloat4;
+                }
+                break;
+
+            case GL_INT:
+                switch(size)
+                {
+                    case 1: return MTLVertexFormatInt;
+                    case 2: return MTLVertexFormatInt2;
+                    case 3: return MTLVertexFormatInt3;
+                    case 4: return MTLVertexFormatInt4;
+                }
+                break;
+
+            case GL_UNSIGNED_INT:
+                switch(size)
+                {
+                    case 1: return MTLVertexFormatUInt;
+                    case 2: return MTLVertexFormatUInt2;
+                    case 3: return MTLVertexFormatUInt3;
+                    case 4: return MTLVertexFormatUInt4;
+                }
+                break;
+
+            case GL_INT_2_10_10_10_REV:
+                if (normalized)
+                    return MTLVertexFormatInt1010102Normalized;
+                break;
+
+            case GL_UNSIGNED_INT_10_10_10_2:
+            case GL_UNSIGNED_INT_2_10_10_10_REV:
+                if (normalized)
+                    return MTLVertexFormatUInt1010102Normalized;
+                break;
+        }
+
+    return MTLVertexFormatInvalid;
+}
+
+
+MGLVertexAttributePlan mglVertexAttributePlan(const VertexAttrib *attrib,
+                                             GLuint shaderType, bool currentValue)
+{
+    MGLVertexAttributePlan plan = {MTLVertexFormatInvalid, MGLVertexConversionNone};
+    bool signedInput = shaderType == GL_INT || shaderType == GL_INT_VEC2 ||
+                       shaderType == GL_INT_VEC3 || shaderType == GL_INT_VEC4;
+    bool unsignedInput = shaderType == GL_UNSIGNED_INT || shaderType == GL_UNSIGNED_INT_VEC2 ||
+                         shaderType == GL_UNSIGNED_INT_VEC3 || shaderType == GL_UNSIGNED_INT_VEC4;
+    if (currentValue) {
+        /* Current attributes are complete four-component values independent
+         * of the disabled array's format, stride, offset or divisor. */
+        plan.format = signedInput ? MTLVertexFormatInt4 : unsignedInput
+            ? MTLVertexFormatUInt4 : MTLVertexFormatFloat4;
+    } else if (attrib->type == GL_DOUBLE || (!attrib->integer &&
+               (attrib->type == GL_INT || attrib->type == GL_UNSIGNED_INT))) {
+        plan.format = mglDoubleVertexAttribFloatFormat(attrib->size);
+        plan.conversion = MGLVertexConversionFloat;
+    } else if (attrib->integer && mglIntegerAttribNeedsConversion(
+                   attrib->type, shaderType, attrib->size, &plan.format)) {
+        plan.conversion = signedInput ? MGLVertexConversionInt : MGLVertexConversionUInt;
+    } else {
+        plan.format = glTypeSizeToMtlType(attrib->type, attrib->size,
+                                        !attrib->integer && attrib->normalized);
+    }
+    return plan;
+}

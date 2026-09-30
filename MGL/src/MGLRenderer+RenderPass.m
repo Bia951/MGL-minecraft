@@ -3859,7 +3859,7 @@ create_new_command_buffer:
                                                                       &resolved);
         // When enabled_attribs tracking is empty but the program uses this attribute,
         // validate the buffer and proceed (Sodium DSA path compatibility).
-        if (!attribsEnabledByApp && !hasAttribBinding) {
+        if (!attribsEnabledByApp && !hasAttribBinding && !usesCurrentValue) {
             continue;
         }
 
@@ -3873,88 +3873,12 @@ create_new_command_buffer:
                 return NULL;
             }
 
-            GLboolean normalized = vao->attrib[i].normalized;
-            if (!normalized &&
-                vao->attrib[i].type == GL_UNSIGNED_BYTE &&
-                vao->attrib[i].size == 4 &&
-                mglRendererVertexAttribIsColorInput(activeProgram, i)) {
-                normalized = GL_TRUE;
-            }
-
-            /* Determine whether this attrib will be CPU-converted before
-             * binding. Converted buffers are reborn starting at the original
-             * binding_offset, so the vertex descriptor's attribute offset must
-             * NOT include binding_offset for them (only relativeoffset).
-             * Non-converted attribs bind the original buffer at offset 0, so
-             * their attribute offset must include binding_offset. */
-            bool needsConversion = false;
-            if (vao->attrib[i].type == GL_DOUBLE) {
-                needsConversion = true;
-            } else if (vao->attrib[i].integer == 0 &&
-                       (vao->attrib[i].type == GL_INT ||
-                        vao->attrib[i].type == GL_UNSIGNED_INT)) {
-                needsConversion = true;
-            } else if (vao->attrib[i].integer == 1) {
-                SpirvResource *attrRes = mglRendererProgramVertexAttribResource(activeProgram, i);
-                GLuint shaderGlType = attrRes ? attrRes->gl_type : 0u;
-                if (mglIntegerAttribNeedsConversion(vao->attrib[i].type,
-                                                    shaderGlType,
-                                                    vao->attrib[i].size,
-                                                    NULL)) {
-                    needsConversion = true;
-                }
-            }
-
-            if (vao->attrib[i].type == GL_DOUBLE) {
-                format = mglDoubleVertexAttribFloatFormat(vao->attrib[i].size);
-            } else if (vao->attrib[i].integer == 0 &&
-                       (vao->attrib[i].type == GL_INT ||
-                        vao->attrib[i].type == GL_UNSIGNED_INT)) {
-                /* Metal's 32-bit integer vertex formats (Int/UInt) cannot feed
-                 * float shader inputs; glVertexAttribFormat (non-integer) with
-                 * GL_INT/GL_UNSIGNED_INT requires int->float conversion. Use a
-                 * float format here and convert the data on the CPU side in
-                 * bindVertexBuffersToCurrentRenderEncoder (like GL_DOUBLE). */
-                format = mglDoubleVertexAttribFloatFormat(vao->attrib[i].size);
-            } else if (vao->attrib[i].integer == 1) {
-                /* glVertexAttribIFormat path: Metal only allows 32-bit Int
-                 * formats for int shader inputs and UInt formats for uint
-                 * inputs. 8/16-bit signed formats sign-extend to int (and
-                 * zero-extend to uint), but unsigned source formats cannot
-                 * feed int inputs and signed sources cannot feed uint inputs.
-                 * When the source signedness is incompatible with the shader's
-                 * declared type, convert the data to the shader's 32-bit
-                 * integer type on the CPU side in
-                 * bindVertexBuffersToCurrentRenderEncoder. */
-                MTLVertexFormat convertedFormat = MTLVertexFormatInvalid;
-                SpirvResource *attrRes = mglRendererProgramVertexAttribResource(activeProgram, i);
-                GLuint shaderGlType = attrRes ? attrRes->gl_type : 0u;
-                if (mglIntegerAttribNeedsConversion(vao->attrib[i].type,
-                                                    shaderGlType,
-                                                    vao->attrib[i].size,
-                                                    &convertedFormat) &&
-                    convertedFormat != MTLVertexFormatInvalid) {
-                    format = convertedFormat;
-                } else {
-                    format = glTypeSizeToMtlType(vao->attrib[i].type,
-                                                 vao->attrib[i].size,
-                                                 normalized);
-                }
-            } else {
-                format = glTypeSizeToMtlType(vao->attrib[i].type,
-                                             vao->attrib[i].size,
-                                             normalized);
-            }
-
-            /* Iris can leave a floating current-value declaration at the
-             * entity slot while the active shader consumes an ivec3. Metal
-             * requires the descriptor to match the shader's integer type.
-             * The current value is uploaded as integers when bound. */
             SpirvResource *shaderInput = mglRendererProgramVertexAttribResource(activeProgram, i);
-            if (usesCurrentValue && shaderInput && shaderInput->gl_type == GL_INT_VEC3 &&
-                vao->attrib[i].type == GL_FLOAT && vao->attrib[i].size >= 3) {
-                format = MTLVertexFormatInt3;
-            }
+            MGLVertexAttributePlan attributePlan = mglVertexAttributePlan(&vao->attrib[i],
+                shaderInput ? shaderInput->gl_type : 0, usesCurrentValue);
+            format = attributePlan.format;
+            GLboolean normalized = !vao->attrib[i].integer && vao->attrib[i].normalized;
+            bool needsConversion = attributePlan.conversion != MGLVertexConversionNone;
 
             if (format == MTLVertexFormatInvalid)
             {
