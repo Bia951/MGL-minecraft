@@ -3669,13 +3669,9 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
             : nil;
         if (depthMTL && _renderPassDescriptor.depthAttachment.texture == depthMTL) {
             mglMarkTextureLevelRenderTargetWritten(depthTex, fbo->depth.level);
-            Program *renderingProgram = mglResolveProgramFromState(ctx);
-            BOOL framebufferYFlipWrite =
-                renderingProgram &&
-                renderingProgram->spirv[_VERTEX_SHADER].mgl_injected_framebuffer_yflip == GL_TRUE;
-            if (framebufferYFlipWrite) {
-                depthTex->mtl_render_yflip_authority |= 1u;
-            }
+            /* The fullscreen compatibility patch flips sampling UVs only.
+             * It does not move rasterized fragments, so depth retains the
+             * framebuffer row direction recorded by the write marker. */
         }
     }
 }

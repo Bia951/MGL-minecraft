@@ -2937,9 +2937,10 @@ typedef struct MGLBlitColorState {
         }
     }
 
-    BOOL destinationIsRenderTarget = tex->is_render_target ? YES : NO;
+    BOOL destinationBottomOrigin = !tex->is_render_target ||
+        mglRTWriteAuthorityIsCurrentAndUsesOriginal(tex);
     NSUInteger destinationY = (NSUInteger)yoffset;
-    if (destinationIsRenderTarget) {
+    if (!destinationBottomOrigin) {
         destinationY = levelHeight - ((NSUInteger)yoffset + height);
     }
     destinationOrigin.y = destinationY;
@@ -2951,7 +2952,7 @@ typedef struct MGLBlitColorState {
                                                               width,
                                                               height,
                                                               texture.pixelFormat,
-                                                              destinationIsRenderTarget)) {
+                                                              !destinationBottomOrigin)) {
         mglDispatchError(glm_ctx, __FUNCTION__, GL_INVALID_OPERATION);
         return;
     }
@@ -2980,6 +2981,8 @@ typedef struct MGLBlitColorState {
     }
 
     mglMarkTextureLevelMetalFilled(tex, (GLuint)level, bgraSize);
+    tex->mtl_render_yflip_authority = (tex->mtl_render_target_write_version << 1) |
+        (destinationBottomOrigin ? 1u : 0u);
     [self updateGLSampledRenderTargetCopyForTexture:tex
                                              source:texture
                                              reason:"copy_tex_sub_image"];
