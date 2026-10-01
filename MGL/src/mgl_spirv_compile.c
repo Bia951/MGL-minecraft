@@ -6007,7 +6007,7 @@ void applyVertexInputLocations(Program *pptr)
                  vs_in->name, (unsigned)desiredLocation);
 
         if (strstr(pptr->spirv[_VERTEX_SHADER].msl_str, from)) {
-            fprintf(stderr,
+            mglTraceLogExternal(
                     "MGL ATTRIB FIX: program=%u vertex input %s loc %u -> %d\n",
                     pptr->name,
                     vs_in->name,
@@ -6016,7 +6016,7 @@ void applyVertexInputLocations(Program *pptr)
             replace_all_substr(&pptr->spirv[_VERTEX_SHADER].msl_str, from, to);
             vs_in->location = (GLuint)desiredLocation;
         } else {
-            fprintf(stderr,
+            mglTraceLogExternal(
                     "MGL ATTRIB WARNING: program=%u wanted %s loc %u -> %d but MSL pattern was not found\n",
                     pptr->name,
                     vs_in->name,
@@ -6211,7 +6211,7 @@ void alignFragmentInputLocationsToVertexOutputs(Program *pptr)
                                                          desired_location,
                                                          fs_msl_name,
                                                          sizeof(fs_msl_name))) {
-                fprintf(stderr,
+                mglTraceLogExternal(
                         "MGL IFACE FIX: program=%u fragment input %s/%s loc %u -> %u to match vertex output %s/%s\n",
                         pptr->name,
                         fs_in->name,
@@ -6222,7 +6222,7 @@ void alignFragmentInputLocationsToVertexOutputs(Program *pptr)
                         vs_msl_name[0] ? vs_msl_name : vs_out->name);
                 fs_in->location = desired_location;
             } else {
-                fprintf(stderr,
+                mglTraceLogExternal(
                         "MGL IFACE WARNING: program=%u wanted to align %s loc %u -> %u but MSL pattern was not found\n",
                         pptr->name,
                         fs_in->name,
@@ -6401,7 +6401,7 @@ void mglBridgeSkippedGeometryShaderVaryings(Program *pptr)
                                               fs_name,
                                               vs_name);
             if (renamed) {
-                fprintf(stderr,
+                mglTraceLogExternal(
                         "MGL GS SKIP IFACE NAME FIX: program=%u fragment input %s -> %s via skipped GS %s\n",
                         pptr->name,
                         fs_name,
@@ -6425,7 +6425,7 @@ void mglBridgeSkippedGeometryShaderVaryings(Program *pptr)
                                                       vs_out->location,
                                                       fs_msl_name,
                                                       sizeof(fs_msl_name))) {
-            fprintf(stderr,
+            mglTraceLogExternal(
                     "MGL GS SKIP IFACE WARNING: program=%u wanted FS %s loc %u -> %u to match VS %s but MSL pattern was not found\n",
                     pptr->name,
                     fs_in->name,
@@ -6435,7 +6435,7 @@ void mglBridgeSkippedGeometryShaderVaryings(Program *pptr)
             continue;
         }
 
-        fprintf(stderr,
+        mglTraceLogExternal(
                 "MGL GS SKIP IFACE FIX: program=%u align FS %s/%s loc %u -> %u to VS %s/%s via skipped GS %s\n",
                 pptr->name,
                 fs_in->name,

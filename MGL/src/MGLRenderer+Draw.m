@@ -2351,13 +2351,13 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
                         level0 ? (unsigned)level0->has_initialized_data : 0u,
                         level0 ? (unsigned)level0->last_init_source : 0u);
         }
-        if (ptr && ptr->target == GL_TEXTURE_BUFFER) {
+        if (ptr && ptr->target == GL_TEXTURE_BUFFER && mglTraceLogIsEnabled()) {
             static uint64_t s_vertexTexelBufferBindLogs = 0;
             uint64_t hit = ++s_vertexTexelBufferBindLogs;
             if (hit <= 32ull || (hit % 512ull) == 0ull) {
                 Texture *unitActive = textureUnit < TEXTURE_UNITS ? STATE(active_textures[textureUnit]) : NULL;
                 Texture *unitBuffer = textureUnit < TEXTURE_UNITS ? STATE(texture_units[textureUnit].textures[_TEXTURE_BUFFER_TARGET]) : NULL;
-                NSLog(@"MGL TEXBUFFER BIND vertex hit=%llu program=%u binding=%u unit=%u ptrTex=%u active=%u bufferSlot=%u expectedType=%lu lookupType=%lu mtlTex=%p mtlType=%lu size=%lux%lu format=%lu sampler=%p",
+                mglTraceLog("MGL TEXBUFFER BIND vertex hit=%llu program=%u binding=%u unit=%u ptrTex=%u active=%u bufferSlot=%u expectedType=%lu lookupType=%lu mtlTex=%p mtlType=%lu size=%lux%lu format=%lu sampler=%p",
                       (unsigned long long)hit,
                       (unsigned)vertexProgramName,
                       (unsigned)spirvBinding,

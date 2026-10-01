@@ -170,25 +170,28 @@ SpirvResource *mglFindSamplerResourceForMetalBinding(Program *program,
     return NULL;
 }
 
-/* Resolves the GL texture unit that `res` (in `stage` of `program`) samples,
- * mirroring MGLRenderer -textureUnitForSampledResource:metalBinding:stage:
- * but operating purely on the Program struct.  Returns the resolved unit
- * (0-based), or -1 if the resource is not sampler-like. */
-GLint mglSamplerResourceTextureUnit(Program *program,
-                                           const SpirvResource *res,
-                                           int stage,
-                                           int resType)
+/* Shared unit precedence for draw-time binding and hazard tracking. */
+GLint mglResolveSamplerTextureUnit(Program *program,
+                                  const SpirvResource *resource,
+                                  GLuint metalBinding,
+                                  int stage)
 {
-    if (!program || !res) return -1;
-    if (!mglRendererResourceLooksSamplerLike(res, resType)) return -1;
-
-    /* A GL resource owns its initial or explicitly assigned sampler value. */
-    if (res->sampler_unit >= 0 &&
-        res->sampler_unit < (GLint)TEXTURE_UNITS) {
-        return res->sampler_unit;
+    if (!program) {
+        return resource && resource->sampler_unit >= 0 &&
+               resource->sampler_unit < (GLint)TEXTURE_UNITS
+            ? resource->sampler_unit
+            : (GLint)metalBinding;
     }
 
-    GLuint metalBinding = res->binding;
+    /* Explicit glUniform1i state on the resource wins over binding-level
+     * defaults. Non-explicit reflected sampler values are only a fallback,
+     * after stage/global sampler-unit state, matching the draw-time resolver. */
+    if (resource && resource->sampler_unit_explicit &&
+        resource->sampler_unit >= 0 &&
+        resource->sampler_unit < (GLint)TEXTURE_UNITS) {
+        return resource->sampler_unit;
+    }
+
     if (metalBinding >= TEXTURE_UNITS) {
         return (GLint)metalBinding;
     }
@@ -199,7 +202,7 @@ GLint mglSamplerResourceTextureUnit(Program *program,
         : false;
     bool globalExplicit = (program->sampler_units_explicit[metalBinding] == GL_TRUE);
 
-    /* 2. Stage array explicit. */
+    /* 2. Explicit stage array. */
     GLint unit = stageValid
         ? program->sampler_units_by_stage[stage][metalBinding]
         : program->sampler_units[metalBinding];
@@ -207,13 +210,13 @@ GLint mglSamplerResourceTextureUnit(Program *program,
         return unit;
     }
 
-    /* 3. Global array explicit. */
+    /* 3. Explicit global array. */
     unit = program->sampler_units[metalBinding];
     if (globalExplicit && unit >= 0 && unit < (GLint)TEXTURE_UNITS) {
         return unit;
     }
 
-    /* 4. Default unit (stage then global fallback). */
+    /* 4. Non-explicit defaults (stage then global fallback). */
     GLint defaultUnit = stageValid
         ? program->sampler_units_by_stage[stage][metalBinding]
         : program->sampler_units[metalBinding];
@@ -222,10 +225,10 @@ GLint mglSamplerResourceTextureUnit(Program *program,
     }
 
     /* 5. Per-resource non-explicit (set by reflection, not glUniform1i). */
-    if (!res->sampler_unit_explicit &&
-        res->sampler_unit >= 0 &&
-        res->sampler_unit < (GLint)TEXTURE_UNITS) {
-        return res->sampler_unit;
+    if (resource && !resource->sampler_unit_explicit &&
+        resource->sampler_unit >= 0 &&
+        resource->sampler_unit < (GLint)TEXTURE_UNITS) {
+        return resource->sampler_unit;
     }
 
     if (defaultUnit >= 0 && defaultUnit < (GLint)TEXTURE_UNITS) {
@@ -234,6 +237,19 @@ GLint mglSamplerResourceTextureUnit(Program *program,
 
     /* 6. OpenGL default is unit 0. */
     return 0;
+}
+
+/* Resolves the GL texture unit that `res` samples after applying sampler-like
+ * resource filtering for the hazard tracker. */
+GLint mglSamplerResourceTextureUnit(Program *program,
+                                   const SpirvResource *res,
+                                   int stage,
+                                   int resType)
+{
+    if (!program || !res || !mglRendererResourceLooksSamplerLike(res, resType)) {
+        return -1;
+    }
+    return mglResolveSamplerTextureUnit(program, res, res->binding, stage);
 }
 
 bool mglProgramSamplesTextureUnit(Program *program, GLuint unit)

@@ -74,11 +74,18 @@ SpirvResource *mglFindSamplerResourceForMetalBinding(Program *program,
                                                      int stage,
                                                      GLuint metalBinding);
 
+/* Resolve the GL texture unit for a sampler resource and Metal binding.
+ * `resource` may be NULL when the caller only has a binding.  With no
+ * program, use the resource's valid sampler unit or the Metal binding. */
+GLint mglResolveSamplerTextureUnit(Program *program,
+                                  const SpirvResource *resource,
+                                  GLuint metalBinding,
+                                  int stage);
+
 /* Returns true if `program` has any sampler-like resource (across all stages
  * and the 5 sampler-like resource types) whose resolved GL texture unit
- * equals `unit`.  Resolution mirrors MGLRenderer
- * -textureUnitForSampledResource:metalBinding:stage: (per-resource
- * sampler_unit -> stage array -> global array -> default 0).
+ * equals `unit`. Resolution uses `mglResolveSamplerTextureUnit` after
+ * filtering sampler-like resources.
  *
  * Used by the WAR hazard tracker to avoid false-positive flushes when a
  * texture is bound to a unit the program never samples (e.g. an FBO color

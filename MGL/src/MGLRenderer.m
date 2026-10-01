@@ -4197,13 +4197,13 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
             break;
     }
 
-    if (mapped_buffers != count) {
+    if (mapped_buffers != count && mglTraceLogIsEnabled()) {
         static unsigned long long s_map_mismatch_hits = 0;
         s_map_mismatch_hits++;
         if ((s_map_mismatch_hits % 64ull) == 1ull) {
             Buffer *drawIndexBuffer = vao->element_array.buffer;
             void *indexBufferMetal = drawIndexBuffer ? drawIndexBuffer->data.mtl_data : NULL;
-            NSLog(@"MGL WARNING: mapGLBuffersToMTLBufferMap mismatch (pipeline=%p mapped=%u expected=%u stage=%d hit=%llu indexBuffer=%p vao=%p)",
+            mglTraceLog("MGL vertex input map summary (pipeline=%p mapped=%u expected=%u stage=%d hit=%llu indexBuffer=%p vao=%p)",
                   _pipelineState, mapped_buffers, count, stage, s_map_mismatch_hits, indexBufferMetal, vao);
         }
     }
@@ -6280,84 +6280,10 @@ static BOOL mglSnapshotSharedBufferRange(id<MTLDevice> device,
 - (GLuint)textureUnitForSampledResource:(SpirvResource *)sampledResource metalBinding:(GLuint)metalBinding stage:(int)stage
 {
     Program *program = mglResolveProgramForStageFromState(ctx, stage);
-    if (!program) {
-        GLuint candidate = sampledResource &&
-                           sampledResource->sampler_unit >= 0 &&
-                           sampledResource->sampler_unit < TEXTURE_UNITS
-            ? (GLuint)sampledResource->sampler_unit
-            : metalBinding;
-        return candidate;
-    }
-
-    const char *sampledName = NULL;
-    if (!sampledResource && metalBinding < TEXTURE_UNITS) {
+    if (program && !sampledResource && metalBinding < TEXTURE_UNITS) {
         sampledResource = mglFindSamplerResourceForMetalBinding(program, stage, metalBinding);
     }
-    if (sampledResource) {
-        sampledName = sampledResource->name;
-    }
-
-    /*
-     * Minecraft usually assigns sampler texture units from the RenderPipeline
-     * sampler list, not from numeric suffixes like Sampler2. For example, chunk
-     * rendering declares Sampler0 and Sampler2, so Sampler2 can be uploaded
-     * through glUniform1i(..., 1). Keep sampler units on the exact reflected
-     * resource instead of only the Metal binding: vertex and fragment resources
-     * commonly share binding numbers, and binding-level state can make entity,
-     * hand, and text textures bleed into each other.
-     */
-    if (sampledResource &&
-        sampledResource->sampler_unit_explicit &&
-        sampledResource->sampler_unit >= 0 &&
-        sampledResource->sampler_unit < TEXTURE_UNITS) {
-        return (GLuint)sampledResource->sampler_unit;
-    }
-
-    if (metalBinding >= TEXTURE_UNITS) {
-        return metalBinding;
-    }
-
-    bool stageExplicit = (stage >= 0 && stage < _MAX_SHADER_TYPES)
-        ? (program->sampler_units_explicit_by_stage[stage][metalBinding] == GL_TRUE)
-        : false;
-    bool globalExplicit = (program->sampler_units_explicit[metalBinding] == GL_TRUE);
-
-    GLint unit = (stage >= 0 && stage < _MAX_SHADER_TYPES)
-        ? program->sampler_units_by_stage[stage][metalBinding]
-        : program->sampler_units[metalBinding];
-
-    if (stageExplicit && unit >= 0 && unit < TEXTURE_UNITS) {
-        return (GLuint)unit;
-    }
-
-    unit = program->sampler_units[metalBinding];
-    if (globalExplicit && unit >= 0 && unit < TEXTURE_UNITS) {
-        return (GLuint)unit;
-    }
-
-    GLint defaultUnit = (stage >= 0 && stage < _MAX_SHADER_TYPES)
-        ? program->sampler_units_by_stage[stage][metalBinding]
-        : program->sampler_units[metalBinding];
-    if (defaultUnit < 0 || defaultUnit >= TEXTURE_UNITS) {
-        defaultUnit = program->sampler_units[metalBinding];
-    }
-
-    if (sampledResource &&
-        !sampledResource->sampler_unit_explicit &&
-        sampledResource->sampler_unit >= 0 &&
-        sampledResource->sampler_unit < TEXTURE_UNITS) {
-        return (GLuint)sampledResource->sampler_unit;
-    }
-
-    if (defaultUnit >= 0 && defaultUnit < TEXTURE_UNITS) {
-        return (GLuint)defaultUnit;
-    }
-
-    /*
-     * OpenGL's valid default is unit 0, and explicit glUniform1i uploads above
-     * are authoritative. No name-based fallback is applied.
-     */
-    return 0u;
+    return (GLuint)mglResolveSamplerTextureUnit(program, sampledResource, metalBinding, stage);
 }
 
 - (GLuint)textureUnitForSampledBinding:(GLuint)metalBinding stage:(int)stage

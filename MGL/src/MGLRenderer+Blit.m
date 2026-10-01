@@ -2646,6 +2646,17 @@ typedef struct MGLBlitColorState {
         return YES; /* Consumed the call; report an error. */
     }
 
+    NSUInteger destinationSlices = destTexture.arrayLength;
+    if (destTexture.textureType == MTLTextureTypeCube) destinationSlices = 6u;
+    if (destTexture.textureType == MTLTextureTypeCubeArray) destinationSlices *= 6u;
+    if (destTexture.textureType == MTLTextureType3D) {
+        destinationSlices = mglMetalTextureLevelDimension(destTexture.depth, level);
+    }
+    if (slice >= destinationSlices) {
+        mglDispatchError(glm_ctx, __FUNCTION__, GL_INVALID_VALUE);
+        return YES;
+    }
+
     NSUInteger destLevelWidth = mglMetalTextureLevelDimension(destTexture.width, level);
     NSUInteger destLevelHeight = mglMetalTextureLevelDimension(destTexture.height, level);
     if ((NSUInteger)xoffset > destLevelWidth ||
@@ -2659,14 +2670,19 @@ typedef struct MGLBlitColorState {
     MGLMetalAttachmentSubresource srcSubresource =
         mglMetalAttachmentSubresourceForAttachment(srcAttachment);
 
-    /* Metal's texture coordinate origin is top-left, GL's is bottom-left.
-     * Flip the source Y so the copied region matches GL semantics. */
+    /* GL rows increase from the bottom. Uploaded textures keep that order,
+     * while ordinary framebuffer writes use Metal's top-origin order. Preserve
+     * the destination's existing orientation for partial updates. */
+    NSUInteger srcLevelWidth = mglMetalTextureLevelDimension(srcTexture.width, srcSubresource.level);
     NSUInteger srcLevelHeight = mglMetalTextureLevelDimension(srcTexture.height, srcSubresource.level);
-    NSInteger srcY = (NSInteger)srcLevelHeight - ((NSInteger)y + (NSInteger)height);
-    if (srcY < 0) {
-        srcY = 0;
+    if (x < 0 || y < 0 || (NSUInteger)x > srcLevelWidth ||
+        (NSUInteger)y > srcLevelHeight || width > srcLevelWidth - (NSUInteger)x ||
+        height > srcLevelHeight - (NSUInteger)y) {
+        /* Pixels outside the read framebuffer are undefined in GL. Leave the
+         * generic readback path to handle clipping rather than issuing an
+         * out-of-bounds Metal copy. */
+        return NO;
     }
-
     /* End any active render encoder so the blit encoder can run. */
     [self endRenderEncoding];
     if (![self ensureWritableCommandBuffer:"mtlCopyTexSubImageViaTextureBlit"]) {
@@ -2690,34 +2706,87 @@ typedef struct MGLBlitColorState {
                                        attachmentEnum:readBuffer];
     }
 
-    id<MTLBlitCommandEncoder> blitEncoder = [_currentCommandBuffer blitCommandEncoder];
-    if (!blitEncoder) {
-        mglDispatchError(glm_ctx, __FUNCTION__, GL_INVALID_OPERATION);
-        return YES;
+    BOOL sourceBottomOrigin = mglRTWriteAuthorityIsCurrentAndUsesOriginal(srcTexObj);
+    BOOL destinationBottomOrigin = !tex->is_render_target ||
+        mglRTWriteAuthorityIsCurrentAndUsesOriginal(tex);
+    NSUInteger srcY = sourceBottomOrigin ? (NSUInteger)y :
+        srcLevelHeight - ((NSUInteger)y + height);
+    NSUInteger dstY = destinationBottomOrigin ? (NSUInteger)yoffset :
+        destLevelHeight - ((NSUInteger)yoffset + height);
+    BOOL reverseRows = sourceBottomOrigin != destinationBottomOrigin;
+
+    /* Depth32 can reverse rows in one render pass, without a staging texture.
+     * Packed and integer formats use exact row blits to retain every bit. */
+    BOOL copied = NO;
+    if (reverseRows && destFormat == MTLPixelFormatDepth32Float &&
+        srcTexture.textureType == MTLTextureType2D &&
+        destTexture.textureType == MTLTextureType2D &&
+        srcTexture.sampleCount == 1u && destTexture.sampleCount == 1u &&
+        srcSubresource.level == 0u && level == 0u && srcTexture != destTexture) {
+        id<MTLRenderPipelineState> pipeline = [self scaledDepthBlitPipelineForPixelFormat:destFormat];
+        id<MTLSamplerState> sampler = [self scaledBlitSamplerForFilter:GL_NEAREST];
+        if (pipeline && sampler) {
+            MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+            pass.depthAttachment.texture = destTexture;
+            pass.depthAttachment.loadAction = MTLLoadActionLoad;
+            pass.depthAttachment.storeAction = MTLStoreActionStore;
+            id<MTLRenderCommandEncoder> encoder = [_currentCommandBuffer renderCommandEncoderWithDescriptor:pass];
+            if (encoder) {
+                MGLScaledBlitParams params = {0};
+                params.uvRect = (vector_float4){
+                    (float)x / srcLevelWidth,
+                    (float)(srcY + height) / srcLevelHeight,
+                    (float)(x + width) / srcLevelWidth,
+                    (float)srcY / srcLevelHeight
+                };
+                [encoder setRenderPipelineState:pipeline];
+                [encoder setDepthStencilState:[self clearRectDepthState]];
+                [encoder setVertexBytes:&params length:sizeof(params) atIndex:0];
+                [encoder setFragmentTexture:srcTexture atIndex:0];
+                [encoder setFragmentSamplerState:sampler atIndex:0];
+                [encoder setViewport:(MTLViewport){(double)xoffset, (double)dstY,
+                    (double)width, (double)height, 0.0, 1.0}];
+                [encoder setScissorRect:(MTLScissorRect){(NSUInteger)xoffset, dstY, width, height}];
+                [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+                [encoder endEncoding];
+                copied = YES;
+            }
+        }
     }
 
-    BOOL blitEnded = NO;
-    @try {
-        [blitEncoder copyFromTexture:srcTexture
-                          sourceSlice:srcSubresource.slice
-                          sourceLevel:srcSubresource.level
-                         sourceOrigin:MTLOriginMake((NSUInteger)x, (NSUInteger)srcY, 0u)
-                           sourceSize:MTLSizeMake(width, height, 1u)
-                            toTexture:destTexture
-                     destinationSlice:slice
-                     destinationLevel:level
-                    destinationOrigin:MTLOriginMake((NSUInteger)xoffset, (NSUInteger)yoffset, 0u)];
-        [blitEncoder endEncoding];
-        blitEnded = YES;
-    } @catch (NSException *exception) {
-        if (!blitEnded) {
-            @try { [blitEncoder endEncoding]; } @catch (NSException *endException) { }
+    if (!copied) {
+        id<MTLBlitCommandEncoder> blitEncoder = [_currentCommandBuffer blitCommandEncoder];
+        if (!blitEncoder) {
+            mglDispatchError(glm_ctx, __FUNCTION__, GL_INVALID_OPERATION);
+            return YES;
         }
-        mglDispatchError(glm_ctx, __FUNCTION__, GL_INVALID_OPERATION);
-        return YES;
+        BOOL blitEnded = NO;
+        @try {
+            NSUInteger rows = reverseRows ? height : 1u;
+            for (NSUInteger row = 0u; row < rows; row++) {
+                [blitEncoder copyFromTexture:srcTexture
+                    sourceSlice:srcSubresource.slice sourceLevel:srcSubresource.level
+                    sourceOrigin:MTLOriginMake((NSUInteger)x, srcY + (reverseRows ? height - 1u - row : 0u), srcSubresource.depthPlane)
+                    sourceSize:MTLSizeMake(width, reverseRows ? 1u : height, 1u)
+                    toTexture:destTexture destinationSlice:destTexture.textureType == MTLTextureType3D ? 0u : slice
+                    destinationLevel:level
+                    destinationOrigin:MTLOriginMake((NSUInteger)xoffset, dstY + row,
+                        destTexture.textureType == MTLTextureType3D ? slice : 0u)];
+            }
+            [blitEncoder endEncoding];
+            blitEnded = YES;
+        } @catch (NSException *exception) {
+            if (!blitEnded) {
+                @try { [blitEncoder endEncoding]; } @catch (NSException *endException) { }
+            }
+            mglDispatchError(glm_ctx, __FUNCTION__, GL_INVALID_OPERATION);
+            return YES;
+        }
     }
 
     mglMarkTextureLevelMetalFilled(tex, (GLuint)level, 0);
+    tex->mtl_render_yflip_authority = (tex->mtl_render_target_write_version << 1) |
+        (destinationBottomOrigin ? 1u : 0u);
     if (destIsDepth) {
         [self updateDepthReadCopiesForTexture:tex];
     }
