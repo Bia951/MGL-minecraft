@@ -4268,7 +4268,7 @@ create_new_command_buffer:
         depthReadMTL &&
         depthReadTexture->is_render_target &&
         depthReadTexture->mtl_render_target_write_version != 0u &&
-        mglMetalPixelFormatIsDepthOrStencil(depthReadMTL.pixelFormat);
+        mglMetalPixelFormatHasDepth(depthReadMTL.pixelFormat);
 
     if (!anySampledRT && !hasDepthReadCandidate) {
         return;

@@ -2046,7 +2046,7 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
             if (ptr->mtl_data) {
                 texture = (__bridge id<MTLTexture>)(ptr->mtl_data);
                 texture = mglSampledTextureViewForBaseLevel(ptr, texture);
-                if (expectedKind == MGLTextureDataKindFloat && mglMetalPixelFormatIsDepthOrStencil(texture.pixelFormat)) {
+                if (expectedKind == MGLTextureDataKindFloat && mglMetalPixelFormatHasDepth(texture.pixelFormat)) {
                     texture = mglSampledTextureViewForBaseLevel(ptr, [self depthReadTextureForObject:ptr program:currentProgram]);
                 }
             }
@@ -2518,7 +2518,7 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
             MGL_ABORT_TBIND_IF_ENCODER_CLOSED();
             if (ptr->mtl_data) {
                 texture = mglSampledTextureViewForBaseLevel(ptr, (__bridge id<MTLTexture>)ptr->mtl_data);
-                if (expectedKind == MGLTextureDataKindFloat && mglMetalPixelFormatIsDepthOrStencil(texture.pixelFormat)) {
+                if (expectedKind == MGLTextureDataKindFloat && mglMetalPixelFormatHasDepth(texture.pixelFormat)) {
                     texture = mglSampledTextureViewForBaseLevel(ptr, [self depthReadTextureForObject:ptr program:sampleProgram]);
                 }
             }
@@ -4094,6 +4094,42 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
     }
 }
 
+/* Prepare depth conversions as one phase before sampled bindings are replayed.
+ * Closing the encoder here is deliberate: no texture bindings have been set
+ * yet, and the caller restores buffers, pipeline and argument buffers once. */
+- (bool)prepareDepthReadCopiesForDraw
+{
+    BOOL endedEncoder = NO;
+    const int stages[] = {_VERTEX_SHADER, _FRAGMENT_SHADER};
+    for (unsigned stageIndex = 0; stageIndex < 2; stageIndex++) {
+        int stage = stages[stageIndex];
+        Program *program = mglResolveProgramForStageFromState(ctx, stage);
+        GLuint count = [self getProgramBindingCount:stage type:SPVC_RESOURCE_TYPE_SAMPLED_IMAGE];
+        for (GLuint i = 0; program && i < count; i++) {
+            SpirvResourceList *resources = &program->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_SAMPLED_IMAGE];
+            SpirvResource *resource = i < resources->count ? &resources->list[i] : NULL;
+            if (mglShouldSkipStageTextureResource(program, stage, SPVC_RESOURCE_TYPE_SAMPLED_IMAGE, resource) ||
+                [self getProgramExpectedTextureDataKind:stage type:SPVC_RESOURCE_TYPE_SAMPLED_IMAGE index:(int)i] != MGLTextureDataKindFloat) continue;
+            GLuint binding = [self getProgramBinding:stage type:SPVC_RESOURCE_TYPE_SAMPLED_IMAGE index:(int)i];
+            MTLTextureType declared = [self getProgramDeclaredTextureType:stage type:SPVC_RESOURCE_TYPE_SAMPLED_IMAGE index:(int)i];
+            MTLTextureType expected = [self getProgramExpectedTextureType:stage type:SPVC_RESOURCE_TYPE_SAMPLED_IMAGE index:(int)i];
+            Texture *object = [self textureForSampledResource:resource metalBinding:binding stage:stage
+                expectedType:declared ? declared : expected];
+            if (!object || !object->mtl_data) continue;
+            id<MTLTexture> source = (__bridge id<MTLTexture>)object->mtl_data;
+            if (source.textureType != MTLTextureType2D || source.sampleCount != 1 ||
+                !mglMetalPixelFormatHasDepth(source.pixelFormat)) continue;
+            unsigned orientation = object->is_render_target &&
+                mglDecideYFlipForSampledRT(object, program) == MGL_YFLIP_USE_SAMPLED_COPY;
+            object->mtl_depth_read_requested_mask |= 1u << orientation;
+            if ([self depthReadTextureForObject:object program:program]) continue;
+            if (!endedEncoder) { [self endRenderEncoding]; endedEncoder = YES; }
+            RETURN_FALSE_ON_FAILURE([self updateDepthReadCopiesForTexture:object]);
+        }
+    }
+    return true;
+}
+
 - (bool)syncResourceBindingsForContext:(GLMContext)glm_ctx
 {
     GLMState *state = MGL_STATE(glm_ctx);
@@ -4116,6 +4152,7 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
                                                  computeEncoder:nil]);
     RETURN_FALSE_ON_FAILURE([self bindBufferSizeConstantsForRenderEncoder]);
     RETURN_FALSE_ON_FAILURE([self bindActiveTexturesToMTL]);
+    RETURN_FALSE_ON_FAILURE([self prepareDepthReadCopiesForDraw]);
     RETURN_FALSE_ON_FAILURE([self restoreRenderEncoderAfterTextureUploadForDraw:"final-active-texture-bind"]);
     if (![self bindTexturesToCurrentRenderEncoder]) {
         RETURN_FALSE_ON_FAILURE([self restoreRenderEncoderAfterTextureUploadForDraw:"final-sampled-texture-bind"]);

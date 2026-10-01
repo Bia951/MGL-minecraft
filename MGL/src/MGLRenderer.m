@@ -2168,7 +2168,7 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
     if (!source ||
         source.textureType != MTLTextureType2D ||
         source.sampleCount != 1 ||
-        !mglMetalPixelFormatIsDepthOrStencil(source.pixelFormat)) {
+        !mglMetalPixelFormatHasDepth(source.pixelFormat)) {
         return nil;
     }
 
@@ -2187,7 +2187,7 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
 
 - (BOOL)updateDepthReadCopiesForTexture:(Texture *)object
 {
-    if (!object || !object->mtl_data || object->mtl_render_target_write_version == 0u) {
+    if (!object || !object->mtl_data || !object->mtl_depth_read_requested_mask) {
         return NO;
     }
 
@@ -2195,7 +2195,7 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
     if (!source ||
         source.textureType != MTLTextureType2D ||
         source.sampleCount != 1 ||
-        !mglMetalPixelFormatIsDepthOrStencil(source.pixelFormat)) {
+        !mglMetalPixelFormatHasDepth(source.pixelFormat)) {
         return NO;
     }
 
@@ -2208,6 +2208,7 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
 
     BOOL allFresh = YES;
     for (unsigned orientation = 0; orientation < 2; orientation++) {
+        if (!(object->mtl_depth_read_requested_mask & (1u << orientation))) continue;
         id<MTLTexture> cached = (__bridge id<MTLTexture>)object->mtl_depth_read_data[orientation];
         BOOL shapeMatches = cached &&
             cached.width == source.width &&
@@ -2229,13 +2230,11 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
     if (!_depthReadCopyPipeline) {
         NSString *code = @"#include <metal_stdlib>\nusing namespace metal;\n"
             "kernel void depth_read_copy(depth2d<float, access::read> src [[texture(0)]], "
-            "texture2d<float, access::write> direct [[texture(1)]], "
-            "texture2d<float, access::write> flipped [[texture(2)]], "
-            "uint2 pos [[thread_position_in_grid]]) { "
-            "if (any(pos >= uint2(direct.get_width(), direct.get_height()))) return; "
-            "float d = src.read(pos); direct.write(float4(d, 0.0, 0.0, 1.0), pos); "
-            "uint2 q = uint2(pos.x, src.get_height() - 1 - pos.y); "
-            "flipped.write(float4(src.read(q), 0.0, 0.0, 1.0), pos); }";
+            "texture2d<float, access::write> dst [[texture(1)]], "
+            "constant uint& flip [[buffer(0)]], uint2 pos [[thread_position_in_grid]]) { "
+            "if (any(pos >= uint2(dst.get_width(), dst.get_height()))) return; "
+            "uint2 q = uint2(pos.x, flip ? src.get_height() - 1 - pos.y : pos.y); "
+            "dst.write(float4(src.read(q), 0.0, 0.0, 1.0), pos); }";
         NSError *error = nil;
         id<MTLLibrary> library = [self newMetalLibraryWithSource:code
                                                         options:nil
@@ -2252,6 +2251,7 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
     }
 
     for (unsigned orientation = 0; orientation < 2; orientation++) {
+        if (!(object->mtl_depth_read_requested_mask & (1u << orientation))) continue;
         if (object->mtl_depth_read_data[orientation]) {
             continue;
         }
@@ -2279,51 +2279,44 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
     }
     [encoder setComputePipelineState:_depthReadCopyPipeline];
 
-    id<MTLTexture> direct = (__bridge id<MTLTexture>)object->mtl_depth_read_data[0];
-    id<MTLTexture> flipped = (__bridge id<MTLTexture>)object->mtl_depth_read_data[1];
-    BOOL encodedAllLevels = YES;
-    for (NSUInteger level = 0; level < source.mipmapLevelCount; level++) {
-        @autoreleasepool {
-            id<MTLTexture> input = source;
-            id<MTLTexture> directLevel = direct;
-            id<MTLTexture> flippedLevel = flipped;
-            if (source.mipmapLevelCount > 1) {
-                input = [source newTextureViewWithPixelFormat:source.pixelFormat
-                                                 textureType:MTLTextureType2D
-                                                      levels:NSMakeRange(level, 1)
-                                                      slices:NSMakeRange(0, 1)];
-                directLevel = [direct newTextureViewWithPixelFormat:direct.pixelFormat
-                                                        textureType:MTLTextureType2D
-                                                             levels:NSMakeRange(level, 1)
-                                                             slices:NSMakeRange(0, 1)];
-                flippedLevel = [flipped newTextureViewWithPixelFormat:flipped.pixelFormat
-                                                          textureType:MTLTextureType2D
-                                                               levels:NSMakeRange(level, 1)
-                                                               slices:NSMakeRange(0, 1)];
+    for (unsigned orientation = 0; orientation < 2; orientation++) {
+        if (!(object->mtl_depth_read_requested_mask & (1u << orientation))) continue;
+        if (object->mtl_depth_read_version[orientation] == object->mtl_render_target_write_version &&
+            object->mtl_render_target_write_version != 0u) continue;
+        id<MTLTexture> destination = (__bridge id<MTLTexture>)object->mtl_depth_read_data[orientation];
+        uint32_t flip = orientation;
+        [encoder setBytes:&flip length:sizeof(flip) atIndex:0];
+        BOOL encodedAllLevels = YES;
+        for (NSUInteger level = 0; level < source.mipmapLevelCount; level++) {
+            @autoreleasepool {
+                id<MTLTexture> input = source;
+                id<MTLTexture> output = destination;
+                if (source.mipmapLevelCount > 1) {
+                    input = [source newTextureViewWithPixelFormat:source.pixelFormat textureType:MTLTextureType2D
+                        levels:NSMakeRange(level, 1) slices:NSMakeRange(0, 1)];
+                    output = [destination newTextureViewWithPixelFormat:destination.pixelFormat textureType:MTLTextureType2D
+                        levels:NSMakeRange(level, 1) slices:NSMakeRange(0, 1)];
+                }
+                if (!input || !output) { encodedAllLevels = NO; break; }
+                [encoder setTexture:input atIndex:0];
+                [encoder setTexture:output atIndex:1];
+                NSUInteger width = MIN((NSUInteger)8, _depthReadCopyPipeline.maxTotalThreadsPerThreadgroup);
+                NSUInteger height = MAX((NSUInteger)1, MIN((NSUInteger)8,
+                    _depthReadCopyPipeline.maxTotalThreadsPerThreadgroup / MAX(width, (NSUInteger)1)));
+                [encoder dispatchThreads:MTLSizeMake(output.width, output.height, 1)
+                    threadsPerThreadgroup:MTLSizeMake(width, height, 1)];
             }
-            if (!input || !directLevel || !flippedLevel) {
-                encodedAllLevels = NO;
-                break;
-            }
-            [encoder setTexture:input atIndex:0];
-            [encoder setTexture:directLevel atIndex:1];
-            [encoder setTexture:flippedLevel atIndex:2];
-            MTLSize grid = MTLSizeMake(directLevel.width, directLevel.height, 1);
-            NSUInteger width = MIN((NSUInteger)8, _depthReadCopyPipeline.maxTotalThreadsPerThreadgroup);
-            NSUInteger height = MAX((NSUInteger)1,
-                                    MIN((NSUInteger)8,
-                                        _depthReadCopyPipeline.maxTotalThreadsPerThreadgroup / MAX(width, (NSUInteger)1)));
-            [encoder dispatchThreads:grid threadsPerThreadgroup:MTLSizeMake(width, height, 1)];
+        }
+        if (!encodedAllLevels) { [encoder endEncoding]; return NO; }
+        object->mtl_depth_read_version[orientation] = object->mtl_render_target_write_version;
+        if (mglTraceLogIsEnabled()) {
+            mglTraceLog("DEPTH_READ_COPY tex=%u orientation=%u version=%u", object->name,
+                orientation, object->mtl_render_target_write_version);
         }
     }
     [encoder endEncoding];
-
-    if (!encodedAllLevels) {
-        return NO;
-    }
-    object->mtl_depth_read_version[0] = object->mtl_render_target_write_version;
-    object->mtl_depth_read_version[1] = object->mtl_render_target_write_version;
-    if (mglEnvFlagEnabled("MGL_CAPTURE_DEPTH_READ") && source.pixelFormat == MTLPixelFormatDepth32Float &&
+    id<MTLTexture> direct = (__bridge id<MTLTexture>)object->mtl_depth_read_data[0];
+    if (direct && mglEnvFlagEnabled("MGL_CAPTURE_DEPTH_READ") && source.pixelFormat == MTLPixelFormatDepth32Float &&
         object->mtl_render_target_write_version >= 500u) {
         static GLuint captured[32]; static unsigned count;
         bool seen = false;

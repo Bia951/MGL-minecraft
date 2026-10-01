@@ -490,6 +490,13 @@
                       (unsigned long long)hit);
     }
 
+    if (uploadedAny && mglMetalPixelFormatHasDepth(texture.pixelFormat)) {
+        /* CPU uploads replace depth values too; invalidate any float-sampling
+         * cache even when the texture has never been a framebuffer attachment. */
+        tex->mtl_render_target_write_version++;
+        tex->mtl_render_yflip_authority = (tex->mtl_render_target_write_version << 1) | 1u;
+    }
+
     if (uploadedAny && !failedAny) {
         tex->dirty_bits &= ~DIRTY_TEXTURE_DATA;
         [self recordGPUSuccess];
@@ -2265,7 +2272,7 @@ mglMetalCopyTextureBytesToBGRA8((const uint8_t *)readBuffer.contents,
         return false;
     }
 
-    return [self copyTextureUploadWithDedicatedCommandBuffer:buffer
+    bool uploaded = [self copyTextureUploadWithDedicatedCommandBuffer:buffer
                                                 sourceOffset:sourceOffset
                                            sourceBytesPerRow:sourceBytesPerRow
                                          sourceBytesPerImage:copyBytesPerImage
@@ -2275,6 +2282,12 @@ mglMetalCopyTextureBytesToBGRA8((const uint8_t *)readBuffer.contents,
                                              destinationLevel:level
                                             destinationOrigin:destinationOrigin
                                                        reason:reason ? reason : "texture_sub_upload"];
+    if (uploaded && mglMetalPixelFormatHasDepth(texture.pixelFormat)) {
+        BOOL bottomOrigin = !tex->is_render_target || mglRTWriteAuthorityIsCurrentAndUsesOriginal(tex);
+        mglMarkTextureLevelMetalFilled(tex, (GLuint)level, 0);
+        tex->mtl_render_yflip_authority = (tex->mtl_render_target_write_version << 1) | (bottomOrigin ? 1u : 0u);
+    }
+    return uploaded;
 }
 
 -(void)mtlTexSubImage:(GLMContext)glm_ctx tex:(Texture *)tex buf:(Buffer *)buf src_offset:(size_t)src_offset src_pitch:(size_t)src_pitch src_image_size:(size_t)src_image_size src_size:(size_t)src_size slice:(GLuint)slice level:(GLuint)level width:(size_t)width height:(size_t)height depth:(size_t)depth xoffset:(size_t)xoffset yoffset:(size_t)yoffset zoffset:(size_t)zoffset

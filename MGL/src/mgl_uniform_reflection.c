@@ -2463,6 +2463,57 @@ GLint mglFirstFreePlainUniformLocation(const bool used[MAX_BINDABLE_BUFFERS])
     return -1;
 }
 
+/* Resolve one program-wide location for a plain uniform name.  SPIR-V
+ * Location decorations on default-block uniforms can differ by stage even
+ * when the GLSL uniform is shared.  A source-level layout(location) is the
+ * authoritative choice; otherwise retain the first reflected location in
+ * shader-stage order. */
+static GLint mglCanonicalPlainUniformLocation(Program *program,
+                                               const char *name,
+                                               GLboolean *explicit_out)
+{
+    if (explicit_out) {
+        *explicit_out = GL_FALSE;
+    }
+    if (!program || !name || !name[0]) {
+        return -1;
+    }
+
+    GLint explicit_location = -1;
+    GLint reflected_location = -1;
+    for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++) {
+        SpirvResourceList *resources =
+            &program->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT];
+        const char *source = program->shader_slots[stage]
+            ? program->shader_slots[stage]->src
+            : NULL;
+        for (GLuint i = 0; resources->list && i < resources->count; i++) {
+            SpirvResource *res = &resources->list[i];
+            if (mglProgramResourceLooksSamplerLike(res, SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT) ||
+                !res->name || strcmp(res->name, name) != 0) {
+                continue;
+            }
+
+            GLint declared_location = mglFindExplicitUniformLocation(source, res->name);
+            if (explicit_location < 0 && declared_location >= 0) {
+                explicit_location = declared_location;
+            }
+            if (reflected_location < 0 && res->location != 0xffffffffu &&
+                res->location < 1024u) {
+                reflected_location = (GLint)res->location;
+            }
+        }
+    }
+
+    if (explicit_location >= 0) {
+        if (explicit_out) {
+            *explicit_out = GL_TRUE;
+        }
+        return explicit_location;
+    }
+    return reflected_location;
+}
+
 static bool mglIsSynthesizedLooseUniformStruct(const SpirvResource *res)
 {
     return res && res->name &&
@@ -2602,6 +2653,45 @@ void mglAssignPlainUniformLocations(Program *program)
      * assigns a free location). */
     const char *used_by[MAX_BINDABLE_BUFFERS] = {NULL};
 
+    /* Reserve source-declared locations before automatic reflected locations
+     * are considered.  This also makes an explicit location in one stage
+     * canonical for same-name resources in every linked stage. */
+    for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++) {
+        SpirvResourceList *resources =
+            &program->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT];
+        for (GLuint i = 0; resources->list && i < resources->count; i++) {
+            SpirvResource *res = &resources->list[i];
+            if (mglProgramResourceLooksSamplerLike(res, SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT) ||
+                !res->name) {
+                continue;
+            }
+            GLboolean is_explicit = GL_FALSE;
+            GLint canonical = mglCanonicalPlainUniformLocation(program, res->name,
+                                                                &is_explicit);
+            if (!is_explicit || canonical < 0 || canonical >= MAX_BINDABLE_BUFFERS) {
+                continue;
+            }
+
+            used[canonical] = true;
+            used_by[canonical] = res->name;
+            for (int shared_stage = _VERTEX_SHADER;
+                 shared_stage < _MAX_SHADER_TYPES; shared_stage++) {
+                SpirvResourceList *shared_resources =
+                    &program->spirv_resources_list[shared_stage][SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT];
+                for (GLuint shared_i = 0;
+                     shared_resources->list && shared_i < shared_resources->count;
+                     shared_i++) {
+                    SpirvResource *shared = &shared_resources->list[shared_i];
+                    if (!mglProgramResourceLooksSamplerLike(
+                            shared, SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT) &&
+                        shared->name && strcmp(shared->name, res->name) == 0) {
+                        shared->uniform_location = canonical;
+                    }
+                }
+            }
+        }
+    }
+
     for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++) {
         SpirvResourceList *resources =
             &program->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT];
@@ -2611,10 +2701,19 @@ void mglAssignPlainUniformLocations(Program *program)
                 continue;
             }
 
-            if (res->location != 0xffffffffu &&
-                       res->location < 1024u &&
-                       res->location < MAX_BINDABLE_BUFFERS) {
-                GLint candidate = (GLint)res->location;
+            if (res->uniform_location >= 0) {
+                continue;
+            }
+
+            GLint canonical_location = mglCanonicalPlainUniformLocation(
+                program, res->name, NULL);
+            GLint candidate_location = canonical_location >= 0
+                ? canonical_location
+                : (res->location != 0xffffffffu && res->location < 1024u
+                    ? (GLint)res->location : -1);
+
+            if (candidate_location >= 0 && candidate_location < MAX_BINDABLE_BUFFERS) {
+                GLint candidate = candidate_location;
                 bool sameName = used_by[candidate] && res->name &&
                                 strcmp(used_by[candidate], res->name) == 0;
                 if (!used[candidate] || sameName) {
@@ -2630,10 +2729,10 @@ void mglAssignPlainUniformLocations(Program *program)
                      * free slot instead of aliasing this one. */
                     res->uniform_location = -1;
                 }
-            } else if (res->location != 0xffffffffu && res->location < 1024u) {
+            } else if (candidate_location >= 0 && candidate_location < 1024u) {
                 /* location >= MAX_BINDABLE_BUFFERS: cannot index used[]; keep
                  * prior behavior of honoring it verbatim. */
-                res->uniform_location = (GLint)res->location;
+                res->uniform_location = candidate_location;
             } else if (res->uniform_location >= 0 &&
                        res->uniform_location < MAX_BINDABLE_BUFFERS) {
                 used[res->uniform_location] = true;
@@ -2664,8 +2763,12 @@ void mglAssignPlainUniformLocations(Program *program)
             }
 
             GLint preferred = -1;
-            if (res->location < MAX_BINDABLE_BUFFERS && !used[res->location]) {
-                preferred = (GLint)res->location;
+            GLint canonical_location = mglCanonicalPlainUniformLocation(
+                program, res->name, NULL);
+            GLuint reflected_location = canonical_location >= 0
+                ? (GLuint)canonical_location : res->location;
+            if (reflected_location < MAX_BINDABLE_BUFFERS && !used[reflected_location]) {
+                preferred = (GLint)reflected_location;
             } else if (res->gl_binding < MAX_BINDABLE_BUFFERS && !used[res->gl_binding]) {
                 preferred = (GLint)res->gl_binding;
             } else {
