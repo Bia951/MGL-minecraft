@@ -59,6 +59,21 @@ GLboolean mglGetCPUFormatTypeForInternalFormat(GLenum internalformat,
                                                GLenum *outFormat,
                                                GLenum *outType);
 
+/* A copy changes GPU-visible content even when CPU readback is authoritative.
+ * Keep the storage orientation while invalidating all sampled caches. */
+static inline void mglInvalidateSampledCopiesForTextureLevel(Texture *tex, GLuint level)
+{
+    if (!tex) return;
+    BOOL usesOriginal = !tex->is_render_target ||
+        ((tex->mtl_render_yflip_authority >> 1) == tex->mtl_render_target_write_version &&
+         (tex->mtl_render_yflip_authority & 1u));
+    tex->mtl_render_target_write_version++;
+    tex->mtl_render_yflip_authority = (tex->mtl_render_target_write_version << 1) | (usesOriginal ? 1u : 0u);
+    if (tex->is_render_target) {
+        tex->mtl_gl_sampled_dirty_mip_mask |= level < 32u ? (uint32_t)1u << level : UINT32_MAX;
+    }
+}
+
 /* RT Metal-fill marker — inline because it's small and called from
  * both MGLRenderer.m and MGLRenderer+Blit.m / MGLRenderer+Texture.m. */
 static inline void mglMarkTextureLevelMetalFilled(Texture *tex, GLuint level, size_t uploadSize)

@@ -3165,6 +3165,7 @@ typedef struct MGLBlitColorState {
                             } @catch (NSException *exception) {
                                 NSLog(@"MGL WARNING: CPU-to-CPU Metal update failed: %@",
                                       exception);
+                                cpuCopyOK = false;
                             }
                             free(expandedData);
                         } else {
@@ -3227,7 +3228,11 @@ typedef struct MGLBlitColorState {
                                                  destinationLevel:(NSUInteger)dstLevel
                                                 destinationOrigin:region.origin];
                                     [uploadEncoder endEncoding];
+                                } else {
+                                    cpuCopyOK = false;
                                 }
+                            } else {
+                                cpuCopyOK = false;
                             }
                             free(expandedData);
                         }
@@ -3239,6 +3244,7 @@ typedef struct MGLBlitColorState {
                     if (dstTex->faces[0].levels) {
                         dstTex->faces[0].levels[dstLevel].metal_data_authoritative = GL_FALSE;
                     }
+                    mglInvalidateSampledCopiesForTextureLevel(dstTex, (GLuint)dstLevel);
                     return YES;
                 }
             }
@@ -3406,6 +3412,8 @@ typedef struct MGLBlitColorState {
                     } @catch (NSException *exception) {
                         NSLog(@"MGL WARNING: format conv renderbuffer Metal update failed: %@",
                               exception);
+                        metalCopyOK = false;
+                        mglDispatchError(glm_ctx, __FUNCTION__, GL_INVALID_OPERATION);
                     }
 
                     /* Also update dst CPU data if available */
@@ -3458,6 +3466,7 @@ typedef struct MGLBlitColorState {
                      * for both memcmp and float-epsilon comparisons used
                      * by CTS.  Keeping CPU data authoritative avoids AGX
                      * Metal readback bugs on 3D and certain packed formats. */
+                    mglInvalidateSampledCopiesForTextureLevel(dstTex, (GLuint)dstLevel);
                     return YES;
                 }
             }
@@ -3878,6 +3887,7 @@ typedef struct MGLBlitColorState {
              * must read from CPU data instead.  The Metal texture was
              * updated via replaceRegion for sampling, but CPU data
              * remains the authoritative source. */
+            mglInvalidateSampledCopiesForTextureLevel(dstTex, (GLuint)dstLevel);
             return YES;
         }
 
@@ -4364,6 +4374,8 @@ typedef struct MGLBlitColorState {
         mglDispatchError(glm_ctx, __FUNCTION__, GL_INVALID_OPERATION);
         return;
     }
+
+    mglInvalidateSampledCopiesForTextureLevel(dstTex, (GLuint)dstLevel);
 
     /* Flush the command buffer to ensure the blit is executed before any
      * subsequent readback (e.g. glGetTexImage).  Without this, the blit

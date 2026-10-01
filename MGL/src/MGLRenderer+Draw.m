@@ -4117,7 +4117,8 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
                 expectedType:declared ? declared : expected];
             if (!object || !object->mtl_data) continue;
             id<MTLTexture> source = (__bridge id<MTLTexture>)object->mtl_data;
-            if (source.textureType != MTLTextureType2D || source.sampleCount != 1 ||
+            if ((source.textureType != MTLTextureType2D && source.textureType != MTLTextureType2DArray) ||
+                source.sampleCount != 1 ||
                 !mglMetalPixelFormatHasDepth(source.pixelFormat)) continue;
             unsigned orientation = object->is_render_target &&
                 mglDecideYFlipForSampledRT(object, program) == MGL_YFLIP_USE_SAMPLED_COPY;

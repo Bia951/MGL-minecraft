@@ -2166,7 +2166,7 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
 
     id<MTLTexture> source = (__bridge id<MTLTexture>)object->mtl_data;
     if (!source ||
-        source.textureType != MTLTextureType2D ||
+        (source.textureType != MTLTextureType2D && source.textureType != MTLTextureType2DArray) ||
         source.sampleCount != 1 ||
         !mglMetalPixelFormatHasDepth(source.pixelFormat)) {
         return nil;
@@ -2179,6 +2179,8 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
         object->mtl_depth_read_version[orientation] != object->mtl_render_target_write_version ||
         cached.width != source.width ||
         cached.height != source.height ||
+        cached.textureType != source.textureType ||
+        cached.arrayLength != source.arrayLength ||
         cached.mipmapLevelCount != source.mipmapLevelCount) {
         return nil;
     }
@@ -2193,7 +2195,7 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
 
     id<MTLTexture> source = (__bridge id<MTLTexture>)object->mtl_data;
     if (!source ||
-        source.textureType != MTLTextureType2D ||
+        (source.textureType != MTLTextureType2D && source.textureType != MTLTextureType2DArray) ||
         source.sampleCount != 1 ||
         !mglMetalPixelFormatHasDepth(source.pixelFormat)) {
         return NO;
@@ -2213,6 +2215,8 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
         BOOL shapeMatches = cached &&
             cached.width == source.width &&
             cached.height == source.height &&
+            cached.textureType == source.textureType &&
+            cached.arrayLength == source.arrayLength &&
             cached.mipmapLevelCount == source.mipmapLevelCount;
         if (cached && !shapeMatches) {
             mglSafeReleaseMetalObj(&object->mtl_depth_read_data[orientation]);
@@ -2227,14 +2231,20 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
         return YES;
     }
 
-    if (!_depthReadCopyPipeline) {
+    if (!_depthReadCopyPipeline || !_depthReadArrayCopyPipeline) {
         NSString *code = @"#include <metal_stdlib>\nusing namespace metal;\n"
             "kernel void depth_read_copy(depth2d<float, access::read> src [[texture(0)]], "
             "texture2d<float, access::write> dst [[texture(1)]], "
             "constant uint& flip [[buffer(0)]], uint2 pos [[thread_position_in_grid]]) { "
             "if (any(pos >= uint2(dst.get_width(), dst.get_height()))) return; "
             "uint2 q = uint2(pos.x, flip ? src.get_height() - 1 - pos.y : pos.y); "
-            "dst.write(float4(src.read(q), 0.0, 0.0, 1.0), pos); }";
+            "dst.write(float4(src.read(q), 0.0, 0.0, 1.0), pos); }\n"
+            "kernel void depth_read_copy_array(depth2d_array<float, access::read> src [[texture(0)]], "
+            "texture2d_array<float, access::write> dst [[texture(1)]], "
+            "constant uint& flip [[buffer(0)]], uint3 pos [[thread_position_in_grid]]) { "
+            "if (pos.x >= dst.get_width() || pos.y >= dst.get_height() || pos.z >= dst.get_array_size()) return; "
+            "uint2 q = uint2(pos.x, flip ? src.get_height() - 1 - pos.y : pos.y); "
+            "dst.write(float4(src.read(q, pos.z), 0.0, 0.0, 1.0), uint2(pos.xy), pos.z); }";
         NSError *error = nil;
         id<MTLLibrary> library = [self newMetalLibraryWithSource:code
                                                         options:nil
@@ -2244,7 +2254,11 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
         if (function) {
             _depthReadCopyPipeline = [_device newComputePipelineStateWithFunction:function error:&error];
         }
-        if (!_depthReadCopyPipeline) {
+        id<MTLFunction> arrayFunction = [library newFunctionWithName:@"depth_read_copy_array"];
+        if (arrayFunction) {
+            _depthReadArrayCopyPipeline = [_device newComputePipelineStateWithFunction:arrayFunction error:&error];
+        }
+        if (!_depthReadCopyPipeline || !_depthReadArrayCopyPipeline) {
             NSLog(@"MGL depth read copy compile failed: %@", error);
             return NO;
         }
@@ -2255,11 +2269,12 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
         if (object->mtl_depth_read_data[orientation]) {
             continue;
         }
-        MTLTextureDescriptor *descriptor =
-            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
-                                                               width:source.width
-                                                              height:source.height
-                                                           mipmapped:source.mipmapLevelCount > 1];
+        MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
+                                                                                              width:source.width
+                                                                                             height:source.height
+                                                                                          mipmapped:source.mipmapLevelCount > 1];
+        descriptor.textureType = source.textureType;
+        descriptor.arrayLength = source.arrayLength;
         descriptor.mipmapLevelCount = source.mipmapLevelCount;
         descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
         descriptor.storageMode = MTLStorageModePrivate;
@@ -2277,7 +2292,8 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
     if (!encoder) {
         return NO;
     }
-    [encoder setComputePipelineState:_depthReadCopyPipeline];
+    BOOL isArray = source.textureType == MTLTextureType2DArray;
+    [encoder setComputePipelineState:isArray ? _depthReadArrayCopyPipeline : _depthReadCopyPipeline];
 
     for (unsigned orientation = 0; orientation < 2; orientation++) {
         if (!(object->mtl_depth_read_requested_mask & (1u << orientation))) continue;
@@ -2292,18 +2308,21 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
                 id<MTLTexture> input = source;
                 id<MTLTexture> output = destination;
                 if (source.mipmapLevelCount > 1) {
-                    input = [source newTextureViewWithPixelFormat:source.pixelFormat textureType:MTLTextureType2D
-                        levels:NSMakeRange(level, 1) slices:NSMakeRange(0, 1)];
-                    output = [destination newTextureViewWithPixelFormat:destination.pixelFormat textureType:MTLTextureType2D
-                        levels:NSMakeRange(level, 1) slices:NSMakeRange(0, 1)];
+                    MTLTextureType viewType = isArray ? MTLTextureType2DArray : MTLTextureType2D;
+                    NSRange slices = NSMakeRange(0, isArray ? source.arrayLength : 1u);
+                    input = [source newTextureViewWithPixelFormat:source.pixelFormat textureType:viewType
+                        levels:NSMakeRange(level, 1) slices:slices];
+                    output = [destination newTextureViewWithPixelFormat:destination.pixelFormat textureType:viewType
+                        levels:NSMakeRange(level, 1) slices:slices];
                 }
                 if (!input || !output) { encodedAllLevels = NO; break; }
                 [encoder setTexture:input atIndex:0];
                 [encoder setTexture:output atIndex:1];
-                NSUInteger width = MIN((NSUInteger)8, _depthReadCopyPipeline.maxTotalThreadsPerThreadgroup);
+                id<MTLComputePipelineState> pipeline = isArray ? _depthReadArrayCopyPipeline : _depthReadCopyPipeline;
+                NSUInteger width = MIN((NSUInteger)8, pipeline.maxTotalThreadsPerThreadgroup);
                 NSUInteger height = MAX((NSUInteger)1, MIN((NSUInteger)8,
-                    _depthReadCopyPipeline.maxTotalThreadsPerThreadgroup / MAX(width, (NSUInteger)1)));
-                [encoder dispatchThreads:MTLSizeMake(output.width, output.height, 1)
+                    pipeline.maxTotalThreadsPerThreadgroup / MAX(width, (NSUInteger)1)));
+                [encoder dispatchThreads:MTLSizeMake(output.width, output.height, isArray ? output.arrayLength : 1u)
                     threadsPerThreadgroup:MTLSizeMake(width, height, 1)];
             }
         }
@@ -2316,7 +2335,9 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
     }
     [encoder endEncoding];
     id<MTLTexture> direct = (__bridge id<MTLTexture>)object->mtl_depth_read_data[0];
-    if (direct && mglEnvFlagEnabled("MGL_CAPTURE_DEPTH_READ") && source.pixelFormat == MTLPixelFormatDepth32Float &&
+    if (direct && (object->mtl_depth_read_requested_mask & 1u) != 0u &&
+        source.textureType == MTLTextureType2D &&
+        mglEnvFlagEnabled("MGL_CAPTURE_DEPTH_READ") && source.pixelFormat == MTLPixelFormatDepth32Float &&
         object->mtl_render_target_write_version >= 500u) {
         static GLuint captured[32]; static unsigned count;
         bool seen = false;
