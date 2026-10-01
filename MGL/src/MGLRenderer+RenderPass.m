@@ -2459,6 +2459,10 @@ static bool mglGeometryShaderIsPassthrough(const Shader *shader)
         _renderPassDescriptor.depthAttachment.loadAction = MTLLoadActionClear;
         _renderPassDescriptor.depthAttachment.storeAction = MTLStoreActionStore;
         fbo->depth.clear_bitmask &= ~GL_DEPTH_BUFFER_BIT;
+        if (_renderPassDescriptor.depthAttachment.texture) {
+            mglMarkTextureLevelRenderTargetWritten(
+                [self framebufferAttachmentTexture:&fbo->depth], fbo->depth.level);
+        }
     } else {
         _renderPassDescriptor.depthAttachment.loadAction = MTLLoadActionLoad;
         if (_renderPassDescriptor.depthAttachment.texture) {
@@ -2471,6 +2475,10 @@ static bool mglGeometryShaderIsPassthrough(const Shader *shader)
         _renderPassDescriptor.stencilAttachment.loadAction = MTLLoadActionClear;
         _renderPassDescriptor.stencilAttachment.storeAction = MTLStoreActionStore;
         fbo->stencil.clear_bitmask &= ~GL_STENCIL_BUFFER_BIT;
+        if (_renderPassDescriptor.stencilAttachment.texture) {
+            mglMarkTextureLevelRenderTargetWritten(
+                [self framebufferAttachmentTexture:&fbo->stencil], fbo->stencil.level);
+        }
     } else {
         _renderPassDescriptor.stencilAttachment.loadAction = MTLLoadActionLoad;
         if (_renderPassDescriptor.stencilAttachment.texture) {
