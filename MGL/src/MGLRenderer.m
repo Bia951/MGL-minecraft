@@ -1107,121 +1107,6 @@ void mglNormalizePipelineDepthStencilFormats(MTLRenderPipelineDescriptor *desc, 
  * mglTextureDataKindName, and mglRendererGLInternalFormatLooksDepthOrStencil
  * now live in mgl_texture_compat.m — see mgl_texture_compat.h. */
 
-BOOL mglRendererTextureLooksRecoverableSampled2D(GLMContext glctx,
-                                                        Texture *tex,
-                                                        MTLTextureType expectedType,
-                                                        MGLTextureDataKind expectedKind)
-{
-    if (!glctx || !tex) {
-        return NO;
-    }
-    if (expectedType != 0 && expectedType != MTLTextureType2D) {
-        return NO;
-    }
-    if (!mglRendererObjectPointerLikelyValid(tex) ||
-        !mglRendererPointerInHashTable(&glctx->state.texture_table, tex) ||
-        !mglPointerRangeIsReadable(tex, sizeof(*tex))) {
-        return NO;
-    }
-    if (tex->target != GL_TEXTURE_2D ||
-        tex->index != _TEXTURE_2D ||
-        tex->is_render_target ||
-        mglRendererGLInternalFormatLooksDepthOrStencil(tex->internalformat)) {
-        return NO;
-    }
-
-    TextureLevel *level0 = mglTraceTextureBaseLevel(tex);
-    if (!level0 ||
-        !level0->complete ||
-        (!level0->ever_written && !level0->has_initialized_data)) {
-        return NO;
-    }
-
-    id<MTLTexture> mtlTexture = tex->mtl_data ? (__bridge id<MTLTexture>)(tex->mtl_data) : nil;
-    if (mtlTexture) {
-        if (mglMetalPixelFormatIsDepthOrStencil(mtlTexture.pixelFormat) ||
-            !mglTexturePixelFormatCompatibleWithExpectedDataKind(mtlTexture.pixelFormat, expectedKind)) {
-            return NO;
-        }
-        if (expectedType != 0 && mtlTexture.textureType != expectedType) {
-            return NO;
-        }
-    }
-
-    return YES;
-}
-
-BOOL mglRendererTextureLooksLikeSampledColor2D(GLMContext glctx,
-                                                      Texture *tex)
-{
-    if (!glctx || !tex) {
-        return NO;
-    }
-    if (!mglRendererObjectPointerLikelyValid(tex) ||
-        !mglRendererPointerInHashTable(&glctx->state.texture_table, tex) ||
-        !mglPointerRangeIsReadable(tex, sizeof(*tex))) {
-        return NO;
-    }
-    if (tex->target != GL_TEXTURE_2D ||
-        tex->index != _TEXTURE_2D ||
-        mglRendererGLInternalFormatLooksDepthOrStencil(tex->internalformat)) {
-        return NO;
-    }
-
-    return YES;
-}
-
-BOOL mglRendererGLSampledCopyLooksUsable(Texture *tex,
-                                                MTLTextureType expectedType,
-                                                MGLTextureDataKind expectedKind,
-                                                BOOL allowPreviousWriteVersion,
-                                                id<MTLTexture> *copyOut,
-                                                BOOL *usedPreviousWriteVersionOut)
-{
-    if (copyOut) {
-        *copyOut = nil;
-    }
-    if (usedPreviousWriteVersionOut) {
-        *usedPreviousWriteVersionOut = NO;
-    }
-    if (!tex || !tex->mtl_gl_sampled_data) {
-        return NO;
-    }
-
-    id<MTLTexture> sampledCopy = (__bridge id<MTLTexture>)(tex->mtl_gl_sampled_data);
-    if (!sampledCopy ||
-        mglMetalPixelFormatIsDepthOrStencil(sampledCopy.pixelFormat) ||
-        !mglTexturePixelFormatCompatibleWithExpectedDataKind(sampledCopy.pixelFormat, expectedKind) ||
-        (expectedType != 0 && sampledCopy.textureType != expectedType)) {
-        return NO;
-    }
-    if (tex->mtl_gl_sampled_width != (GLuint)sampledCopy.width ||
-        tex->mtl_gl_sampled_height != (GLuint)sampledCopy.height ||
-        tex->mtl_gl_sampled_format != (GLuint)sampledCopy.pixelFormat) {
-        return NO;
-    }
-
-    BOOL exactVersion =
-        tex->mtl_gl_sampled_write_version != 0u &&
-        tex->mtl_gl_sampled_write_version == tex->mtl_render_target_write_version;
-    BOOL previousVersion =
-        allowPreviousWriteVersion &&
-        tex->mtl_gl_sampled_write_version != 0u &&
-        tex->mtl_render_target_write_version != 0u &&
-        tex->mtl_gl_sampled_write_version + 1u == tex->mtl_render_target_write_version;
-    if (!exactVersion && !previousVersion) {
-        return NO;
-    }
-
-    if (copyOut) {
-        *copyOut = sampledCopy;
-    }
-    if (usedPreviousWriteVersionOut) {
-        *usedPreviousWriteVersionOut = previousVersion;
-    }
-    return YES;
-}
-
 /* mglNowSeconds moved to MGLRenderer_Private.h as static inline */
 
 void mglLogLoopHeartbeat(const char *tag,
@@ -1552,171 +1437,6 @@ BOOL mglRendererPointerInHashTable(HashTable *table, const void *ptr)
 {
     return mglRendererObjectPointerLikelyValid(ptr) &&
            mglHashTableContainsData(table, ptr);
-}
-
-Texture *mglFindFramebufferColorTexturePairedWithDepth(GLMContext glctx,
-                                                              Texture *depthTexture,
-                                                              GLuint *fboNameOut)
-{
-    if (fboNameOut) {
-        *fboNameOut = 0u;
-    }
-    if (!glctx || !depthTexture) {
-        return NULL;
-    }
-
-    Framebuffer *currentFbo = glctx->state.framebuffer;
-    if (currentFbo &&
-        mglRendererObjectPointerLikelyValid(currentFbo) &&
-        mglPointerRangeIsReadable(currentFbo, sizeof(*currentFbo))) {
-        BOOL depthMatches =
-            currentFbo->depth.buf.tex == depthTexture ||
-            currentFbo->stencil.buf.tex == depthTexture ||
-            currentFbo->depth.texture == depthTexture->name ||
-            currentFbo->stencil.texture == depthTexture->name;
-        if (depthMatches && (currentFbo->color_attachment_bitfield & 1u) != 0u) {
-            FBOAttachment *colorAttachment = &currentFbo->color_attachments[0];
-            Texture *colorTexture = colorAttachment->buf.tex;
-            if (!colorTexture && colorAttachment->texture != 0u) {
-                colorTexture = (Texture *)searchHashTable(&glctx->state.texture_table,
-                                                          colorAttachment->texture);
-            }
-            /* Validate raw pointer is still registered (see table-scan path). */
-            if (colorTexture) {
-                Texture *verified = (Texture *)searchHashTable(&glctx->state.texture_table,
-                                                                colorTexture->name);
-                if (verified != colorTexture) {
-                    colorAttachment->buf.tex = NULL;
-                    colorAttachment->texture = 0u;
-                    colorTexture = NULL;
-                }
-            }
-            if (colorTexture &&
-                colorTexture != depthTexture &&
-                mglRendererObjectPointerLikelyValid(colorTexture) &&
-                mglPointerRangeIsReadable(colorTexture, sizeof(*colorTexture)) &&
-                (!colorTexture->mtl_data ||
-                 !mglMetalPixelFormatIsDepthOrStencil([(__bridge id<MTLTexture>)colorTexture->mtl_data pixelFormat]))) {
-                if (fboNameOut) {
-                    *fboNameOut = currentFbo->name;
-                }
-                return colorTexture;
-            }
-        }
-    }
-
-    HashTable *table = &glctx->state.framebuffer_table;
-    if (!mglHashTableValidateStorage(table, "findPairedFramebufferColor") ||
-        !table->keys || !table->states || table->size == 0u) {
-        return NULL;
-    }
-
-    for (size_t slot = 0; slot < table->size; slot++) {
-        if (table->states[slot] != 1u || !table->keys[slot].data) {
-            continue;
-        }
-
-        Framebuffer *fbo = (Framebuffer *)table->keys[slot].data;
-        if (!mglRendererObjectPointerLikelyValid(fbo) ||
-            !mglPointerRangeIsReadable(fbo, sizeof(*fbo))) {
-            continue;
-        }
-
-        BOOL depthMatches =
-            fbo->depth.buf.tex == depthTexture ||
-            fbo->stencil.buf.tex == depthTexture ||
-            fbo->depth.texture == depthTexture->name ||
-            fbo->stencil.texture == depthTexture->name;
-        if (!depthMatches) {
-            continue;
-        }
-
-        FBOAttachment *colorAttachment = &fbo->color_attachments[0];
-        Texture *colorTexture = colorAttachment->buf.tex;
-        if (!colorTexture && colorAttachment->texture != 0u) {
-            colorTexture = (Texture *)searchHashTable(&glctx->state.texture_table,
-                                                      colorAttachment->texture);
-        }
-
-        /* Validate that the raw pointer is still registered in the texture
-         * table.  glDeleteTextures frees the Texture struct but stale raw
-         * pointers can survive in FBO attachments (and mglPointerRangeIsReadable
-         * cannot reliably detect freed-but-mapped malloc memory). */
-        if (colorTexture) {
-            Texture *verified = (Texture *)searchHashTable(&glctx->state.texture_table,
-                                                            colorTexture->name);
-            if (verified != colorTexture) {
-                /* Stale pointer — clear it and skip. */
-                colorAttachment->buf.tex = NULL;
-                colorAttachment->texture = 0u;
-                continue;
-            }
-        }
-
-        if (!colorTexture ||
-            colorTexture == depthTexture ||
-            !mglRendererObjectPointerLikelyValid(colorTexture) ||
-            !mglPointerRangeIsReadable(colorTexture, sizeof(*colorTexture))) {
-            continue;
-        }
-
-        if (colorTexture->mtl_data &&
-            mglMetalPixelFormatIsDepthOrStencil([(__bridge id<MTLTexture>)colorTexture->mtl_data pixelFormat])) {
-            continue;
-        }
-
-        if (fboNameOut) {
-            *fboNameOut = fbo->name;
-        }
-        return colorTexture;
-    }
-
-    return NULL;
-}
-
-BOOL mglCurrentDrawFramebufferUsesColorTexture(GLMContext glctx,
-                                                      Texture *texture,
-                                                      GLuint expectedFboName,
-                                                      NSUInteger *attachmentIndexOut)
-{
-    if (attachmentIndexOut) {
-        *attachmentIndexOut = MAX_COLOR_ATTACHMENTS;
-    }
-    if (!glctx || !texture) {
-        return NO;
-    }
-
-    Framebuffer *fbo = glctx->state.framebuffer;
-    if (!fbo ||
-        !mglRendererObjectPointerLikelyValid(fbo) ||
-        !mglPointerRangeIsReadable(fbo, sizeof(*fbo))) {
-        return NO;
-    }
-    if (expectedFboName != 0u && fbo->name != expectedFboName) {
-        return NO;
-    }
-
-    GLsizei drawBufferCount = mglMetalDrawBufferCount(glctx);
-    for (GLsizei i = 0; i < drawBufferCount; i++) {
-        GLuint attachmentIndex = MAX_COLOR_ATTACHMENTS;
-        if (!mglMetalResolveFboDrawAttachmentIndex(glctx,
-                                                   mglMetalDrawBufferAt(glctx, (GLuint)i),
-                                                   &attachmentIndex) ||
-            attachmentIndex >= MAX_COLOR_ATTACHMENTS ||
-            ((fbo->color_attachment_bitfield >> attachmentIndex) & 1u) == 0u) {
-            continue;
-        }
-
-        FBOAttachment *attachment = &fbo->color_attachments[attachmentIndex];
-        if (attachment->buf.tex == texture || attachment->texture == texture->name) {
-            if (attachmentIndexOut) {
-                *attachmentIndexOut = attachmentIndex;
-            }
-            return YES;
-        }
-    }
-
-    return NO;
 }
 
 static void mglRendererDropCurrentVAO(GLMContext ctx)
@@ -2437,6 +2157,204 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
 
 // Main class performing the rendering
 @implementation MGLRenderer
+
+- (id<MTLTexture>)depthReadTextureForObject:(Texture *)object program:(Program *)program
+{
+    if (!object || !object->mtl_data) {
+        return nil;
+    }
+
+    id<MTLTexture> source = (__bridge id<MTLTexture>)object->mtl_data;
+    if (!source ||
+        source.textureType != MTLTextureType2D ||
+        source.sampleCount != 1 ||
+        !mglMetalPixelFormatIsDepthOrStencil(source.pixelFormat)) {
+        return nil;
+    }
+
+    unsigned orientation = object->is_render_target &&
+        mglDecideYFlipForSampledRT(object, program) == MGL_YFLIP_USE_SAMPLED_COPY;
+    id<MTLTexture> cached = (__bridge id<MTLTexture>)object->mtl_depth_read_data[orientation];
+    if (!cached ||
+        object->mtl_depth_read_version[orientation] != object->mtl_render_target_write_version ||
+        cached.width != source.width ||
+        cached.height != source.height ||
+        cached.mipmapLevelCount != source.mipmapLevelCount) {
+        return nil;
+    }
+    return cached;
+}
+
+- (BOOL)updateDepthReadCopiesForTexture:(Texture *)object
+{
+    if (!object || !object->mtl_data || object->mtl_render_target_write_version == 0u) {
+        return NO;
+    }
+
+    id<MTLTexture> source = (__bridge id<MTLTexture>)object->mtl_data;
+    if (!source ||
+        source.textureType != MTLTextureType2D ||
+        source.sampleCount != 1 ||
+        !mglMetalPixelFormatIsDepthOrStencil(source.pixelFormat)) {
+        return NO;
+    }
+
+    /* This updater is intentionally restricted to a render-pass boundary.
+     * Starting a compute encoder from texture binding tears down the active
+     * draw encoder in the middle of state replay and corrupts post-processing. */
+    if (_currentRenderEncoder) {
+        return NO;
+    }
+
+    BOOL allFresh = YES;
+    for (unsigned orientation = 0; orientation < 2; orientation++) {
+        id<MTLTexture> cached = (__bridge id<MTLTexture>)object->mtl_depth_read_data[orientation];
+        BOOL shapeMatches = cached &&
+            cached.width == source.width &&
+            cached.height == source.height &&
+            cached.mipmapLevelCount == source.mipmapLevelCount;
+        if (cached && !shapeMatches) {
+            mglSafeReleaseMetalObj(&object->mtl_depth_read_data[orientation]);
+            object->mtl_depth_read_version[orientation] = 0u;
+            cached = nil;
+        }
+        if (!cached || object->mtl_depth_read_version[orientation] != object->mtl_render_target_write_version) {
+            allFresh = NO;
+        }
+    }
+    if (allFresh) {
+        return YES;
+    }
+
+    if (!_depthReadCopyPipeline) {
+        NSString *code = @"#include <metal_stdlib>\nusing namespace metal;\n"
+            "kernel void depth_read_copy(depth2d<float, access::read> src [[texture(0)]], "
+            "texture2d<float, access::write> direct [[texture(1)]], "
+            "texture2d<float, access::write> flipped [[texture(2)]], "
+            "uint2 pos [[thread_position_in_grid]]) { "
+            "if (any(pos >= uint2(direct.get_width(), direct.get_height()))) return; "
+            "float d = src.read(pos); direct.write(float4(d, 0.0, 0.0, 1.0), pos); "
+            "uint2 q = uint2(pos.x, src.get_height() - 1 - pos.y); "
+            "flipped.write(float4(src.read(q), 0.0, 0.0, 1.0), pos); }";
+        NSError *error = nil;
+        id<MTLLibrary> library = [self newMetalLibraryWithSource:code
+                                                        options:nil
+                                                          label:@"MGL depth read copy"
+                                                          error:&error];
+        id<MTLFunction> function = [library newFunctionWithName:@"depth_read_copy"];
+        if (function) {
+            _depthReadCopyPipeline = [_device newComputePipelineStateWithFunction:function error:&error];
+        }
+        if (!_depthReadCopyPipeline) {
+            NSLog(@"MGL depth read copy compile failed: %@", error);
+            return NO;
+        }
+    }
+
+    for (unsigned orientation = 0; orientation < 2; orientation++) {
+        if (object->mtl_depth_read_data[orientation]) {
+            continue;
+        }
+        MTLTextureDescriptor *descriptor =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
+                                                               width:source.width
+                                                              height:source.height
+                                                           mipmapped:source.mipmapLevelCount > 1];
+        descriptor.mipmapLevelCount = source.mipmapLevelCount;
+        descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        descriptor.storageMode = MTLStorageModePrivate;
+        id<MTLTexture> destination = [_device newTextureWithDescriptor:descriptor];
+        if (!destination) {
+            return NO;
+        }
+        object->mtl_depth_read_data[orientation] = (void *)CFBridgingRetain(destination);
+    }
+
+    if (![self ensureWritableCommandBuffer:"depth_read_copy_end_pass"]) {
+        return NO;
+    }
+    id<MTLComputeCommandEncoder> encoder = [_currentCommandBuffer computeCommandEncoder];
+    if (!encoder) {
+        return NO;
+    }
+    [encoder setComputePipelineState:_depthReadCopyPipeline];
+
+    id<MTLTexture> direct = (__bridge id<MTLTexture>)object->mtl_depth_read_data[0];
+    id<MTLTexture> flipped = (__bridge id<MTLTexture>)object->mtl_depth_read_data[1];
+    BOOL encodedAllLevels = YES;
+    for (NSUInteger level = 0; level < source.mipmapLevelCount; level++) {
+        @autoreleasepool {
+            id<MTLTexture> input = source;
+            id<MTLTexture> directLevel = direct;
+            id<MTLTexture> flippedLevel = flipped;
+            if (source.mipmapLevelCount > 1) {
+                input = [source newTextureViewWithPixelFormat:source.pixelFormat
+                                                 textureType:MTLTextureType2D
+                                                      levels:NSMakeRange(level, 1)
+                                                      slices:NSMakeRange(0, 1)];
+                directLevel = [direct newTextureViewWithPixelFormat:direct.pixelFormat
+                                                        textureType:MTLTextureType2D
+                                                             levels:NSMakeRange(level, 1)
+                                                             slices:NSMakeRange(0, 1)];
+                flippedLevel = [flipped newTextureViewWithPixelFormat:flipped.pixelFormat
+                                                          textureType:MTLTextureType2D
+                                                               levels:NSMakeRange(level, 1)
+                                                               slices:NSMakeRange(0, 1)];
+            }
+            if (!input || !directLevel || !flippedLevel) {
+                encodedAllLevels = NO;
+                break;
+            }
+            [encoder setTexture:input atIndex:0];
+            [encoder setTexture:directLevel atIndex:1];
+            [encoder setTexture:flippedLevel atIndex:2];
+            MTLSize grid = MTLSizeMake(directLevel.width, directLevel.height, 1);
+            NSUInteger width = MIN((NSUInteger)8, _depthReadCopyPipeline.maxTotalThreadsPerThreadgroup);
+            NSUInteger height = MAX((NSUInteger)1,
+                                    MIN((NSUInteger)8,
+                                        _depthReadCopyPipeline.maxTotalThreadsPerThreadgroup / MAX(width, (NSUInteger)1)));
+            [encoder dispatchThreads:grid threadsPerThreadgroup:MTLSizeMake(width, height, 1)];
+        }
+    }
+    [encoder endEncoding];
+
+    if (!encodedAllLevels) {
+        return NO;
+    }
+    object->mtl_depth_read_version[0] = object->mtl_render_target_write_version;
+    object->mtl_depth_read_version[1] = object->mtl_render_target_write_version;
+    if (mglEnvFlagEnabled("MGL_CAPTURE_DEPTH_READ") && source.pixelFormat == MTLPixelFormatDepth32Float &&
+        object->mtl_render_target_write_version >= 500u) {
+        static GLuint captured[32]; static unsigned count;
+        bool seen = false;
+        for (unsigned i=0;i<count;i++) if (captured[i]==object->name) seen=true;
+        if (!seen && count<32) {
+            captured[count++]=object->name;
+            NSUInteger width=source.width,height=source.height,pitch=(width*sizeof(float)+255u)&~255u;
+            id<MTLBuffer> original=[_device newBufferWithLength:pitch*height options:MTLResourceStorageModeShared];
+            id<MTLBuffer> converted=[_device newBufferWithLength:pitch*height options:MTLResourceStorageModeShared];
+            id<MTLBlitCommandEncoder> capture=[_currentCommandBuffer blitCommandEncoder];
+            for (unsigned i=0;i<2;i++) [capture copyFromTexture:i?direct:source sourceSlice:0 sourceLevel:0
+                sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(width,height,1) toBuffer:i?converted:original
+                destinationOffset:0 destinationBytesPerRow:pitch destinationBytesPerImage:pitch*height];
+            [capture endEncoding];
+            GLuint name=object->name;
+            [_currentCommandBuffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                if(cb.status!=MTLCommandBufferStatusCompleted)return;
+                float minimum=1,maximum=0,error=0; NSUInteger filled=0;
+                for(NSUInteger y=0;y<height;y++) {
+                    float *a=(float *)((uint8_t *)original.contents+y*pitch);
+                    float *b=(float *)((uint8_t *)converted.contents+y*pitch);
+                    for(NSUInteger x=0;x<width;x++) { minimum=fminf(minimum,b[x]);maximum=fmaxf(maximum,b[x]);error=fmaxf(error,fabsf(a[x]-b[x]));filled+=b[x]<1; }
+                }
+                NSLog(@"MGL DEPTH READ VERIFY texture=%u min=%g max=%g populated=%lu/%lu error=%g",name,minimum,maximum,(unsigned long)filled,(unsigned long)(width*height),error);
+            }];
+        }
+    }
+    return YES;
+}
+
+
 
 /* mglVertexAttribComponentSize / mglVertexFormatName moved to mgl_vertex_format.h/.m. */
 
@@ -3692,9 +3610,8 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
                     continue;
                 }
                 SpirvResource *resource = &program->spirv_resources_list[stage][spvc_type].list[i];
-                if (mglShouldSkipStageBufferResource(program, stage, spvc_type, resource)) {
-                    continue;
-                }
+                BOOL skippedResource = mglShouldSkipStageBufferResource(program, stage, spvc_type, resource);
+                if (skippedResource) continue;
 
                 if (spvc_type == SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT &&
                     getenv("MGL_DEBUG_STRUCT_PACK")) {
@@ -3933,6 +3850,7 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
 	                              stage, spvc_type, spirv_binding, baseBinding->buffer, resolved);
 	                    }
 	                }
+
 
                 NSUInteger reflectedRequiredSize =
                     [self getProgramBindingRequiredSize:stage type:spvc_type index:i];

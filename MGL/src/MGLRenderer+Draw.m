@@ -1846,6 +1846,7 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
 
 - (bool) bindTexturesToCurrentRenderEncoder
 {
+    id<MTLRenderCommandEncoder> bindingEncoder = _currentRenderEncoder;
     static uint64_t s_bindTexturesCallCount = 0;
     uint64_t bindCall = ++s_bindTexturesCallCount;
     bool traceBind = mglShouldTraceCall(bindCall);
@@ -1980,7 +1981,10 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
               (unsigned)boundSeparateSamplers);
     }
 
-    return true;
+    /* A sampled-copy refresh may close and recreate the encoder while
+     * retaining a non-nil encoder pointer. Earlier bindings belong to the
+     * old encoder; the caller must replay the complete texture set. */
+    return _currentRenderEncoder == bindingEncoder;
 }
 
 - (bool)bindVertexSampledTexturesToEncoder:(Program *)vertexProgram
@@ -2042,6 +2046,9 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
             if (ptr->mtl_data) {
                 texture = (__bridge id<MTLTexture>)(ptr->mtl_data);
                 texture = mglSampledTextureViewForBaseLevel(ptr, texture);
+                if (expectedKind == MGLTextureDataKindFloat && mglMetalPixelFormatIsDepthOrStencil(texture.pixelFormat)) {
+                    texture = mglSampledTextureViewForBaseLevel(ptr, [self depthReadTextureForObject:ptr program:currentProgram]);
+                }
             }
             if (texture && expectedType != 0 && texture.textureType != expectedType) {
                 static uint64_t s_vertexTypeMismatchLogCount = 0;
@@ -2142,7 +2149,8 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
          * NOTE: lazy refresh from bindTexturesToCurrentRenderEncoder was
          * removed — it re-enters the Metal render encoder during a flush and
          * crashes AGX.  See the fragment counterpart above. */
-        if (!usedTypeFallback && ptr && ptr->is_render_target) {
+        if (!usedTypeFallback && ptr && ptr->is_render_target &&
+            !mglRendererGLInternalFormatLooksDepthOrStencil(ptr->internalformat)) {
             MGLYFlipDecision yflip = mglDecideYFlipForSampledRT(ptr, currentProgram);
             if (mglTraceRTYFlipDiagnosticsEnabled()) {
                 mglTraceLog("RT_YFLIP_DECISION stage=vertex program=%u name=%s binding=%u unit=%u tex=%u label=\"%s\" decision=%s(%d) authority=0x%x rtVer=%u copyVer=%u hasCopy=%d sampleYFlip=%d",
@@ -2205,7 +2213,8 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
                                                             expectedType:expectedType
                                                             expectedKind:expectedKind];
                     if (repairedCopy) {
-                        return false;
+                        texture = mglSampledTextureViewForBaseLevel(ptr, repairedCopy);
+                        boundSampledCopy = YES;
                     }
                 }
                 if (!boundSampledCopy && ptr->mtl_gl_sampled_data &&
@@ -2505,17 +2514,13 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
         BOOL usedSampledCopyForTrace = NO;
 
         if (ptr) {
-            if (![self recoverFragmentSampledDepthTexture:&ptr
-                                                   texture:&texture
-                                               sampledName:sampledName
-                                              spirvBinding:spirvBinding
-                                                textureUnit:textureUnit
-                                               expectedType:expectedType
-                                               expectedKind:expectedKind
-                                       fragmentProgramName:fragmentProgramName
-                            suppressMissingTextureFallback:&suppressMissingTextureFallback
-                                      usedFallbackTexture:&usedFallbackTexture]) {
-                return false;
+            RETURN_FALSE_ON_FAILURE([self bindMTLTexture:ptr]);
+            MGL_ABORT_TBIND_IF_ENCODER_CLOSED();
+            if (ptr->mtl_data) {
+                texture = mglSampledTextureViewForBaseLevel(ptr, (__bridge id<MTLTexture>)ptr->mtl_data);
+                if (expectedKind == MGLTextureDataKindFloat && mglMetalPixelFormatIsDepthOrStencil(texture.pixelFormat)) {
+                    texture = mglSampledTextureViewForBaseLevel(ptr, [self depthReadTextureForObject:ptr program:sampleProgram]);
+                }
             }
             if (![self resolveFragmentSampledYFlipAndSampler:ptr
                                                       texture:&texture
@@ -2875,418 +2880,6 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
     return true;
 }
 
-- (bool)recoverFragmentSampledDepthTexture:(Texture **)ptrPtr
-                                    texture:(id<MTLTexture> *)texturePtr
-                                sampledName:(const char *)sampledName
-                                spirvBinding:(GLuint)spirvBinding
-                                  textureUnit:(GLuint)textureUnit
-                                 expectedType:(MTLTextureType)expectedType
-                                 expectedKind:(MGLTextureDataKind)expectedKind
-                         fragmentProgramName:(GLuint)fragmentProgramName
-                  suppressMissingTextureFallback:(BOOL *)suppressMissingTextureFallbackPtr
-                            usedFallbackTexture:(BOOL *)usedFallbackTexturePtr
-{
-    Texture *ptr = *ptrPtr;
-    id<MTLTexture> texture = *texturePtr;
-    BOOL suppressMissingTextureFallback = *suppressMissingTextureFallbackPtr;
-    BOOL usedFallbackTexture = *usedFallbackTexturePtr;
-
-    RETURN_FALSE_ON_FAILURE([self bindMTLTexture:ptr]);
-    MGL_ABORT_TBIND_IF_ENCODER_CLOSED();
-    if (ptr->mtl_data) {
-        texture = (__bridge id<MTLTexture>)(ptr->mtl_data);
-        texture = mglSampledTextureViewForBaseLevel(ptr, texture);
-    }
-    BOOL sampledNameIsInSampler =
-        sampledName && strcmp(sampledName, "InSampler") == 0;
-    if (texture &&
-        sampledNameIsInSampler &&
-        mglMetalPixelFormatIsDepthOrStencil(texture.pixelFormat)) {
-        GLuint pairedFboName = 0u;
-        Texture *pairedColor =
-            mglFindFramebufferColorTexturePairedWithDepth(ctx, ptr, &pairedFboName);
-        Texture *recoverTexture = NULL;
-        id<MTLTexture> recoverMTL = nil;
-        const char *recoverReason = "none";
-        BOOL recoveredFromSampledCopy = NO;
-        BOOL recoveredFromPreviousVersion = NO;
-        NSUInteger recoverAttachmentIndex = MAX_COLOR_ATTACHMENTS;
-        NSUInteger currentAttachmentIndex = MAX_COLOR_ATTACHMENTS;
-        BOOL pairedColorIsCurrentDrawTarget =
-            mglCurrentDrawFramebufferUsesColorTexture(ctx,
-                                                      pairedColor,
-                                                      pairedFboName,
-                                                      &currentAttachmentIndex);
-        id<MTLTexture> pairedMTL = nil;
-
-        if (pairedColor) {
-            RETURN_FALSE_ON_FAILURE([self bindMTLTexture:pairedColor]);
-            MGL_ABORT_TBIND_IF_ENCODER_CLOSED();
-            pairedMTL = pairedColor->mtl_data
-                ? (__bridge id<MTLTexture>)(pairedColor->mtl_data)
-                : nil;
-            if (!pairedColorIsCurrentDrawTarget && pairedMTL) {
-                pairedColorIsCurrentDrawTarget =
-                    mglRenderPassUsesColorTexture(_renderPassDescriptor,
-                                                  pairedMTL,
-                                                  &currentAttachmentIndex);
-            }
-        }
-
-        if (pairedColorIsCurrentDrawTarget) {
-            static uint64_t s_inSamplerDepthHistoryScanSuppressedLogCount = 0;
-            uint64_t hit = ++s_inSamplerDepthHistoryScanSuppressedLogCount;
-            if (hit <= 64ull || (hit % 512ull) == 0ull) {
-                NSLog(@"MGL INSAMPLER DEPTH HISTORY SCAN SUPPRESSED hit=%llu program=%u binding=%u unit=%u fbo=%u colorAttachment=%lu depthTex=%u pairedColor=%u currentDrawTarget=1",
-                      (unsigned long long)hit,
-                      (unsigned)fragmentProgramName,
-                      (unsigned)spirvBinding,
-                      (unsigned)textureUnit,
-                      (unsigned)pairedFboName,
-                      (unsigned long)currentAttachmentIndex,
-                      ptr ? (unsigned)ptr->name : 0u,
-                      pairedColor ? (unsigned)pairedColor->name : 0u);
-            }
-
-            id<MTLTexture> pairedCopy = nil;
-            BOOL usedPreviousVersion = NO;
-            if (pairedColor &&
-                mglRendererGLSampledCopyLooksUsable(pairedColor,
-                                                    expectedType,
-                                                    expectedKind,
-                                                    YES,
-                                                    &pairedCopy,
-                                                    &usedPreviousVersion)) {
-                recoverTexture = pairedColor;
-                recoverMTL = pairedCopy;
-                recoverReason = "paired-current-copy";
-                recoveredFromSampledCopy = YES;
-                recoveredFromPreviousVersion = usedPreviousVersion;
-                recoverAttachmentIndex = currentAttachmentIndex;
-            } else {
-                static uint64_t s_inSamplerDepthCurrentTargetNoCopyLogCount = 0;
-                uint64_t noCopyHit = ++s_inSamplerDepthCurrentTargetNoCopyLogCount;
-                if (noCopyHit <= 64ull || (noCopyHit % 512ull) == 0ull) {
-                    NSLog(@"MGL INSAMPLER DEPTH CURRENT TARGET NO COPY hit=%llu program=%u binding=%u unit=%u fbo=%u colorAttachment=%lu depthTex=%u colorTex=%u depthFmt=%lu sampledVersion=%u rtVersion=%u",
-                          (unsigned long long)noCopyHit,
-                          (unsigned)fragmentProgramName,
-                          (unsigned)spirvBinding,
-                          (unsigned)textureUnit,
-                          (unsigned)pairedFboName,
-                          (unsigned long)currentAttachmentIndex,
-                          ptr ? (unsigned)ptr->name : 0u,
-                          pairedColor ? (unsigned)pairedColor->name : 0u,
-                          (unsigned long)texture.pixelFormat,
-                          pairedColor ? (unsigned)pairedColor->mtl_gl_sampled_write_version : 0u,
-                          pairedColor ? (unsigned)pairedColor->mtl_render_target_write_version : 0u);
-                }
-                texture = nil;
-                suppressMissingTextureFallback = YES;
-            }
-        } else if (pairedColor &&
-                   pairedMTL &&
-                   !mglMetalPixelFormatIsDepthOrStencil(pairedMTL.pixelFormat)) {
-            static uint64_t s_inSamplerDepthRecoveryLogCount = 0;
-            uint64_t hit = ++s_inSamplerDepthRecoveryLogCount;
-            if (hit <= 64ull || (hit % 512ull) == 0ull) {
-                NSLog(@"MGL INSAMPLER DEPTH RECOVERY hit=%llu program=%u binding=%u unit=%u fbo=%u depthTex=%u colorTex=%u depthFmt=%lu colorFmt=%lu size=%lux%lu",
-                      (unsigned long long)hit,
-                      (unsigned)fragmentProgramName,
-                      (unsigned)spirvBinding,
-                      (unsigned)textureUnit,
-                      (unsigned)pairedFboName,
-                      ptr ? (unsigned)ptr->name : 0u,
-                      (unsigned)pairedColor->name,
-                      (unsigned long)texture.pixelFormat,
-                      (unsigned long)pairedMTL.pixelFormat,
-                      (unsigned long)pairedMTL.width,
-                      (unsigned long)pairedMTL.height);
-            }
-            ptr = pairedColor;
-            texture = pairedMTL;
-        } else if (textureUnit < TEXTURE_UNITS) {
-            for (GLuint historyIndex = 0;
-                 historyIndex < MGL_RECENT_SAMPLED_2D_HISTORY;
-                 historyIndex++) {
-                Texture *candidate =
-                    STATE(recent_sampled_2d_textures[textureUnit][historyIndex]);
-                if (!candidate ||
-                    candidate == ptr ||
-                    candidate == pairedColor ||
-                    !mglRendererTextureLooksLikeSampledColor2D(ctx, candidate)) {
-                    continue;
-                }
-
-                id<MTLTexture> candidateMTL = candidate->mtl_data
-                    ? (__bridge id<MTLTexture>)(candidate->mtl_data)
-                    : nil;
-                NSUInteger candidateAttachmentIndex = MAX_COLOR_ATTACHMENTS;
-                BOOL candidateIsCurrentDrawTarget =
-                    mglCurrentDrawFramebufferUsesColorTexture(ctx,
-                                                              candidate,
-                                                              0u,
-                                                              &candidateAttachmentIndex) ||
-                    mglRenderPassUsesColorTexture(_renderPassDescriptor,
-                                                  candidateMTL,
-                                                  &candidateAttachmentIndex);
-
-                if (!candidateIsCurrentDrawTarget &&
-                    (!candidate->mtl_data || candidate->dirty_bits)) {
-                    RETURN_FALSE_ON_FAILURE([self bindMTLTexture:candidate]);
-                    MGL_ABORT_TBIND_IF_ENCODER_CLOSED();
-                    candidateMTL = candidate->mtl_data
-                        ? (__bridge id<MTLTexture>)(candidate->mtl_data)
-                        : nil;
-                    candidateAttachmentIndex = MAX_COLOR_ATTACHMENTS;
-                    candidateIsCurrentDrawTarget =
-                        mglCurrentDrawFramebufferUsesColorTexture(ctx,
-                                                                  candidate,
-                                                                  0u,
-                                                                  &candidateAttachmentIndex) ||
-                        mglRenderPassUsesColorTexture(_renderPassDescriptor,
-                                                      candidateMTL,
-                                                      &candidateAttachmentIndex);
-                }
-
-                id<MTLTexture> candidateCopy = nil;
-                BOOL usedPreviousVersion = NO;
-                if (candidate->is_render_target &&
-                    mglRendererGLSampledCopyLooksUsable(candidate,
-                                                        expectedType,
-                                                        expectedKind,
-                                                        candidateIsCurrentDrawTarget,
-                                                        &candidateCopy,
-                                                        &usedPreviousVersion)) {
-                    recoverTexture = candidate;
-                    recoverMTL = candidateCopy;
-                    recoverReason = candidateIsCurrentDrawTarget
-                        ? "history-current-copy"
-                        : "history-copy";
-                    recoveredFromSampledCopy = YES;
-                    recoveredFromPreviousVersion = usedPreviousVersion;
-                    recoverAttachmentIndex = candidateAttachmentIndex;
-                    break;
-                }
-
-                if (candidateIsCurrentDrawTarget) {
-                    continue;
-                }
-                if (candidateMTL &&
-                    !mglMetalPixelFormatIsDepthOrStencil(candidateMTL.pixelFormat) &&
-                    (expectedType == 0 || candidateMTL.textureType == expectedType) &&
-                    mglTexturePixelFormatCompatibleWithExpectedDataKind(candidateMTL.pixelFormat, expectedKind)) {
-                    recoverTexture = candidate;
-                    recoverMTL = candidateMTL;
-                    recoverReason = "history-direct";
-                    recoverAttachmentIndex = candidateAttachmentIndex;
-                    break;
-                }
-            }
-        } else if (!pairedColor) {
-            static uint64_t s_inSamplerDepthUnpairedLogCount = 0;
-            uint64_t hit = ++s_inSamplerDepthUnpairedLogCount;
-            if (hit <= 64ull || (hit % 512ull) == 0ull) {
-                NSLog(@"MGL INSAMPLER DEPTH UNPAIRED hit=%llu program=%u binding=%u unit=%u depthTex=%u fmt=%lu size=%lux%lu",
-                      (unsigned long long)hit,
-                      (unsigned)fragmentProgramName,
-                      (unsigned)spirvBinding,
-                      (unsigned)textureUnit,
-                      ptr ? (unsigned)ptr->name : 0u,
-                      (unsigned long)texture.pixelFormat,
-                      (unsigned long)texture.width,
-                      (unsigned long)texture.height);
-            }
-        }
-
-        if (recoverTexture && recoverMTL) {
-            static uint64_t s_inSamplerDepthHistoryRecoveryLogCount = 0;
-            uint64_t hit = ++s_inSamplerDepthHistoryRecoveryLogCount;
-            if (hit <= 64ull || (hit % 512ull) == 0ull) {
-                NSLog(@"MGL INSAMPLER DEPTH RECOVERY hit=%llu reason=%s program=%u binding=%u unit=%u fbo=%u colorAttachment=%lu depthTex=%u recoverTex=%u depthFmt=%lu recoverFmt=%lu size=%lux%lu copy=%d prevVersion=%d sampledVersion=%u rtVersion=%u pairedColor=%u pairedCurrent=%d",
-                      (unsigned long long)hit,
-                      recoverReason,
-                      (unsigned)fragmentProgramName,
-                      (unsigned)spirvBinding,
-                      (unsigned)textureUnit,
-                      (unsigned)pairedFboName,
-                      (unsigned long)recoverAttachmentIndex,
-                      ptr ? (unsigned)ptr->name : 0u,
-                      recoverTexture ? (unsigned)recoverTexture->name : 0u,
-                      (unsigned long)texture.pixelFormat,
-                      (unsigned long)recoverMTL.pixelFormat,
-                      (unsigned long)recoverMTL.width,
-                      (unsigned long)recoverMTL.height,
-                      recoveredFromSampledCopy ? 1 : 0,
-                      recoveredFromPreviousVersion ? 1 : 0,
-                      recoverTexture ? (unsigned)recoverTexture->mtl_gl_sampled_write_version : 0u,
-                      recoverTexture ? (unsigned)recoverTexture->mtl_render_target_write_version : 0u,
-                      pairedColor ? (unsigned)pairedColor->name : 0u,
-                      pairedColorIsCurrentDrawTarget ? 1 : 0);
-            }
-            ptr = recoverTexture;
-            texture = recoverMTL;
-        }
-    }
-    TextureLevel *depthSampleLevel0 = mglTraceTextureBaseLevel(ptr);
-    if (texture &&
-        !sampledNameIsInSampler &&
-        ptr &&
-        ptr->is_render_target &&
-        mglMetalPixelFormatIsDepthOrStencil(texture.pixelFormat) &&
-        (!depthSampleLevel0 ||
-         !depthSampleLevel0->ever_written ||
-         !depthSampleLevel0->has_initialized_data)) {
-        Texture *unitActive = textureUnit < TEXTURE_UNITS ? STATE(active_textures[textureUnit]) : NULL;
-        Texture *unit2D = textureUnit < TEXTURE_UNITS ? STATE(texture_units[textureUnit].textures[_TEXTURE_2D]) : NULL;
-        Texture *last2D = textureUnit < TEXTURE_UNITS ? STATE(last_sampled_2d_textures[textureUnit]) : NULL;
-        Texture *recoverTexture = NULL;
-        const char *recoverReason = "none";
-        GLuint recoverFboName = 0u;
-
-        Texture *pairedColor =
-            mglFindFramebufferColorTexturePairedWithDepth(ctx, ptr, &recoverFboName);
-        if (pairedColor) {
-            RETURN_FALSE_ON_FAILURE([self bindMTLTexture:pairedColor]);
-            MGL_ABORT_TBIND_IF_ENCODER_CLOSED();
-            id<MTLTexture> pairedMTL = pairedColor->mtl_data
-                ? (__bridge id<MTLTexture>)(pairedColor->mtl_data)
-                : nil;
-            NSUInteger drawAttachmentIndex = MAX_COLOR_ATTACHMENTS;
-            BOOL pairedColorIsCurrentDrawTarget =
-                mglRenderPassUsesColorTexture(_renderPassDescriptor,
-                                              pairedMTL,
-                                              &drawAttachmentIndex);
-            if (pairedMTL &&
-                !pairedColorIsCurrentDrawTarget &&
-                !mglMetalPixelFormatIsDepthOrStencil(pairedMTL.pixelFormat) &&
-                (expectedType == 0 || pairedMTL.textureType == expectedType) &&
-                mglTexturePixelFormatCompatibleWithExpectedDataKind(pairedMTL.pixelFormat, expectedKind)) {
-                recoverTexture = pairedColor;
-                recoverReason = "paired-color";
-            } else if (pairedColorIsCurrentDrawTarget) {
-                static uint64_t s_sampledDepthRenderTargetRecoverSkipLogCount = 0;
-                uint64_t hit = ++s_sampledDepthRenderTargetRecoverSkipLogCount;
-                if (hit <= 64ull || (hit % 512ull) == 0ull) {
-                    NSLog(@"MGL SAMPLED DEPTH RT RECOVER SKIP current-draw-target hit=%llu program=%u name=%s binding=%u unit=%u fbo=%u colorAttachment=%lu depthTex=%u colorTex=%u",
-                          (unsigned long long)hit,
-                          (unsigned)fragmentProgramName,
-                          sampledName ? sampledName : "",
-                          (unsigned)spirvBinding,
-                          (unsigned)textureUnit,
-                          (unsigned)recoverFboName,
-                          (unsigned long)drawAttachmentIndex,
-                          ptr ? (unsigned)ptr->name : 0u,
-                          pairedColor ? (unsigned)pairedColor->name : 0u);
-                }
-            }
-        }
-
-        if (!recoverTexture &&
-            mglRendererTextureLooksRecoverableSampled2D(ctx, last2D, expectedType, expectedKind)) {
-            static uint64_t s_sampledDepthLast2DRecoverySuppressedLogCount = 0;
-            uint64_t hit = ++s_sampledDepthLast2DRecoverySuppressedLogCount;
-            if (hit <= 64ull || (hit % 512ull) == 0ull) {
-                NSLog(@"MGL SAMPLED DEPTH RT RECOVER SUPPRESS last-sampled-2d hit=%llu program=%u name=%s binding=%u unit=%u depthTex=%u last2D=%u",
-                      (unsigned long long)hit,
-                      (unsigned)fragmentProgramName,
-                      sampledName ? sampledName : "",
-                      (unsigned)spirvBinding,
-                      (unsigned)textureUnit,
-                      ptr ? (unsigned)ptr->name : 0u,
-                      (unsigned)last2D->name);
-            }
-        }
-
-        if (recoverTexture) {
-            RETURN_FALSE_ON_FAILURE([self bindMTLTexture:recoverTexture]);
-            MGL_ABORT_TBIND_IF_ENCODER_CLOSED();
-            id<MTLTexture> recoverMTL = recoverTexture->mtl_data
-                ? (__bridge id<MTLTexture>)(recoverTexture->mtl_data)
-                : nil;
-            if (recoverMTL &&
-                !mglMetalPixelFormatIsDepthOrStencil(recoverMTL.pixelFormat) &&
-                (expectedType == 0 || recoverMTL.textureType == expectedType) &&
-                mglTexturePixelFormatCompatibleWithExpectedDataKind(recoverMTL.pixelFormat, expectedKind)) {
-                Framebuffer *currentFbo = ctx ? ctx->state.framebuffer : NULL;
-                GLuint colorTexName = 0u;
-                GLuint depthTexName = 0u;
-                if (currentFbo &&
-                    mglRendererObjectPointerLikelyValid(currentFbo) &&
-                    mglPointerRangeIsReadable(currentFbo, sizeof(*currentFbo))) {
-                    colorTexName = currentFbo->color_attachments[0].texture;
-                    depthTexName = currentFbo->depth.texture;
-                }
-
-                static uint64_t s_sampledDepthRenderTargetRecoverLogCount = 0;
-                uint64_t hit = ++s_sampledDepthRenderTargetRecoverLogCount;
-                if (hit <= 64ull || (hit % 512ull) == 0ull) {
-                    NSLog(@"MGL SAMPLED DEPTH RT RECOVER hit=%llu reason=%s program=%u name=%s binding=%u unit=%u depthTex=%u recoverTex=%u fmt=%lu recoverFmt=%lu size=%lux%lu level=%p ever=%u init=%u unit(active=%u tex2D=%u last2D=%u) recoverFbo=%u currentFbo=%u colorTex=%u fboDepthTex=%u",
-                          (unsigned long long)hit,
-                          recoverReason,
-                          (unsigned)fragmentProgramName,
-                          sampledName ? sampledName : "",
-                          (unsigned)spirvBinding,
-                          (unsigned)textureUnit,
-                          ptr ? (unsigned)ptr->name : 0u,
-                          (unsigned)recoverTexture->name,
-                          (unsigned long)texture.pixelFormat,
-                          (unsigned long)recoverMTL.pixelFormat,
-                          (unsigned long)texture.width,
-                          (unsigned long)texture.height,
-                          depthSampleLevel0,
-                          depthSampleLevel0 ? (unsigned)depthSampleLevel0->ever_written : 0u,
-                          depthSampleLevel0 ? (unsigned)depthSampleLevel0->has_initialized_data : 0u,
-                          mglTraceTextureName(unitActive),
-                          mglTraceTextureName(unit2D),
-                          mglTraceTextureName(last2D),
-                          (unsigned)recoverFboName,
-                          currentFbo ? (unsigned)currentFbo->name : 0u,
-                          (unsigned)colorTexName,
-                          (unsigned)depthTexName);
-                }
-
-                ptr = recoverTexture;
-                texture = recoverMTL;
-            }
-        }
-
-        if (mglMetalPixelFormatIsDepthOrStencil(texture.pixelFormat)) {
-            id<MTLTexture> fallbackTexture =
-                [self fallbackSampledTextureForExpectedType:expectedType dataKind:expectedKind];
-            if (fallbackTexture) {
-                static uint64_t s_sampledDepthRenderTargetFallbackLogCount = 0;
-                uint64_t hit = ++s_sampledDepthRenderTargetFallbackLogCount;
-                if (hit <= 64ull || (hit % 512ull) == 0ull) {
-                    NSLog(@"MGL SAMPLED DEPTH RT FALLBACK hit=%llu program=%u name=%s binding=%u unit=%u depthTex=%u fmt=%lu size=%lux%lu level=%p ever=%u init=%u unit(active=%u tex2D=%u last2D=%u)",
-                          (unsigned long long)hit,
-                          (unsigned)fragmentProgramName,
-                          sampledName ? sampledName : "",
-                          (unsigned)spirvBinding,
-                          (unsigned)textureUnit,
-                          ptr ? (unsigned)ptr->name : 0u,
-                          (unsigned long)texture.pixelFormat,
-                          (unsigned long)texture.width,
-                          (unsigned long)texture.height,
-                          depthSampleLevel0,
-                          depthSampleLevel0 ? (unsigned)depthSampleLevel0->ever_written : 0u,
-                          depthSampleLevel0 ? (unsigned)depthSampleLevel0->has_initialized_data : 0u,
-                          mglTraceTextureName(unitActive),
-                          mglTraceTextureName(unit2D),
-                          mglTraceTextureName(last2D));
-                }
-                texture = fallbackTexture;
-                usedFallbackTexture = YES;
-            }
-        }
-    }
-
-    *ptrPtr = ptr;
-    *texturePtr = texture;
-    *suppressMissingTextureFallbackPtr = suppressMissingTextureFallback;
-    *usedFallbackTexturePtr = usedFallbackTexture;
-    return true;
-}
-
 - (bool)resolveFragmentSampledYFlipAndSampler:(Texture *)ptr
                                        texture:(id<MTLTexture> *)texturePtr
                                        sampler:(id<MTLSamplerState> *)samplerPtr
@@ -3322,7 +2915,8 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
     if (texture &&
         !usedFallbackTexture &&
         ptr &&
-        ptr->is_render_target) {
+        ptr->is_render_target &&
+        !mglRendererGLInternalFormatLooksDepthOrStencil(ptr->internalformat)) {
         MGLYFlipDecision yflip = mglDecideYFlipForSampledRT(ptr, sampleProgram);
         if (mglTraceRTYFlipDiagnosticsEnabled()) {
             mglTraceLog("RT_YFLIP_DECISION stage=fragment program=%u stateProgram=%u current=%u pipeline=%u vs=%u fs=%u pipelineProgram=%u name=%s binding=%u unit=%u tex=%u label=\"%s\" decision=%s(%d) authority=0x%x rtVer=%u copyVer=%u hasCopy=%d sampleYFlip=%d",
@@ -3406,7 +3000,10 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
                                                         expectedType:expectedType
                                                         expectedKind:expectedKind];
                 if (repairedCopy) {
-                    return false;
+                    texture = mglSampledTextureViewForBaseLevel(ptr, repairedCopy);
+                    sampledCopyForTrace = repairedCopy;
+                    usedSampledCopyForTrace = YES;
+                    boundSampledCopy = YES;
                 }
             }
             if (!boundSampledCopy && ptr->mtl_gl_sampled_data &&
@@ -3496,6 +3093,7 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
         Program *dumpProgram = sampleProgram;
         mglWriteProgramMSLDump(dumpProgram,
                                [NSString stringWithFormat:@"tex-data-mismatch-fragment-binding-%u", spirvBinding]);
+
         texture = [self fallbackSampledTextureForExpectedType:expectedType dataKind:expectedKind];
         usedFallbackTexture = YES;
         usedSampledCopyForTrace = NO;
@@ -4058,6 +3656,25 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
             if (_renderPassDescriptor.colorAttachments[colorSlot].texture == mtlTex) {
                 [self markCurrentFramebufferColorAttachmentWrittenAtIndex:attachmentIndex];
                 break;
+            }
+        }
+    }
+
+    if (ctx->state.caps.depth_test &&
+        ctx->state.var.depth_writemask &&
+        _renderPassDescriptor.depthAttachment.texture) {
+        Texture *depthTex = [self framebufferAttachmentTexture:&fbo->depth];
+        id<MTLTexture> depthMTL = (depthTex && depthTex->mtl_data)
+            ? (__bridge id<MTLTexture>)(depthTex->mtl_data)
+            : nil;
+        if (depthMTL && _renderPassDescriptor.depthAttachment.texture == depthMTL) {
+            mglMarkTextureLevelRenderTargetWritten(depthTex, fbo->depth.level);
+            Program *renderingProgram = mglResolveProgramFromState(ctx);
+            BOOL framebufferYFlipWrite =
+                renderingProgram &&
+                renderingProgram->spirv[_VERTEX_SHADER].mgl_injected_framebuffer_yflip == GL_TRUE;
+            if (framebufferYFlipWrite) {
+                depthTex->mtl_render_yflip_authority |= 1u;
             }
         }
     }

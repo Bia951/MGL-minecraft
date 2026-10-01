@@ -968,6 +968,11 @@ static bool mglGeometryShaderIsPassthrough(const Shader *shader)
     RETURN_FALSE_ON_FAILURE([self mapBuffersToMTL]);
     RETURN_FALSE_ON_FAILURE([self bindVertexBuffersToCurrentRenderEncoder]);
     RETURN_FALSE_ON_FAILURE([self bindFragmentBuffersToCurrentRenderEncoder]);
+    RETURN_FALSE_ON_FAILURE([self bindArgumentBuffersForProgram:mglResolveProgramForStageFromState(ctx, _VERTEX_SHADER)
+                                                          stage:_VERTEX_SHADER context:ctx renderEncoder:_currentRenderEncoder computeEncoder:nil]);
+    RETURN_FALSE_ON_FAILURE([self bindArgumentBuffersForProgram:mglResolveProgramForStageFromState(ctx, _FRAGMENT_SHADER)
+                                                          stage:_FRAGMENT_SHADER context:ctx renderEncoder:_currentRenderEncoder computeEncoder:nil]);
+    RETURN_FALSE_ON_FAILURE([self bindBufferSizeConstantsForRenderEncoder]);
     return true;
 }
 
@@ -4216,6 +4221,9 @@ create_new_command_buffer:
     if (!ctx || !fbo) {
         return;
     }
+    static const char *captureDirectory;
+    static dispatch_once_t captureDirectoryOnce;
+    dispatch_once(&captureDirectoryOnce, ^{ captureDirectory = getenv("MGL_CAPTURE_ATTACHMENTS_DIR"); });
 
     /* Early-out: skip the per-attachment copy loop entirely when no texture
      * in this FBO is a sampled render target.  The old code unconditionally
@@ -4251,7 +4259,18 @@ create_new_command_buffer:
             break;
         }
     }
-    if (!anySampledRT) {
+    Texture *depthReadTexture = fbo->depth.textarget ? [self framebufferAttachmentTexture:&fbo->depth] : NULL;
+    id<MTLTexture> depthReadMTL = (depthReadTexture && depthReadTexture->mtl_data)
+        ? (__bridge id<MTLTexture>)(depthReadTexture->mtl_data)
+        : nil;
+    BOOL hasDepthReadCandidate =
+        depthReadTexture &&
+        depthReadMTL &&
+        depthReadTexture->is_render_target &&
+        depthReadTexture->mtl_render_target_write_version != 0u &&
+        mglMetalPixelFormatIsDepthOrStencil(depthReadMTL.pixelFormat);
+
+    if (!anySampledRT && !hasDepthReadCandidate) {
         return;
     }
 
@@ -4268,6 +4287,38 @@ create_new_command_buffer:
         }
 
         id<MTLTexture> source = (__bridge id<MTLTexture>)(tex->mtl_data);
+        if (captureDirectory && source.textureType == MTLTextureType2D &&
+            source.sampleCount == 1 && source.width >= 512 &&
+            _dontCareFrameGeneration >= 180u) {
+            static GLuint capturedNames[64];
+            static unsigned capturedCount;
+            BOOL seen = NO;
+            for (unsigned i = 0; i < capturedCount; i++) seen |= capturedNames[i] == tex->name;
+            NSUInteger bpp = mglMetalReadbackBytesPerPixel(source.pixelFormat);
+            if (!seen && capturedCount < 64 && bpp &&
+                [self ensureWritableCommandBuffer:"capture_attachment"]) {
+                capturedNames[capturedCount++] = tex->name;
+                NSLog(@"MGL ATTACHMENT CAPTURE texture=%u version=%u format=%lu program=%u",tex->name,tex->mtl_render_target_write_version,(unsigned long)source.pixelFormat,mglCurrentRenderProgramKey(ctx));
+                NSUInteger width = source.width, height = source.height;
+                NSUInteger row = width * bpp, pitch = (row + 255u) & ~255u;
+                id<MTLBuffer> buffer = [_device newBufferWithLength:pitch * height options:MTLResourceStorageModeShared];
+                id<MTLBlitCommandEncoder> capture = [_currentCommandBuffer blitCommandEncoder];
+                [capture copyFromTexture:source sourceSlice:0 sourceLevel:0
+                            sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(width, height, 1)
+                                toBuffer:buffer destinationOffset:0 destinationBytesPerRow:pitch
+                 destinationBytesPerImage:pitch * height];
+                [capture endEncoding];
+                NSString *path = [NSString stringWithFormat:@"%s/mgl-attachment-%u-%u-%lux%lu.raw",
+                    captureDirectory, tex->name, (unsigned)source.pixelFormat, (unsigned long)width, (unsigned long)height];
+                [_currentCommandBuffer addCompletedHandler:^(id<MTLCommandBuffer> commandBuffer) {
+                    if (commandBuffer.status != MTLCommandBufferStatusCompleted) return;
+                    NSMutableData *data = [NSMutableData dataWithLength:row * height];
+                    for (NSUInteger y = 0; y < height; y++)
+                        memcpy((uint8_t *)data.mutableBytes + y * row, (uint8_t *)buffer.contents + y * pitch, row);
+                    [data writeToFile:path atomically:YES];
+                }];
+            }
+        }
         if (![self textureCanUseGLSampledRenderTargetCopy:tex source:source]) {
             continue;
         }
@@ -4301,6 +4352,10 @@ create_new_command_buffer:
         [self updateGLSampledRenderTargetCopyForTexture:tex
                                                  source:source
                                                  reason:reason ? reason : "end_render_pass"];
+    }
+
+    if (hasDepthReadCandidate) {
+        [self updateDepthReadCopiesForTexture:depthReadTexture];
     }
 }
 

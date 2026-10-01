@@ -152,6 +152,8 @@ typedef struct Texture_t {
     TextureFace faces[6];
     void    *mtl_data;
     void    *mtl_gl_sampled_data;
+    void    *mtl_depth_read_data[2];
+    GLuint   mtl_depth_read_version[2];
     GLuint  mtl_gl_sampled_width;
     GLuint  mtl_gl_sampled_height;
     GLuint  mtl_gl_sampled_format;

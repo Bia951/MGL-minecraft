@@ -540,6 +540,10 @@ typedef struct MGLBlitColorState {
         mglSafeReleaseMetalObj((void **)&tex->mtl_gl_sampled_data);
     }
 
+    for (unsigned orientation = 0; orientation < 2; orientation++) {
+        mglSafeReleaseMetalObj(&tex->mtl_depth_read_data[orientation]);
+        tex->mtl_depth_read_version[orientation] = 0;
+    }
     tex->mtl_gl_sampled_width = 0u;
     tex->mtl_gl_sampled_height = 0u;
     tex->mtl_gl_sampled_format = 0u;
@@ -627,6 +631,10 @@ typedef struct MGLBlitColorState {
                                                expectedKind:(MGLTextureDataKind)expectedKind
 {
     if (!tex || !source || !mglTextureCanUseGLSampledRenderTargetCopy(tex)) {
+        return nil;
+    }
+    id<MTLTexture> baseTexture = (__bridge id<MTLTexture>)tex->mtl_data;
+    if (![self textureCanUseGLSampledRenderTargetCopy:tex source:baseTexture]) {
         return nil;
     }
     if (tex->mtl_render_target_write_version == 0u) {
@@ -1218,6 +1226,7 @@ typedef struct MGLBlitColorState {
                         if (resolveEncoder) {
                             [resolveEncoder endEncoding];
                             mglMarkTextureLevelRenderTargetWritten(depthDrawObject, depthDrawAttachment->level);
+                            [self updateDepthReadCopiesForTexture:depthDrawObject];
                             if (depthStencilMask & GL_DEPTH_BUFFER_BIT) {
                                 mask &= ~GL_DEPTH_BUFFER_BIT;
                             }
@@ -1299,6 +1308,7 @@ typedef struct MGLBlitColorState {
                                                                        depthDrawSubresource.depthPlane)];
                                 [depthBlit endEncoding];
                                 mglMarkTextureLevelRenderTargetWritten(depthDrawObject, depthDrawAttachment->level);
+                            [self updateDepthReadCopiesForTexture:depthDrawObject];
                             }
                         }
                     }
@@ -1451,6 +1461,7 @@ typedef struct MGLBlitColorState {
                                     }
                                     [depthEncoder endEncoding];
                                     mglMarkTextureLevelRenderTargetWritten(depthDrawObject, depthDrawAttachment->level);
+                            [self updateDepthReadCopiesForTexture:depthDrawObject];
                                 }
                             }
                         } else {
@@ -2707,6 +2718,9 @@ typedef struct MGLBlitColorState {
     }
 
     mglMarkTextureLevelMetalFilled(tex, (GLuint)level, 0);
+    if (destIsDepth) {
+        [self updateDepthReadCopiesForTexture:tex];
+    }
     [self updateGLSampledRenderTargetCopyForTexture:tex
                                              source:destTexture
                                              reason:"copy_tex_sub_image_blit"];

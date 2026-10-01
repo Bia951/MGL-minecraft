@@ -76,8 +76,10 @@ static inline void mglMarkTextureLevelMetalFilled(Texture *tex, GLuint level, si
     texLevel->last_src_ptr = NULL;
     texLevel->last_src_hash = 0ull;
 
+    /* GPU copies also change sampled content, even when the destination has
+     * never been attached to a framebuffer. */
+    tex->mtl_render_target_write_version++;
     if (tex->is_render_target) {
-        tex->mtl_render_target_write_version++;
         if (level < 32u) {
             tex->mtl_gl_sampled_dirty_mip_mask |= (uint32_t)1u << level;
         } else {

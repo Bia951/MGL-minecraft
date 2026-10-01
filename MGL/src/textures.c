@@ -341,6 +341,13 @@ void mglReleaseGLSampledTextureCopy(GLMContext ctx, Texture *tex, const char *re
         }
         tex->mtl_gl_sampled_data = NULL;
     }
+    for (unsigned orientation = 0; orientation < 2; orientation++) {
+        if (tex->mtl_depth_read_data[orientation] && ctx && ctx->mtl_funcs.mtlDeleteMTLObj) {
+            ctx->mtl_funcs.mtlDeleteMTLObj(ctx, tex->mtl_depth_read_data[orientation]);
+        }
+        tex->mtl_depth_read_data[orientation] = NULL;
+        tex->mtl_depth_read_version[orientation] = 0u;
+    }
     tex->mtl_gl_sampled_width = 0u;
     tex->mtl_gl_sampled_height = 0u;
     tex->mtl_gl_sampled_format = 0u;
@@ -1056,9 +1063,8 @@ void mglDeleteTextures(GLMContext ctx, GLsizei n, const GLuint *textures)
             /* OpenGL spec: when a texture is deleted, it is detached from any
              * framebuffer it is bound to.  MGL stores raw Texture* pointers in
              * FBOAttachment.buf.tex; without clearing them here the pointers
-             * become dangling after free(tex) below, causing use-after-free
-             * crashes in later draw calls that scan FBO attachments (e.g.
-             * mglFindFramebufferColorTexturePairedWithDepth). */
+             * become dangling after free(tex) below and can cause use-after-free
+             * crashes in later framebuffer attachment scans. */
             mglHashTableForEach(&STATE(framebuffer_table),
                                 mglDetachTextureFromFramebuffers, tex);
 
