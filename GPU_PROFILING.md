@@ -14,3 +14,15 @@ Render `ms` is the envelope of its four stage timestamps. Vertex and fragment st
 Counter intervals are converted with two CPU/GPU clock pairs. Metal's CPU timestamps are already nanoseconds; they must not be multiplied by the Mach timebase. See [Apple's timestamp conversion documentation](https://developer.apple.com/documentation/metal/converting-gpu-timestamps-into-cpu-time).
 
 Profiling can affect scheduling and sampled frames. Compare mode 1 with mode 2 and normal performance summaries in the actual application before drawing conclusions.
+
+## Uniform arena experiments
+
+`MGL_PLAIN_UNIFORM_ARENA=1` opts ordinary vertex/fragment plain uniforms into immutable command-buffer arena storage. It is disabled by default. UBO and SSBO storage is unchanged. `MGL_UNIFORM_VERSIONS=1` independently opts queued draws into immutable Program uniform versions; it also remains disabled by default.
+
+Arena storage is reused only after command-buffer completion. The pool holds at most eight buffers and 32 MiB; additional in-flight storage is temporary. A bounded cache compares source bytes before reusing an arena slice within the same command buffer. Changed values append new slices, preserving bytes referenced by earlier draws.
+
+`MGL_PACKED_ARENA_TRACE=1` reports allocations, reuse, and plain-uniform cache hits/misses. `MGL_PERF_SUMMARY=1` also enables these counters. Leave diagnostics and GPU profiling disabled for final performance comparisons.
+
+## Single-frame capture
+
+`MGL_CAPTURE_SWAP_FRAME=N` captures only swap N using the existing drawable readback path. It takes precedence over the repeated capture schedule when both capture options are set. Exclude the capture interval from performance measurements.

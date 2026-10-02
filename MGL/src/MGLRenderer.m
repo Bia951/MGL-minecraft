@@ -125,6 +125,137 @@ static MTLPixelFormat mglMetalLayerPixelFormatForContext(GLMContext drawCtx)
 static Buffer s_packedStructBuffers[MGL_MAX_PACKED_STRUCT_BUFFERS];
 static int s_packedStructBufferIdx = 0;
 
+#define MGL_PACKED_ARENA_POOL_MAX_ENTRIES 8u
+#define MGL_PACKED_ARENA_POOL_MAX_BYTES (32u * 1024u * 1024u)
+
+@implementation MGLPackedUniformArenaLease
+- (instancetype)init
+{
+    self = [super init];
+    if (self) atomic_init(&available, false);
+    return self;
+}
+@end
+
+@implementation MGLPackedUniformArenaLeaseGroup
+- (instancetype)init
+{
+    self = [super init];
+    if (self) {
+        entries = [NSMutableArray array];
+        atomic_init(&returned, false);
+    }
+    return self;
+}
+
+- (void)addLease:(MGLPackedUniformArenaLease *)lease
+{
+    if (!lease) return;
+    @synchronized (self) {
+        if (!atomic_load_explicit(&returned, memory_order_acquire)) {
+            [entries addObject:lease];
+        }
+    }
+}
+
+- (void)returnLeases
+{
+    bool expected = false;
+    if (!atomic_compare_exchange_strong_explicit(&returned, &expected, true,
+                                                  memory_order_acq_rel,
+                                                  memory_order_acquire)) {
+        return;
+    }
+    @synchronized (self) {
+        for (MGLPackedUniformArenaLease *lease in entries) {
+            if (lease.pooled) {
+                atomic_store_explicit(&lease->available, true, memory_order_release);
+            }
+        }
+        [entries removeAllObjects];
+    }
+}
+
+- (void)dealloc
+{
+    [self returnLeases];
+}
+@end
+
+static BOOL mglPackedArenaTraceEnabled(void)
+{
+    static dispatch_once_t onceToken;
+    static BOOL enabled = NO;
+    dispatch_once(&onceToken, ^{
+        const char *value = getenv("MGL_PACKED_ARENA_TRACE");
+        enabled = value && value[0] && strcmp(value, "0") != 0;
+    });
+    return enabled;
+}
+
+static BOOL mglPlainUniformArenaEnabled(void)
+{
+    static dispatch_once_t once;
+    static BOOL enabled = NO;
+    dispatch_once(&once, ^{
+        const char *value = getenv("MGL_PLAIN_UNIFORM_ARENA");
+        enabled = value && value[0] && strcmp(value, "0") != 0;
+    });
+    return enabled;
+}
+
+static void mglPackedArenaRecordEvent(BOOL reused, NSUInteger capacity)
+{
+    if (!mglPerfSummaryEnabled() && !mglPackedArenaTraceEnabled()) return;
+    static _Atomic(uint64_t) reuseCount = 0;
+    static _Atomic(uint64_t) allocationCount = 0;
+    uint64_t reuse = atomic_load_explicit(&reuseCount, memory_order_relaxed);
+    uint64_t allocations = atomic_load_explicit(&allocationCount, memory_order_relaxed);
+    if (reused) reuse = atomic_fetch_add_explicit(&reuseCount, 1u, memory_order_relaxed) + 1u;
+    else allocations = atomic_fetch_add_explicit(&allocationCount, 1u, memory_order_relaxed) + 1u;
+    uint64_t total = reuse + allocations;
+    if (total <= 8u || (total % 256u) == 0u) {
+        if (mglPerfSummaryEnabled()) {
+            NSLog(@"MGL PERF: packed_arena event=%s reuse=%llu new=%llu capacity=%lu",
+                  reused ? "reuse" : "new",
+                  (unsigned long long)reuse,
+                  (unsigned long long)allocations,
+                  (unsigned long)capacity);
+        } else {
+            fprintf(stderr, "MGL PACKED ARENA event=%s reuse=%llu new=%llu capacity=%lu\n",
+                        reused ? "reuse" : "new",
+                        (unsigned long long)reuse,
+                        (unsigned long long)allocations,
+                        (unsigned long)capacity);
+        }
+    }
+}
+
+static void mglPlainUniformCacheRecordEvent(BOOL hit)
+{
+    if (!mglPerfSummaryEnabled() && !mglPackedArenaTraceEnabled()) return;
+    static _Atomic(uint64_t) hitCount = 0;
+    static _Atomic(uint64_t) missCount = 0;
+    uint64_t hits = atomic_load_explicit(&hitCount, memory_order_relaxed);
+    uint64_t misses = atomic_load_explicit(&missCount, memory_order_relaxed);
+    if (hit) hits = atomic_fetch_add_explicit(&hitCount, 1u, memory_order_relaxed) + 1u;
+    else misses = atomic_fetch_add_explicit(&missCount, 1u, memory_order_relaxed) + 1u;
+    uint64_t total = hits + misses;
+    if (total <= 8u || (total % 65536u) == 0u) {
+        if (mglPerfSummaryEnabled()) {
+            NSLog(@"MGL PERF: plain_uniform_arena_cache event=%s hits=%llu misses=%llu",
+                  hit ? "hit" : "miss",
+                  (unsigned long long)hits,
+                  (unsigned long long)misses);
+        } else {
+            fprintf(stderr, "MGL PLAIN UNIFORM ARENA CACHE event=%s hits=%llu misses=%llu\n",
+                        hit ? "hit" : "miss",
+                        (unsigned long long)hits,
+                        (unsigned long long)misses);
+        }
+    }
+}
+
 /* mglMetalCopyTextureBytesToBGRA8 moved to mgl_readback.m */
 void mglMetalCopyRows(const uint8_t *src,
                       NSUInteger srcBytesPerRow,
@@ -3436,26 +3567,58 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
     return (value + mask) & ~mask;
 }
 
-/* Suballocate immutable packed uniform data from one shared Metal buffer per
- * command buffer.  The wrapper pool is reset before vertex+fragment mapping,
- * so every map entry in one synchronization pass keeps a distinct Buffer
- * object even if the arena has to grow between stages. */
-- (Buffer *)packedStructBufferWithData:(const void *)data
-                                  size:(size_t)size
-                                offset:(GLintptr *)outOffset
+static NSUInteger mglPlainUniformArenaCacheHash(const Buffer *sourceBuffer,
+                                                NSUInteger sourceOffset,
+                                                NSUInteger sourceSize,
+                                                NSUInteger packedSize)
 {
-    if (!data || size == 0u || !outOffset || !_device || !_currentCommandBuffer) {
-        return NULL;
-    }
+    uint64_t x = (uint64_t)(uintptr_t)sourceBuffer;
+    x ^= (uint64_t)sourceOffset + 0x9e3779b97f4a7c15ULL + (x << 6) + (x >> 2);
+    x ^= (uint64_t)sourceSize + 0x9e3779b97f4a7c15ULL + (x << 6) + (x >> 2);
+    x ^= (uint64_t)packedSize + 0x9e3779b97f4a7c15ULL + (x << 6) + (x >> 2);
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebULL;
+    x ^= x >> 31;
+    return (NSUInteger)x & (MGL_PLAIN_UNIFORM_ARENA_CACHE_CAPACITY - 1u);
+}
 
-    if (_packedUniformArenaCommandBuffer != _currentCommandBuffer) {
-        _packedUniformArenaCommandBuffer = _currentCommandBuffer;
-        _packedUniformArenaBuffer = nil;
+- (void)preparePackedUniformArenaForCurrentCommandBuffer
+{
+    if (!_currentCommandBuffer) {
+        _packedUniformArenaCommandBuffer = nil;
+        _packedUniformArenaLeaseGroup = nil;
+        _packedUniformArenaLease = nil;
         _packedUniformArenaCapacity = 0u;
         _packedUniformArenaOffset = 0u;
-        [_packedUniformRetiredArenas removeAllObjects];
+        memset(_plainUniformArenaCache, 0, sizeof(_plainUniformArenaCache));
+        return;
     }
+    if (_packedUniformArenaCommandBuffer == _currentCommandBuffer) return;
 
+    _packedUniformArenaCommandBuffer = _currentCommandBuffer;
+    MGLPackedUniformArenaLeaseGroup *group =
+        [[MGLPackedUniformArenaLeaseGroup alloc] init];
+    _packedUniformArenaLeaseGroup = group;
+    [_currentCommandBuffer addCompletedHandler:^(id<MTLCommandBuffer> commandBuffer) {
+        (void)commandBuffer;
+        [group returnLeases];
+    }];
+    _packedUniformArenaLease = nil;
+    _packedUniformArenaCapacity = 0u;
+    _packedUniformArenaOffset = 0u;
+    memset(_plainUniformArenaCache, 0, sizeof(_plainUniformArenaCache));
+}
+
+- (Buffer *)packedStructBufferForArenaBuffer:(id<MTLBuffer>)arenaBuffer
+                                    capacity:(NSUInteger)capacity
+                                      offset:(NSUInteger)offset
+                                        size:(size_t)size
+{
+    if (!arenaBuffer || !arenaBuffer.contents) {
+        return NULL;
+    }
     if (s_packedStructBufferIdx >= MGL_MAX_PACKED_STRUCT_BUFFERS) {
         static uint64_t s_packedWrapperExhaustionCount = 0;
         uint64_t hit = ++s_packedWrapperExhaustionCount;
@@ -3465,6 +3628,37 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
         }
         return NULL;
     }
+    int idx = s_packedStructBufferIdx++;
+    Buffer *buf = &s_packedStructBuffers[idx];
+    if (buf->name == 0u) {
+        buf->name = 0xF0000000u | (GLuint)idx;
+        buf->target = GL_UNIFORM_BUFFER;
+        buf->usage = GL_STREAM_DRAW;
+    }
+    buf->data.mtl_data = (__bridge void *)arenaBuffer;
+    buf->size = (GLsizeiptr)capacity;
+    buf->data.buffer_data = 0;
+    buf->data.buffer_size = capacity;
+    buf->data.dirty_bits = 0;
+    buf->has_initialized_data = GL_TRUE;
+    buf->ever_written = GL_TRUE;
+    buf->written_min = (GLintptr)offset;
+    buf->written_max = (GLintptr)(offset + size);
+    buf->transient_batch_buffer = GL_TRUE;
+    return buf;
+}
+
+/* Suballocate immutable packed uniform data from arenas leased to one Metal
+ * command buffer. Leases return to the bounded pool only after GPU completion. */
+- (Buffer *)packedStructBufferWithData:(const void *)data
+                                  size:(size_t)size
+                                offset:(GLintptr *)outOffset
+{
+    if (!data || size == 0u || !outOffset || !_device || !_currentCommandBuffer) {
+        return NULL;
+    }
+
+    [self preparePackedUniformArenaForCurrentCommandBuffer];
 
     NSUInteger alignedSize = mglPackedUniformAlignUp((NSUInteger)size,
                                                       MGL_PACKED_UNIFORM_ALIGNMENT);
@@ -3474,7 +3668,7 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
         return NULL;
     }
 
-    BOOL needsArena = !_packedUniformArenaBuffer ||
+    BOOL needsArena = !_packedUniformArenaLease ||
         alignedOffset > _packedUniformArenaCapacity ||
         alignedSize > (_packedUniformArenaCapacity - alignedOffset);
     if (needsArena) {
@@ -3487,7 +3681,7 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
         }
         if (grown < alignedSize) {
             grown = alignedSize;
-        } else if (_packedUniformArenaBuffer &&
+        } else if (_packedUniformArenaLease &&
                    alignedSize <= previousCapacity &&
                    grown <= NSUIntegerMax / 2u) {
             /* When the current arena merely filled, grow rather than allocate
@@ -3495,58 +3689,73 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
             grown *= 2u;
         }
 
-        id<MTLBuffer> replacement =
-            [_device newBufferWithLength:grown
-                                 options:(MTLResourceStorageModeShared |
-                                          MTLResourceCPUCacheModeWriteCombined)];
-        if (!replacement || !replacement.contents) {
-            return NULL;
-        }
-        replacement.label = [NSString stringWithFormat:@"MGL packed uniforms %lu KiB",
-                             (unsigned long)(grown / 1024u)];
-
-        if (_packedUniformArenaBuffer) {
-            if (!_packedUniformRetiredArenas) {
-                _packedUniformRetiredArenas = [NSMutableArray array];
+        MGLPackedUniformArenaLease *replacementLease = nil;
+        if (grown <= MGL_PACKED_ARENA_POOL_MAX_BYTES) {
+            for (MGLPackedUniformArenaLease *candidate in _packedUniformArenaPool) {
+                if (candidate.capacity < grown) continue;
+                bool expectedAvailable = true;
+                if (atomic_compare_exchange_strong_explicit(&candidate->available,
+                                                            &expectedAvailable,
+                                                            false,
+                                                            memory_order_acq_rel,
+                                                            memory_order_acquire)) {
+                    replacementLease = candidate;
+                    mglPackedArenaRecordEvent(YES, candidate.capacity);
+                    break;
+                }
             }
-            [_packedUniformRetiredArenas addObject:_packedUniformArenaBuffer];
         }
-        _packedUniformArenaBuffer = replacement;
-        _packedUniformArenaCapacity = grown;
+        if (!replacementLease) {
+            id<MTLBuffer> replacement =
+                [_device newBufferWithLength:grown
+                                     options:(MTLResourceStorageModeShared |
+                                              MTLResourceCPUCacheModeWriteCombined)];
+            if (!replacement || !replacement.contents) {
+                return NULL;
+            }
+            replacement.label = [NSString stringWithFormat:@"MGL packed uniforms %lu KiB",
+                                 (unsigned long)(grown / 1024u)];
+            replacementLease = [[MGLPackedUniformArenaLease alloc] init];
+            replacementLease.buffer = replacement;
+            replacementLease.capacity = grown;
+            BOOL canPool = grown <= MGL_PACKED_ARENA_POOL_MAX_BYTES &&
+                _packedUniformArenaPool.count < MGL_PACKED_ARENA_POOL_MAX_ENTRIES &&
+                _packedUniformArenaPoolCapacity <= MGL_PACKED_ARENA_POOL_MAX_BYTES - grown;
+            if (canPool) {
+                replacementLease.pooled = YES;
+                if (!_packedUniformArenaPool) {
+                    _packedUniformArenaPool = [NSMutableArray array];
+                }
+                [_packedUniformArenaPool addObject:replacementLease];
+                _packedUniformArenaPoolCapacity += grown;
+            }
+            mglPackedArenaRecordEvent(NO, grown);
+        }
+
+        /* The current group retains every arena used by this CB, including
+         * replaced arenas, until completion or discard. */
+        [_packedUniformArenaLeaseGroup addLease:replacementLease];
+        _packedUniformArenaLease = replacementLease;
+        _packedUniformArenaCapacity = replacementLease.capacity;
         _packedUniformArenaOffset = 0u;
         alignedOffset = 0u;
     }
 
-    uint8_t *destination = (uint8_t *)_packedUniformArenaBuffer.contents + alignedOffset;
+    id<MTLBuffer> arenaBuffer = _packedUniformArenaLease.buffer;
+    if (!arenaBuffer || !arenaBuffer.contents) return NULL;
+    uint8_t *destination = (uint8_t *)arenaBuffer.contents + alignedOffset;
     memcpy(destination, data, size);
     if (alignedSize > size) {
         memset(destination + size, 0, alignedSize - size);
     }
     _packedUniformArenaOffset = alignedOffset + alignedSize;
 
-    int idx = s_packedStructBufferIdx++;
-    Buffer *buf = &s_packedStructBuffers[idx];
-    if (buf->name == 0u) {
-        buf->name = 0xF0000000u | (GLuint)idx;
-        buf->target = GL_UNIFORM_BUFFER;
-        buf->usage = GL_STREAM_DRAW;
-    }
-
-    /* Non-owning bridge: the renderer retains the active/retired arenas and
-     * Metal command buffers retain every encoded resource until completion. */
-    buf->data.mtl_data = (__bridge void *)_packedUniformArenaBuffer;
-    buf->size = (GLsizeiptr)_packedUniformArenaCapacity;
-    buf->data.buffer_data = 0;
-    buf->data.buffer_size = _packedUniformArenaCapacity;
-    buf->data.dirty_bits = 0;
-    buf->has_initialized_data = GL_TRUE;
-    buf->ever_written = GL_TRUE;
-    buf->written_min = (GLintptr)alignedOffset;
-    buf->written_max = (GLintptr)(alignedOffset + size);
-    /* Mark as transient so mglRendererGetValidatedBuffer bypasses the
-     * buffer hash-table lookup (packed struct buffers are standalone
-     * Buffer wrappers, not inserted into the GL buffer table). */
-    buf->transient_batch_buffer = GL_TRUE;
+    /* Non-owning bridge: the lease group retains active and replaced arenas
+     * until this command buffer completes or is discarded. */
+    Buffer *buf = [self packedStructBufferForArenaBuffer:arenaBuffer
+                                                capacity:_packedUniformArenaCapacity
+                                                  offset:alignedOffset
+                                                    size:size];
     *outOffset = (GLintptr)alignedOffset;
     return buf;
 }
@@ -3945,6 +4154,105 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
                     baseBinding->buffer = buf->name;
                     buffer_map->count++;
 
+                    /* Plain uniforms are read-only Program storage. Publish an
+                     * immutable CPU snapshot directly into the command-buffer
+                     * arena instead of allocating/uploading a Metal buffer for
+                     * each location. UBO/SSBO and writable buffers keep their
+                     * regular backing and mutation rules. */
+                    if (spvc_type == SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT &&
+                        mglPlainUniformArenaEnabled() &&
+                        (stage == _VERTEX_SHADER || stage == _FRAGMENT_SHADER) &&
+                        baseBinding->offset >= 0 && baseBinding->size > 0 &&
+                        buf->size > 0 && buf->data.buffer_data) {
+                        NSUInteger sourceOffset = (NSUInteger)baseBinding->offset;
+                        NSUInteger sourceSize = (NSUInteger)baseBinding->size;
+                        NSUInteger available = MIN((NSUInteger)buf->size,
+                                                   (NSUInteger)buf->data.buffer_size);
+                        if (sourceOffset <= available && sourceSize <= available - sourceOffset) {
+                            NSUInteger packedSize = MAX(sourceSize, reflectedRequiredSize);
+                            const uint8_t *source = (const uint8_t *)(uintptr_t)buf->data.buffer_data + sourceOffset;
+                            [self preparePackedUniformArenaForCurrentCommandBuffer];
+
+                            NSUInteger cacheIndex = mglPlainUniformArenaCacheHash(buf,
+                                                                                   sourceOffset,
+                                                                                   sourceSize,
+                                                                                   packedSize);
+                            MGLPlainUniformArenaCacheEntry *cacheSlot = NULL;
+                            Buffer *snapshot = NULL;
+                            GLintptr finalOffset = 0;
+                            for (NSUInteger probe = 0;
+                                 probe < MGL_PLAIN_UNIFORM_ARENA_CACHE_CAPACITY;
+                                 probe++) {
+                                MGLPlainUniformArenaCacheEntry *candidate =
+                                    &_plainUniformArenaCache[(cacheIndex + probe) &
+                                        (MGL_PLAIN_UNIFORM_ARENA_CACHE_CAPACITY - 1u)];
+                                if (!candidate->valid) {
+                                    cacheSlot = candidate;
+                                    break;
+                                }
+                                if (candidate->source_buffer != buf ||
+                                    candidate->source_offset != sourceOffset ||
+                                    candidate->source_size != sourceSize ||
+                                    candidate->packed_size != packedSize) {
+                                    continue;
+                                }
+
+                                cacheSlot = candidate;
+                                id<MTLBuffer> cachedArena = candidate->arena_buffer;
+                                if (cachedArena && cachedArena.contents &&
+                                    candidate->arena_offset <= candidate->arena_capacity &&
+                                    packedSize <= candidate->arena_capacity - candidate->arena_offset &&
+                                    sourceSize <= packedSize &&
+                                    memcmp(source,
+                                           (const uint8_t *)cachedArena.contents + candidate->arena_offset,
+                                           sourceSize) == 0) {
+                                    snapshot = [self packedStructBufferForArenaBuffer:cachedArena
+                                                                              capacity:candidate->arena_capacity
+                                                                                offset:candidate->arena_offset
+                                                                                  size:packedSize];
+                                    if (!snapshot) return false;
+                                }
+                                break;
+                            }
+
+                            if (snapshot) {
+                                finalOffset = (GLintptr)cacheSlot->arena_offset;
+                                mglPlainUniformCacheRecordEvent(YES);
+                            } else {
+                                uint8_t stackPadding[4096];
+                                uint8_t *heapPadding = NULL;
+                                const void *packedBytes = source;
+                                if (packedSize > sourceSize) {
+                                    uint8_t *padding = packedSize <= sizeof(stackPadding)
+                                        ? stackPadding : (heapPadding = malloc(packedSize));
+                                    if (!padding) return false;
+                                    memset(padding, 0, packedSize);
+                                    memcpy(padding, source, sourceSize);
+                                    packedBytes = padding;
+                                }
+                                snapshot = [self packedStructBufferWithData:packedBytes
+                                                                      size:packedSize
+                                                                    offset:&finalOffset];
+                                free(heapPadding);
+                                if (!snapshot) return false;
+                                mglPlainUniformCacheRecordEvent(NO);
+                                if (cacheSlot) {
+                                    cacheSlot->source_buffer = buf;
+                                    cacheSlot->source_offset = sourceOffset;
+                                    cacheSlot->source_size = sourceSize;
+                                    cacheSlot->packed_size = packedSize;
+                                    cacheSlot->arena_buffer = (__bridge id<MTLBuffer>)snapshot->data.mtl_data;
+                                    cacheSlot->arena_offset = (NSUInteger)finalOffset;
+                                    cacheSlot->arena_capacity = (NSUInteger)snapshot->data.buffer_size;
+                                    cacheSlot->valid = YES;
+                                }
+                            }
+                            entry->buf = snapshot;
+                            entry->offset = finalOffset;
+                            entry->size = (GLsizeiptr)packedSize;
+                        }
+                    }
+
                     if (mglProgramNeedsBindingTrace(program)) {
                         static uint64_t s_focusedUBOMapLogs = 0;
                         if (mglShouldLogFocusedBinding(&s_focusedUBOMapLogs)) {
@@ -3982,8 +4290,8 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
                                     usedFallbackBinding ? 1 : 0);
                     }
 
-                    if (reflectedRequiredSize > 0 && baseBinding->size > 0 &&
-                        (NSUInteger)baseBinding->size < reflectedRequiredSize) {
+                    if (reflectedRequiredSize > 0 && entry->size > 0 &&
+                        (NSUInteger)entry->size < reflectedRequiredSize) {
                         GLuint programName = ctx ? ctx->state.program_name : 0u;
                         if (mglShouldLogSmallBaseBinding(programName,
                                                          stage,
@@ -8860,9 +9168,12 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
 
         // Opt-in capture of the actual presented pixels for visual debugging.
         static BOOL captureSwapFrames = NO;
+        static uint64_t captureSwapFrame = 0;
         static dispatch_once_t captureSwapFramesOnce;
         dispatch_once(&captureSwapFramesOnce, ^{
             captureSwapFrames = getenv("MGL_CAPTURE_SWAP_FRAMES") != NULL;
+            const char *singleFrame = getenv("MGL_CAPTURE_SWAP_FRAME");
+            if (singleFrame) captureSwapFrame = strtoull(singleFrame, NULL, 10);
         });
         if (captureSwapFrames && swapCall <= 3ull) {
             NSLog(@"MGL capture swap call=%llu format=%lu drawable=%p size=%lux%lu",
@@ -8870,9 +9181,12 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
                   drawableTexture, (unsigned long)drawableTexture.width,
                   (unsigned long)drawableTexture.height);
         }
-        if (captureSwapFrames && drawableTexture &&
-            (swapCall <= 3ull || (swapCall <= 600ull && swapCall % 30ull == 0ull) ||
-             (swapCall > 600ull && swapCall <= 9000ull && swapCall % 300ull == 0ull)) &&
+        BOOL captureThisFrame = captureSwapFrame > 0
+            ? swapCall == captureSwapFrame
+            : captureSwapFrames &&
+              (swapCall <= 3ull || (swapCall <= 600ull && swapCall % 30ull == 0ull) ||
+               (swapCall > 600ull && swapCall <= 9000ull && swapCall % 300ull == 0ull));
+        if (captureThisFrame && drawableTexture &&
             (drawableTexture.pixelFormat == MTLPixelFormatBGRA8Unorm ||
              drawableTexture.pixelFormat == MTLPixelFormatBGRA8Unorm_sRGB)) {
             NSUInteger width = drawableTexture.width;

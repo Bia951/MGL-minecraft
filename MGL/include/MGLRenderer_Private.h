@@ -25,6 +25,7 @@
 #import "mgl_gpu_profile.h"
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <stdatomic.h>
 #import <AppKit/AppKit.h>
 #import <QuartzCore/QuartzCore.h>   // CAMetalLayer
 #import <simd/simd.h>               // vector_float4, vector_uint2, etc.
@@ -170,6 +171,36 @@ static inline void mglMetalUnlock(os_unfair_lock *lock) {
  * it falls back to the live &ctx->state. */
 #define MGL_STATE(context)  (_activeState ? _activeState : &(context)->state)
 
+@interface MGLPackedUniformArenaLease : NSObject {
+@public
+    atomic_bool available;
+}
+@property(nonatomic, strong) id<MTLBuffer> buffer;
+@property(nonatomic) NSUInteger capacity;
+@property(nonatomic) BOOL pooled;
+@end
+
+@interface MGLPackedUniformArenaLeaseGroup : NSObject {
+@public
+    NSMutableArray<MGLPackedUniformArenaLease *> *entries;
+    atomic_bool returned;
+}
+- (void)addLease:(MGLPackedUniformArenaLease *)lease;
+- (void)returnLeases;
+@end
+
+#define MGL_PLAIN_UNIFORM_ARENA_CACHE_CAPACITY 1024u
+typedef struct MGLPlainUniformArenaCacheEntry_t {
+    const Buffer *source_buffer;
+    NSUInteger source_offset;
+    NSUInteger source_size;
+    NSUInteger packed_size;
+    __unsafe_unretained id<MTLBuffer> arena_buffer;
+    NSUInteger arena_offset;
+    NSUInteger arena_capacity;
+    BOOL valid;
+} MGLPlainUniformArenaCacheEntry;
+
 @interface MGLRenderer () {
     NSView *_view;
     CAMetalLayer *_layer;
@@ -254,11 +285,14 @@ static inline void mglMetalUnlock(os_unfair_lock *lock) {
     NSMutableArray<id<MTLBuffer>> *_argumentBufferRetiredFallbackStorage;
     /* Packed loose-uniform structs share one suballocated arena per Metal
      * command buffer instead of allocating one MTLBuffer per draw. */
-    id<MTLCommandBuffer> _packedUniformArenaCommandBuffer;
-    id<MTLBuffer> _packedUniformArenaBuffer;
-    NSMutableArray<id<MTLBuffer>> *_packedUniformRetiredArenas;
+    __weak id<MTLCommandBuffer> _packedUniformArenaCommandBuffer;
+    MGLPackedUniformArenaLeaseGroup *_packedUniformArenaLeaseGroup;
+    MGLPackedUniformArenaLease *_packedUniformArenaLease;
+    NSMutableArray<MGLPackedUniformArenaLease *> *_packedUniformArenaPool;
+    NSUInteger _packedUniformArenaPoolCapacity;
     NSUInteger _packedUniformArenaCapacity;
     NSUInteger _packedUniformArenaOffset;
+    MGLPlainUniformArenaCacheEntry _plainUniformArenaCache[MGL_PLAIN_UNIFORM_ARENA_CACHE_CAPACITY];
     /* glVertexAttrib* current values are expanded into a repeated Metal
      * vertex stream.  Cache the immutable stream per attribute and rebuild it
      * only when the encoded value or stride actually changes. */
