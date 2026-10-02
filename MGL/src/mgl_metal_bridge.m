@@ -169,6 +169,16 @@ void mtlFlush(GLMContext glm_ctx, bool finish) {
     }
 }
 
+void mtlMemoryBarrier(GLMContext glm_ctx) {
+    id<MGLMetalBridgeTarget> target = mglBridgeTarget(glm_ctx, __func__);
+    if (!target) {
+        return;
+    }
+    @autoreleasepool {
+        [target mtlMemoryBarrier:glm_ctx];
+    }
+}
+
 void mtlSwapBuffers(GLMContext glm_ctx) {
     id<MGLMetalBridgeTarget> target = mglBridgeTarget(glm_ctx, __func__);
     if (!target) {

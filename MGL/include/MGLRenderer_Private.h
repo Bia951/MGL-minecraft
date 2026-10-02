@@ -204,7 +204,7 @@ static inline void mglMetalUnlock(os_unfair_lock *lock) {
     MTLPixelFormat _pipelineDepthFormat;
     MTLPixelFormat _pipelineStencilFormat;
     GLuint _pipelineProgramName;
-    NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *_pipelineStateCache;
+    NSMutableDictionary<NSData *, id<MTLRenderPipelineState>> *_pipelineStateCache;
     /* Gated by MGL_DS_CACHE (default ON; =0 disables).  Maps cache key →
      * id<MTLDepthStencilState> with simple LRU eviction at 64 entries. */
     NSMutableDictionary *_depthStencilStateCache;

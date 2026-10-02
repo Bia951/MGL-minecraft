@@ -59,6 +59,7 @@
 - (void)mtlReleaseSync:(GLMContext)glm_ctx sync:(Sync *)sync;
 - (void)flushDrawBuffer:(GLMContext)glm_ctx;
 - (void)mtlFlush:(GLMContext)glm_ctx finish:(bool)finish;
+- (void)mtlMemoryBarrier:(GLMContext)glm_ctx;
 - (void)mtlSwapBuffers:(GLMContext)glm_ctx;
 - (void)mtlClearBuffer:(GLMContext)glm_ctx type:(GLuint)type mask:(GLbitfield)mask;
 - (void)mtlBlitFramebuffer:(GLMContext)glm_ctx srcX0:(GLint)srcX0 srcY0:(GLint)srcY0 srcX1:(GLint)srcX1 srcY1:(GLint)srcY1 dstX0:(GLint)dstX0 dstY0:(GLint)dstY0 dstX1:(GLint)dstX1 dstY1:(GLint)dstY1 mask:(GLbitfield)mask filter:(GLenum)filter;
@@ -123,6 +124,7 @@ void mtlReleaseSync(GLMContext glm_ctx, Sync *sync);
 /* Flush / Swap */
 void mtlFlushDrawBuffer(GLMContext glm_ctx);
 void mtlFlush(GLMContext glm_ctx, bool finish);
+void mtlMemoryBarrier(GLMContext glm_ctx);
 void mtlSwapBuffers(GLMContext glm_ctx);
 
 /* Clear / Blit / Invalidate */

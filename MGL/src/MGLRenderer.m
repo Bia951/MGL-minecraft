@@ -121,6 +121,10 @@ static MTLPixelFormat mglMetalLayerPixelFormatForContext(GLMContext drawCtx)
     return fallback;
 }
 
+#define MGL_MAX_PACKED_STRUCT_BUFFERS 256
+static Buffer s_packedStructBuffers[MGL_MAX_PACKED_STRUCT_BUFFERS];
+static int s_packedStructBufferIdx = 0;
+
 /* mglMetalCopyTextureBytesToBGRA8 moved to mgl_readback.m */
 void mglMetalCopyRows(const uint8_t *src,
                       NSUInteger srcBytesPerRow,
@@ -1518,6 +1522,24 @@ Buffer *mglRendererGetValidatedBuffer(GLMContext ctx, Buffer *candidate, const c
 
     if (!mglRendererObjectPointerLikelyValid(candidate)) {
         NSLog(@"MGL BUFFER INVALID in %s: slot=%lu candidate=%p (suspicious pseudo-pointer)",
+              where ? where : "unknown", (unsigned long)slot, candidate);
+        return NULL;
+    }
+
+    /* Packed struct wrappers live in a renderer-owned static object pool,
+     * outside buffer_table. Confirm pool identity using the pointer value
+     * before reading the object, then avoid vm_region_64 for these known-safe
+     * wrappers. */
+    uintptr_t candidateAddress = (uintptr_t)candidate;
+    uintptr_t packedPoolStart = (uintptr_t)&s_packedStructBuffers[0];
+    uintptr_t packedPoolOffset = candidateAddress - packedPoolStart;
+    if (candidateAddress >= packedPoolStart &&
+        packedPoolOffset < sizeof(s_packedStructBuffers) &&
+        packedPoolOffset % sizeof(Buffer) == 0u) {
+        if (candidate->transient_batch_buffer) {
+            return candidate;
+        }
+        NSLog(@"MGL BUFFER INVALID in %s: slot=%lu candidate=%p (uninitialized packed wrapper)",
               where ? where : "unknown", (unsigned long)slot, candidate);
         return NULL;
     }
@@ -3295,11 +3317,8 @@ void logDirtyBits(GLMContext ctx)
  * buffers at render time.
  */
 
-#define MGL_MAX_PACKED_STRUCT_BUFFERS 256
 #define MGL_PACKED_UNIFORM_ARENA_INITIAL_SIZE (4u * 1024u * 1024u)
 #define MGL_PACKED_UNIFORM_ALIGNMENT 256u
-static Buffer *s_packedStructBuffers[MGL_MAX_PACKED_STRUCT_BUFFERS];
-static int s_packedStructBufferIdx = 0;
 
 /* Compute the location step per array element from reflected members.
  * For a struct S = { vec4 m0, float m1[2], mat2 m2 }, the step is 4
@@ -3481,16 +3500,11 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
     _packedUniformArenaOffset = alignedOffset + alignedSize;
 
     int idx = s_packedStructBufferIdx++;
-    Buffer *buf = s_packedStructBuffers[idx];
-    if (!buf) {
-        buf = (Buffer *)calloc(1, sizeof(Buffer));
-        if (!buf) {
-            return NULL;
-        }
+    Buffer *buf = &s_packedStructBuffers[idx];
+    if (buf->name == 0u) {
         buf->name = 0xF0000000u | (GLuint)idx;
         buf->target = GL_UNIFORM_BUFFER;
         buf->usage = GL_STREAM_DRAW;
-        s_packedStructBuffers[idx] = buf;
     }
 
     /* Non-owning bridge: the renderer retains the active/retired arenas and
@@ -8571,6 +8585,15 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
     [self flushCommandBuffer: finish];
 }
 
+-(void) mtlMemoryBarrier:(GLMContext) glm_ctx
+{
+    METAL_LOCK();
+    ctx = glm_ctx;
+    [self flushDrawBuffer:glm_ctx];
+    [self endRenderEncodingLocked];
+    METAL_UNLOCK();
+}
+
 #pragma mark C interface to mtlSwapBuffers
 -(void) mtlSwapBuffers:(GLMContext) glm_ctx
 {
@@ -11228,6 +11251,7 @@ Buffer *getIndirectBuffer(GLMContext ctx)
     glm_ctx->mtl_funcs.mtlGetSyncStatus = mtlGetSyncStatus;
     glm_ctx->mtl_funcs.mtlReleaseSync = mtlReleaseSync;
     glm_ctx->mtl_funcs.mtlFlush = mtlFlush;
+    glm_ctx->mtl_funcs.mtlMemoryBarrier = mtlMemoryBarrier;
     glm_ctx->mtl_funcs.mtlSwapBuffers = mtlSwapBuffers;
     glm_ctx->mtl_funcs.mtlFlushDrawBuffer = mtlFlushDrawBuffer;
     glm_ctx->mtl_funcs.mtlInvalidateRenderPass = mtlInvalidateRenderPass;

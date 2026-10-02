@@ -292,7 +292,11 @@ void mglTextureBarrier(GLMContext ctx)
         return;
     }
 
-    mglFlushCommandBuffer(ctx);
+    if (ctx->mtl_funcs.mtlMemoryBarrier) {
+        ctx->mtl_funcs.mtlMemoryBarrier(ctx);
+    } else {
+        mglFlushCommandBuffer(ctx);
+    }
 }
 
 void mglMemoryBarrier(GLMContext ctx, GLbitfield barriers)
@@ -323,30 +327,32 @@ void mglMemoryBarrier(GLMContext ctx, GLbitfield barriers)
         return;
     }
 
-    /*
-     * Metal command buffers provide the actual visibility boundary for compute
-     * writes consumed by later GL reads or draws. This conservative barrier
-     * gives SSBO/image/texture updates GL ordering semantics until finer-grain
-     * encoder hazards are implemented.
-     *
-     * Compute encoder coverage: MGL does NOT keep a long-lived compute encoder
-     * across GL calls — every glDispatchCompute / tessellation dispatch creates
-     * a local MTLComputeCommandEncoder via [_currentCommandBuffer
-     * computeCommandEncoder] and calls endEncoding() before returning (see
-     * mtlDispatchCompute and the TCS/TES dispatch paths in MGLRenderer.m). Thus
-     * no open compute encoder exists when mglMemoryBarrier is reached, and the
-     * flush path below (mglFlushCommandBuffer -> mtlFlush -> flushCommandBuffer:
-     * -> endRenderEncoding + commit + waitUntilCompleted) is sufficient: it
-     * commits the current CB (which already contains all encoded compute
-     * dispatches) and waits for completion, making compute writes visible to
-     * subsequent GL draws/reads. No explicit endComputeEncoding is needed here.
-     */
-    mglFlushCommandBuffer(ctx);
-    if (ctx->mtl_funcs.mtlFlush) {
-        ctx->mtl_funcs.mtlFlush(ctx, true);
+    if (barriers == 0) {
+        return;
     }
-    /* MGL_SYNC_STRICT: 此处已执行 mglFlushCommandBuffer + mtlFlush(ctx, true)
-     * (commit + waitUntilCompleted)，属于保守路径，无需额外 strict 分支。 */
+
+    /* Client-mapped visibility is consumed by CPU access, so retain the
+     * synchronous path for it (and for the explicit diagnostic strict mode).
+     * GL_ALL_BARRIER_BITS includes the client-mapped bit and remains on the
+     * same conservative path. Other barriers need only order GPU work: the
+     * Metal bridge flushes queued draws and ends the render encoder while
+     * leaving the command buffer uncommitted for later GPU commands. */
+    if (ctx->sync_strict || barriers == GL_ALL_BARRIER_BITS ||
+        (barriers & GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT)) {
+        mglFlushCommandBuffer(ctx);
+        if (ctx->mtl_funcs.mtlFlush) {
+            ctx->mtl_funcs.mtlFlush(ctx, true);
+        }
+    } else if (ctx->mtl_funcs.mtlMemoryBarrier) {
+        ctx->mtl_funcs.mtlMemoryBarrier(ctx);
+    } else {
+        /* Preserve correctness if a backend has not installed the nonblocking
+         * encoder-boundary entry point. */
+        mglFlushCommandBuffer(ctx);
+        if (ctx->mtl_funcs.mtlFlush) {
+            ctx->mtl_funcs.mtlFlush(ctx, true);
+        }
+    }
 
     /* Storage image (imageStore) writes go directly to the GPU Metal texture.
      * Without marking the texture/level as metal_data_authoritative, subsequent
@@ -384,4 +390,6 @@ void mglMemoryBarrierByRegion(GLMContext ctx, GLbitfield barriers)
         // extra bits...
         ERROR_RETURN(GL_INVALID_VALUE);
     }
+
+    mglMemoryBarrier(ctx, barriers);
 }

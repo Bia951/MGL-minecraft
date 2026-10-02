@@ -5455,18 +5455,21 @@ stencil_format_ok:;
             }
 
 	            pipelineStateDescriptor.vertexDescriptor = vertexDescriptor;
-	            NSString *pipelineCacheKey = nil;
+	            NSData *pipelineCacheKey = nil;
 	            bool pipelineResolvedFromCache = false;
 
 	            if (!pipelineResolvedFromCache && _pipelineStateCache && currentProgramName != 0) {
 	                uint64_t pipelineSig = mglPipelineDescriptorSignature(pipelineStateDescriptor);
                 uint64_t vertexSig = mglVertexDescriptorSignature(vertexDescriptor);
-	                pipelineCacheKey = [NSString stringWithFormat:@"%u:%x:%x:%016llx:%016llx",
-		                                    (unsigned)currentProgramName,
-		                                    (unsigned)state->var.clip_origin,
-		                                    (unsigned)state->var.clip_depth_mode,
-		                                    (unsigned long long)pipelineSig,
-		                                    (unsigned long long)vertexSig];
+	                const uint64_t pipelineCacheKeyWords[5] = {
+	                    (uint64_t)currentProgramName,
+	                    (uint64_t)(unsigned)state->var.clip_origin,
+	                    (uint64_t)(unsigned)state->var.clip_depth_mode,
+	                    pipelineSig,
+	                    vertexSig
+	                };
+	                pipelineCacheKey = [NSData dataWithBytes:pipelineCacheKeyWords
+	                                                  length:sizeof(pipelineCacheKeyWords)];
 	                id<MTLRenderPipelineState> cachedPipeline = [_pipelineStateCache objectForKey:pipelineCacheKey];
 	                if (cachedPipeline) {
 	                    static uint64_t s_pipelineCacheHitCount = 0;
@@ -5828,7 +5831,7 @@ stencil_format_ok:;
  * Pipeline cache insertion with LRU eviction, extracted from
  * syncPipelineStateWithDeferredBufferMap:.
  */
-- (void)insertPipelineIntoCacheWithKey:(NSString *)pipelineCacheKey
+- (void)insertPipelineIntoCacheWithKey:(NSData *)pipelineCacheKey
 {
     if (_pipelineStateCache) {
         /* LRU eviction: remove the oldest 25% of cached entries instead

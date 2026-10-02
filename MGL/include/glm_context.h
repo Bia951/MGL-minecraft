@@ -109,6 +109,9 @@ struct GLMMetalFuncs {
     void (*mtlReleaseSync)(GLMContext glm_ctx, Sync *sync);
 
     void (*mtlFlush)(GLMContext glm_ctx, bool finish);
+    /* End the current render encoder after flushing deferred draws, without
+     * committing the command buffer or waiting for GPU completion. */
+    void (*mtlMemoryBarrier)(GLMContext glm_ctx);
     void (*mtlSwapBuffers)(GLMContext glm_ctx);
     void (*mtlFlushDrawBuffer)(GLMContext glm_ctx);
     void (*mtlInvalidateRenderPass)(GLMContext glm_ctx);

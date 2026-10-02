@@ -24,16 +24,20 @@
  * aggregate MGLHazardState recording whether compute / render / blit writes
  * are pending in the current (uncommitted) command buffer.
  *
- * mglMemoryBarrier consults this state together with the barrier bits to
- * decide between:
+ * The current coarse mglMemoryBarrier path ends the active render encoder
+ * (after encoding deferred draws) for GPU->GPU ordering, without committing
+ * the command buffer or blocking the CPU. The bookkeeping below is reserved
+ * for a future per-resource refinement; it is not currently consulted by the
+ * barrier entry point. The synchronous path remains for client-mapped access
+ * and explicit strict mode:
  *
- *   - GPU->GPU visibility within the same command buffer — free: Metal
- *     guarantees that encoders execute in encoding order, so writes from an
- *     earlier encoder are visible to a later encoder.  Ending the current
- *     encoder is enough; no commit, no CPU wait.
- *   - CPU visibility — commit + waitUntilCompleted, used ONLY for
- *     GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT (the only bit whose spec semantics
- *     promise CPU observability of prior GPU writes).
+ *   - GPU->GPU visibility with tracked resources on one Metal command queue:
+ *     Metal synchronizes resource conflicts between encoder passes. Ending
+ *     the current encoder is enough; no commit, no CPU wait. Indirect resources
+ *     must be declared with useResource; untracked resources require explicit
+ *     GPU synchronization.
+ *   - CPU visibility — commit + waitUntilCompleted, retained conservatively for
+ *     GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT (including ALL) and sync_strict to support the current CPU mapping implementation.
  *
  * The design is deliberately minimal: it records enough state to make the
  * per-bit decision required by R4 without a heavy per-resource dependency
