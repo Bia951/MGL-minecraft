@@ -833,6 +833,8 @@ void mglLinkProgram(GLMContext ctx, GLuint program)
     pptr->mslCacheValid = GL_FALSE;
     pptr->usesFragCoordParams = GL_FALSE;
     pptr->vertexAttribUsageMask = 0u;
+    memset(pptr->draw_buffer_slot_masks_valid, 0,
+           sizeof(pptr->draw_buffer_slot_masks_valid));
     memset(pptr->msl_named_argument_cache, 0, sizeof(pptr->msl_named_argument_cache));
     pptr->msl_named_argument_cache_next = 0u;
     for (int stage = 0; stage < _MAX_SHADER_TYPES; stage++) {

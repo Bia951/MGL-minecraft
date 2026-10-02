@@ -2561,7 +2561,8 @@ static void mglTrackPendingDrawBufferReads(GLMContext ctx,
     mglTrackPendingBaseBufferReads(ctx);
 }
 
-void mglRecordDrawCommand(GLMContext ctx, const MGLDrawCommand *cmd)
+static void mglRecordDrawCommandCore(GLMContext ctx, const MGLDrawCommand *cmd,
+                                     MGLStateKey *cachedKey, bool *keyValid)
 {
     MGL_SIGNPOST_BEGIN(RecordDrawCommand);
     if (!ctx || !cmd) {
@@ -2585,7 +2586,15 @@ void mglRecordDrawCommand(GLMContext ctx, const MGLDrawCommand *cmd)
          cmd->type != MGL_CMD_DRAW_ARRAYS_INSTANCED_BASE_INSTANCE);
 
     MGLStateKey key;
-    mglComputeStateKey(ctx, cmd->mode, cmd_uses_elements, &key);
+    if (cachedKey && keyValid) {
+        if (!*keyValid) {
+            mglComputeStateKey(ctx, cmd->mode, cmd_uses_elements, cachedKey);
+            *keyValid = true;
+        }
+        key = *cachedKey;
+    } else {
+        mglComputeStateKey(ctx, cmd->mode, cmd_uses_elements, &key);
+    }
 
     MGLStreamMergeCandidate streamCandidate;
     bool can_stream_merge =
@@ -2773,6 +2782,17 @@ void mglRecordDrawCommand(GLMContext ctx, const MGLDrawCommand *cmd)
     mglTrackPendingSampledTextureReads(ctx);
     mglTrackPendingFramebufferTextureWrites(ctx);
     MGL_SIGNPOST_END(RecordDrawCommand);
+}
+
+void mglRecordDrawCommandWithStateKey(GLMContext ctx, const MGLDrawCommand *cmd,
+                                      MGLStateKey *cachedKey, bool *keyValid)
+{
+    mglRecordDrawCommandCore(ctx, cmd, cachedKey, keyValid);
+}
+
+void mglRecordDrawCommand(GLMContext ctx, const MGLDrawCommand *cmd)
+{
+    mglRecordDrawCommandCore(ctx, cmd, NULL, NULL);
 }
 
 void mglAppendDrawCommand(GLMContext ctx, const MGLDrawCommand *cmd)

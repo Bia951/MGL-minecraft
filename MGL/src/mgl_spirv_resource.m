@@ -150,38 +150,50 @@ void mglVisitDrawBufferBindings(GLMContext ctx, MGLDrawBufferBindingVisitor visi
         GLuint pidx = 0;
         while (pidx < programCount && programs[pidx] != program) pidx++;
         if (pidx == programCount) programs[programCount++] = program;
-        for (GLuint t = 0; t < 4; t++) {
-            SpirvResourceList *list = &program->spirv_resources_list[stage][types[t]];
-            for (GLuint r = 0; list->list && r < list->count; r++) {
-                SpirvResource *res = &list->list[r];
-                /* Argument-buffer resources are bound by their own encoder
-                 * path, but still consume these GL client bindings. */
-                if (!res->uses_argument_buffer &&
-                    mglShouldSkipStageBufferResource(program, stage, types[t], res)) continue;
-                if (t == 1 && mglRendererResourceLooksSamplerLike(res, types[t])) continue;
-                if (t == 1 && res->ubo_members && res->ubo_member_count && res->required_size) {
-                    GLint base = res->uniform_location >= 0 ? res->uniform_location : (GLint)res->location;
-                    for (GLuint m = 0; m < res->ubo_member_count; m++) {
-                        SpirvUBOMember *member = &res->ubo_members[m];
-                        GLint count = member->size > 1 ? member->size : 1;
-                        for (GLint a = 0; a < count && a < MAX_BINDABLE_BUFFERS; a++) {
-                            GLint slot = base + member->location_offset + a;
-                            mglSelectBufferSlot(plainMasks[pidx], slot);
-                            if (mglPlainUniformAllowsGlobalFallback(res)) mglSelectBufferSlot(baseMasks[t], slot);
+        if (!program->draw_buffer_slot_masks_valid[stage]) {
+            memset(program->draw_buffer_slot_masks[stage], 0,
+                   sizeof(program->draw_buffer_slot_masks[stage]));
+            for (GLuint t = 0; t < 4; t++) {
+                SpirvResourceList *list = &program->spirv_resources_list[stage][types[t]];
+                uint64_t *stageMask = program->draw_buffer_slot_masks[stage][t];
+                for (GLuint r = 0; list->list && r < list->count; r++) {
+                    SpirvResource *res = &list->list[r];
+                    /* Argument-buffer resources are bound by their own encoder
+                     * path, but still consume these GL client bindings. */
+                    if (!res->uses_argument_buffer &&
+                        mglShouldSkipStageBufferResource(program, stage, types[t], res)) continue;
+                    if (t == 1 && mglRendererResourceLooksSamplerLike(res, types[t])) continue;
+                    if (t == 1 && res->ubo_members && res->ubo_member_count && res->required_size) {
+                        GLint base = res->uniform_location >= 0
+                            ? res->uniform_location : (GLint)res->location;
+                        for (GLuint m = 0; m < res->ubo_member_count; m++) {
+                            SpirvUBOMember *member = &res->ubo_members[m];
+                            GLint count = member->size > 1 ? member->size : 1;
+                            for (GLint a = 0; a < count && a < MAX_BINDABLE_BUFFERS; a++) {
+                                GLint slot = base + member->location_offset + a;
+                                mglSelectBufferSlot(stageMask, slot);
+                            }
                         }
-                    }
-                } else {
-                    GLuint count = mglStageBufferResourceElementCount(types[t], res);
-                    for (GLuint a = 0; a < count && a < MAX_BINDABLE_BUFFERS; a++) {
-                        GLuint slot = mglClientBufferBindingForResourceElement(types[t], res, a);
-                        if (t == 1) {
-                            mglSelectBufferSlot(plainMasks[pidx], (GLint)slot);
-                            if (mglPlainUniformAllowsGlobalFallback(res)) mglSelectBufferSlot(baseMasks[t], (GLint)slot);
-                        } else {
-                            mglSelectBufferSlot(baseMasks[t], (GLint)slot);
+                    } else {
+                        GLuint count = mglStageBufferResourceElementCount(types[t], res);
+                        for (GLuint a = 0; a < count && a < MAX_BINDABLE_BUFFERS; a++) {
+                            GLuint slot = mglClientBufferBindingForResourceElement(types[t], res, a);
+                            mglSelectBufferSlot(stageMask, (GLint)slot);
                         }
                     }
                 }
+            }
+            program->draw_buffer_slot_masks_valid[stage] = GL_TRUE;
+        }
+
+        /* These masks depend on a program's reflected stage resources, not on
+         * the currently bound Buffer objects. Union cached slot sets into the
+         * per-draw target masks and the program's plain-uniform mask. */
+        for (GLuint t = 0; t < 4; t++) {
+            uint64_t *drawMask = t == 1 ? plainMasks[pidx] : baseMasks[t];
+            const uint64_t *stageMask = program->draw_buffer_slot_masks[stage][t];
+            for (GLuint w = 0; w < MGL_BINDING_MASK_WORDS; w++) {
+                drawMask[w] |= stageMask[w];
             }
         }
     }
@@ -197,9 +209,19 @@ void mglVisitDrawBufferBindings(GLMContext ctx, MGLDrawBufferBindingVisitor visi
             while (bits) {
                 GLuint slot = w * 64u + (GLuint)__builtin_ctzll(bits);
                 bits &= bits - 1u;
-                if (slot < MAX_BINDABLE_BUFFERS) visit(ctx,
-                    &ctx->state.buffer_base[targets[t]].buffers[slot],
-                    ((uint64_t)(targets[t] + 1) * 131u) + slot, data);
+                if (slot < MAX_BINDABLE_BUFFERS) {
+                    const BufferBaseTarget *binding =
+                        &ctx->state.buffer_base[targets[t]].buffers[slot];
+                    /* Texture-buffer backing has no shader-block dependency
+                     * mask yet, so inspect all slots; empty slots cannot
+                     * contribute either a live GL buffer name or resolved
+                     * Buffer object and need no hash/hazard visitor work. */
+                    if (t == 4 && binding->buffer == 0 && binding->buf == NULL) {
+                        continue;
+                    }
+                    visit(ctx, binding,
+                          ((uint64_t)(targets[t] + 1) * 131u) + slot, data);
+                }
             }
         }
     }

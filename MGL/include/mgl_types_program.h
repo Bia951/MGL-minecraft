@@ -273,6 +273,10 @@ typedef struct Program_t {
     uint64_t msl_texture_cache_instance_id;
     uint64_t msl_texture_cache_generation;
     GLboolean program_separable;
+    /* Per-stage source slots for draw buffer dependency tracking. Resource
+     * classes are UBO, plain uniform, SSBO, and atomic counter. */
+    uint64_t draw_buffer_slot_masks[_MAX_SHADER_TYPES][4][(MAX_BINDABLE_BUFFERS + 63) / 64];
+    GLboolean draw_buffer_slot_masks_valid[_MAX_SHADER_TYPES];
     BufferBaseTarget plain_uniform_buffers[MAX_BINDABLE_BUFFERS];
     char *attrib_location_names[MAX_ATTRIBS];
     GLboolean attrib_location_name_owned[MAX_ATTRIBS];

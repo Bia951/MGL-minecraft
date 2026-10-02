@@ -5908,6 +5908,8 @@ void mglShaderStorageBlockBinding(GLMContext ctx, GLuint program, GLuint storage
 		}
 	}
 
+	memset(pptr->draw_buffer_slot_masks_valid, 0,
+	       sizeof(pptr->draw_buffer_slot_masks_valid));
 	ctx->state.dirty_bits |= DIRTY_BUFFER_BASE_STATE | DIRTY_PROGRAM;
 }
 

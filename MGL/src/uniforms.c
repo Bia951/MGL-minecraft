@@ -1955,6 +1955,8 @@ void mglUniformBlockBinding(GLMContext ctx, GLuint program, GLuint uniformBlockI
         }
     }
 
+    memset(ptr->draw_buffer_slot_masks_valid, 0,
+           sizeof(ptr->draw_buffer_slot_masks_valid));
     ctx->state.dirty_bits |= DIRTY_BUFFER_BASE_STATE | DIRTY_PROGRAM;
 }
 

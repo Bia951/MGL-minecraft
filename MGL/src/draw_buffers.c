@@ -1943,6 +1943,8 @@ void mglMultiDrawArrays(GLMContext ctx, GLenum mode, const GLint *first, const G
     ERROR_CHECK_RETURN(validate_program(ctx), GL_INVALID_OPERATION);
 
     if (ctx->draw_defer_enabled) {
+        MGLStateKey cachedKey;
+        bool keyValid = false;
         for (GLsizei i = 0; i < drawcount; i++) {
             if (count[i] == 0) {
                 continue;
@@ -1955,7 +1957,7 @@ void mglMultiDrawArrays(GLMContext ctx, GLenum mode, const GLint *first, const G
             cmd.first = first[i];
             cmd.count = count[i];
             cmd.instanceCount = 1;
-            mglRecordDrawCommand(ctx, &cmd);
+            mglRecordDrawCommandWithStateKey(ctx, &cmd, &cachedKey, &keyValid);
         }
         return;
     }
@@ -1991,6 +1993,8 @@ void mglMultiDrawElements(GLMContext ctx, GLenum mode, const GLsizei *count, GLe
 
     if (ctx->draw_defer_enabled) {
         Buffer *elementBuffer = mglCurrentElementBuffer(ctx, __func__);
+        MGLStateKey cachedKey;
+        bool keyValid = false;
         for (GLsizei i = 0; i < drawcount; i++) {
             if (count[i] == 0) {
                 continue;
@@ -2005,7 +2009,7 @@ void mglMultiDrawElements(GLMContext ctx, GLenum mode, const GLsizei *count, GLe
             cmd.indexBufferOffset = (GLuint)(uintptr_t)indices[i];
             cmd.elementBuffer = elementBuffer;
             cmd.instanceCount = 1;
-            mglRecordDrawCommand(ctx, &cmd);
+            mglRecordDrawCommandWithStateKey(ctx, &cmd, &cachedKey, &keyValid);
         }
         return;
     }
@@ -2041,6 +2045,8 @@ void mglMultiDrawElementsBaseVertex(GLMContext ctx, GLenum mode, const GLsizei *
 
     if (ctx->draw_defer_enabled) {
         Buffer *elementBuffer = mglCurrentElementBuffer(ctx, __func__);
+        MGLStateKey cachedKey;
+        bool keyValid = false;
         for (GLsizei i = 0; i < drawcount; i++) {
             if (count[i] == 0) {
                 continue;
@@ -2056,7 +2062,7 @@ void mglMultiDrawElementsBaseVertex(GLMContext ctx, GLenum mode, const GLsizei *
             cmd.elementBuffer = elementBuffer;
             cmd.baseVertex = basevertex[i];
             cmd.instanceCount = 1;
-            mglRecordDrawCommand(ctx, &cmd);
+            mglRecordDrawCommandWithStateKey(ctx, &cmd, &cachedKey, &keyValid);
         }
         return;
     }

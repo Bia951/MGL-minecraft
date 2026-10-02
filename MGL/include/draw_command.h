@@ -160,6 +160,10 @@ void mglResetCommandBufferForContext(GLMContext ctx, MGLCommandBuffer *cb);
 void mglComputeStateKey(GLMContext ctx, GLenum mode, bool uses_elements, MGLStateKey *out);
 bool mglStateKeysEqual(const MGLStateKey *a, const MGLStateKey *b);
 void mglRecordDrawCommand(GLMContext ctx, const MGLDrawCommand *cmd);
+/* Reuse only within one GL multi-draw call with fixed mode and indexedness.
+ * Initialize *keyValid=false; the first draw computes the key after hazards. */
+void mglRecordDrawCommandWithStateKey(GLMContext ctx, const MGLDrawCommand *cmd,
+                                      MGLStateKey *cachedKey, bool *keyValid);
 void mglAppendDrawCommand(GLMContext ctx, const MGLDrawCommand *cmd);
 void mglFlushCommandBuffer(GLMContext ctx);
 void mglFlushPendingDraws(GLMContext ctx);
