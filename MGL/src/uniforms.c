@@ -2117,18 +2117,11 @@ void mglUniform(GLMContext ctx, GLint location, void *ptr, GLsizeiptr size)
     }
 
     BufferBaseTarget *uniformSlot = &program->plain_uniform_buffers[location];
-    BufferBaseTarget *globalSlot =
-        &ctx->state.buffer_base[_UNIFORM_CONSTANT].buffers[location];
     Buffer *buf = uniformSlot->buf;
 
-    /* Minecraft frequently uploads unchanged projection/fog/color values.
-     * Avoid work only when both stores already contain the requested bytes. */
-    bool programDataChanged =
-        (buf == NULL) || mglUniformBufferDataWouldChange(buf, size, ptr);
-    bool globalDataChanged =
-        (globalSlot->buf == NULL) ||
-        mglUniformBufferDataWouldChange(globalSlot->buf, size, ptr);
-    if (!programDataChanged && !globalDataChanged) {
+    /* Uniform values belong to this linked Program. Uploading the same value
+     * remains a no-op even if another program uses the same numeric location. */
+    if (buf && !mglUniformBufferDataWouldChange(buf, size, ptr)) {
         return;
     }
 
@@ -2147,57 +2140,25 @@ void mglUniform(GLMContext ctx, GLint location, void *ptr, GLsizeiptr size)
      */
     mglFlushPendingDraws(ctx);
 
-    bool bindingLayoutChanged =
-        (buf == NULL || uniformSlot->size != size ||
-         globalSlot->buf == NULL || globalSlot->size != size);
+    bool bindingLayoutChanged = (buf == NULL || uniformSlot->size != size);
 
-    if (programDataChanged) {
-        if(buf == NULL)
-        {
-            GLuint internalName = MGL_INTERNAL_UNIFORM_BUFFER_NAME_BASE |
-                                  (((GLuint)program->name & 0x0fffu) << 12) |
-                                  (GLuint)location;
-            uniformSlot->buf = newBuffer(ctx, GL_UNIFORM_BUFFER, internalName);
-            buf = uniformSlot->buf;
-            if (buf) {
-                insertHashElement(&ctx->state.buffer_table, internalName, buf);
-            }
-        }
-
-        if (!buf) {
-            mglUniformSetError(ctx, GL_OUT_OF_MEMORY);
-            return;
-        }
-
-        initBufferData(ctx, buf, size, ptr, true);
-        uniformSlot->buffer = buf->name;
-        uniformSlot->offset = 0;
-        uniformSlot->size = size;
+    if (buf == NULL) {
+        GLuint internalName = MGL_INTERNAL_UNIFORM_BUFFER_NAME_BASE |
+                              (((GLuint)program->name & 0x0fffu) << 12) |
+                              (GLuint)location;
+        uniformSlot->buf = newBuffer(ctx, GL_UNIFORM_BUFFER, internalName);
+        buf = uniformSlot->buf;
+        if (buf) insertHashElement(&ctx->state.buffer_table, internalName, buf);
+    }
+    if (!buf) {
+        mglUniformSetError(ctx, GL_OUT_OF_MEMORY);
+        return;
     }
 
-    /*
-     * Minecraft's shader layer can reuse the same logical plain uniform values
-     * across generated program variants. Keep the legacy global slot as a
-     * fallback for programs that have not received an explicit upload yet, while
-     * still preferring the per-program storage above when it exists.
-     */
-    if (!globalSlot->buf) {
-        GLuint globalName = MGL_INTERNAL_UNIFORM_BUFFER_NAME_BASE |
-                            0x00fff000u |
-                            (GLuint)location;
-        globalSlot->buf = newBuffer(ctx, GL_UNIFORM_BUFFER, globalName);
-        if (globalSlot->buf) {
-            insertHashElement(&ctx->state.buffer_table, globalName, globalSlot->buf);
-        }
-    }
-    if (globalSlot->buf) {
-        if (globalDataChanged) {
-            initBufferData(ctx, globalSlot->buf, size, ptr, true);
-        }
-        globalSlot->buffer = globalSlot->buf->name;
-        globalSlot->offset = 0;
-        globalSlot->size = size;
-    }
+    initBufferData(ctx, buf, size, ptr, true);
+    uniformSlot->buffer = buf->name;
+    uniformSlot->offset = 0;
+    uniformSlot->size = size;
 
     ctx->state.dirty_bits |= bindingLayoutChanged
         ? DIRTY_BUFFER_BASE_STATE

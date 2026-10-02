@@ -4230,7 +4230,9 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
                batchIndex:(uint32_t)batchIndex
                     phase:(const char *)phase
 {
-    if (!batch || !glm_ctx) {
+    /* Replay diagnostics are opt-in through the trace log.  Keep capture-only
+     * runs (MGL_CAPTURE_SWAP_FRAMES) out of the program/VAO validation path. */
+    if (!mglTraceLogIsEnabled() || !batch || !glm_ctx) {
         return;
     }
 
@@ -4350,7 +4352,10 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
                      phase:(const char *)phase
                     reason:(const char *)reason
 {
-    if (!batch || !cmd || !glm_ctx) {
+    /* This method is called from per-command issue paths.  Gate before program
+     * resolution, VM pointer checks, texture metadata, or NSString/log setup;
+     * image capture alone must not enable replay tracing. */
+    if (!mglTraceLogIsEnabled() || !batch || !cmd || !glm_ctx) {
         return;
     }
 

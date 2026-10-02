@@ -3856,7 +3856,11 @@ create_new_command_buffer:
         // but still reports them in the reflection. Configuring a vertex descriptor
         // entry for an attribute the shader doesn't use can cause Metal to silently
         // produce no rasterization output.
-        if (vsMslStr) {
+        if (vsMslStr && _mslCacheEnabled && activeProgram && activeProgram->mslCacheValid) {
+            if ((activeProgram->vertexAttribUsageMask & (1u << i)) == 0u) {
+                continue;
+            }
+        } else if (vsMslStr) {
             char attrPattern[32];
             snprintf(attrPattern, sizeof(attrPattern), "[[attribute(%u)]]", i);
             if (!strstr(vsMslStr, attrPattern)) {

@@ -47,8 +47,13 @@
 #define MGL_HASH_MIN_CAPACITY 64u
 #define MGL_HASH_COOKIE_KEYS 0x4d474c5f48415348ULL
 #define MGL_HASH_COOKIE_STATES 0x53544154455f4d47ULL
+#define MGL_HASH_COOKIE_DATA_INDEX 0x444154415f494e44ULL
 
 static int mglRehash(HashTable *table, size_t new_capacity);
+static inline uintptr_t mglMakeCookie(const void *ptr, uintptr_t salt);
+static inline int mglCookieMatches(const void *ptr, uintptr_t cookie, uintptr_t salt);
+static inline int mglIsPow2Size(size_t value);
+static size_t mglNextPow2(size_t value);
 
 static void mglInvalidateContainsDataCache(HashTable *table)
 {
@@ -59,6 +64,271 @@ static void mglInvalidateContainsDataCache(HashTable *table)
     memset(table->cached_valid_ptrs, 0, sizeof(table->cached_valid_ptrs));
     memset(table->cached_valid_gens, 0, sizeof(table->cached_valid_gens));
     table->cached_valid_next = 0u;
+}
+
+static int mglDataIndexLooksSane(const HashTable *table)
+{
+    if (!table) return 0;
+    if (!table->data_index) {
+        return table->data_index_size == 0u &&
+               table->data_index_count == 0u &&
+               table->data_index_deleted_count == 0u &&
+               table->data_index_cookie == 0u;
+    }
+    return table->data_index_size >= MGL_HASH_MIN_CAPACITY &&
+           mglIsPow2Size(table->data_index_size) &&
+           table->data_index_size <= MGL_HASH_TABLE_MAX_CAPACITY &&
+           table->data_index_count <= table->data_index_size &&
+           table->data_index_deleted_count <=
+               table->data_index_size - table->data_index_count &&
+           mglCookieMatches(table->data_index,
+                            table->data_index_cookie,
+                            MGL_HASH_COOKIE_DATA_INDEX);
+}
+
+static void mglDropDataIndex(HashTable *table)
+{
+    if (!table) return;
+    if (table->data_index &&
+        mglCookieMatches(table->data_index,
+                         table->data_index_cookie,
+                         MGL_HASH_COOKIE_DATA_INDEX)) {
+        free(table->data_index);
+    }
+    table->data_index = NULL;
+    table->data_index_size = 0u;
+    table->data_index_count = 0u;
+    table->data_index_deleted_count = 0u;
+    table->data_index_cookie = 0u;
+}
+
+static inline size_t mglHashDataPointer(const void *data)
+{
+    uintptr_t value = (uintptr_t)data;
+#if UINTPTR_MAX > UINT32_MAX
+    value ^= value >> 33;
+    value *= (uintptr_t)0xff51afd7ed558ccdULL;
+    value ^= value >> 33;
+    value *= (uintptr_t)0xc4ceb9fe1a85ec53ULL;
+    value ^= value >> 33;
+#else
+    value ^= value >> 16;
+    value *= (uintptr_t)0x7feb352dU;
+    value ^= value >> 15;
+    value *= (uintptr_t)0x846ca68bU;
+    value ^= value >> 16;
+#endif
+    return (size_t)value;
+}
+
+static size_t mglFindDataIndexSlot(const MGLHashDataIndexEntry *index,
+                                   size_t capacity,
+                                   const void *data,
+                                   int for_insert,
+                                   int *found)
+{
+    size_t first_deleted = SIZE_MAX;
+    if (found) *found = 0;
+    if (!index || capacity == 0u || !data) return SIZE_MAX;
+
+    size_t mask = capacity - 1u;
+    size_t slot = mglHashDataPointer(data) & mask;
+    for (size_t probe = 0; probe < capacity; probe++) {
+        unsigned char state = index[slot].state;
+        if (state == MGL_HASH_STATE_EMPTY) {
+            return for_insert && first_deleted != SIZE_MAX ? first_deleted : slot;
+        }
+        if (state == MGL_HASH_STATE_OCCUPIED && index[slot].data == data) {
+            if (found) *found = 1;
+            return slot;
+        }
+        if (for_insert && state == MGL_HASH_STATE_DELETED && first_deleted == SIZE_MAX) {
+            first_deleted = slot;
+        }
+        slot = (slot + 1u) & mask;
+    }
+    return for_insert ? first_deleted : SIZE_MAX;
+}
+
+static int mglInsertDataIndexReference(MGLHashDataIndexEntry *index,
+                                       size_t capacity,
+                                       const void *data,
+                                       size_t references)
+{
+    if (!data || references == 0u) return 1;
+    int found = 0;
+    size_t slot = mglFindDataIndexSlot(index, capacity, data, 1, &found);
+    if (slot == SIZE_MAX) return 0;
+    if (found) {
+        index[slot].references += references;
+    } else {
+        index[slot].data = data;
+        index[slot].references = references;
+        index[slot].state = MGL_HASH_STATE_OCCUPIED;
+    }
+    return 1;
+}
+
+static int mglRebuildDataIndex(HashTable *table)
+{
+    if (!table) return 0;
+    if (mglDataIndexLooksSane(table) && table->data_index) return 1;
+    if (table->data_index) mglDropDataIndex(table);
+
+    size_t desired = table->count > SIZE_MAX / 2u
+        ? MGL_HASH_TABLE_MAX_CAPACITY
+        : (size_t)table->count * 2u;
+    if (desired < MGL_HASH_MIN_CAPACITY) desired = MGL_HASH_MIN_CAPACITY;
+    size_t capacity = mglNextPow2(desired);
+    if (capacity > MGL_HASH_TABLE_MAX_CAPACITY) capacity = MGL_HASH_TABLE_MAX_CAPACITY;
+    if (capacity > MGL_HASH_TABLE_MAX_CAPACITY ||
+        capacity > SIZE_MAX / sizeof(MGLHashDataIndexEntry)) {
+        return 0;
+    }
+    MGLHashDataIndexEntry *index = (MGLHashDataIndexEntry *)calloc(capacity, sizeof(*index));
+    if (!index) return 0;
+
+    if (table->keys && table->states && table->size > 0u) {
+        for (size_t i = 0; i < table->size; i++) {
+            if (table->states[i] != MGL_HASH_STATE_OCCUPIED || !table->keys[i].data) continue;
+            if (!mglInsertDataIndexReference(index, capacity, table->keys[i].data, 1u)) {
+                free(index);
+                return 0;
+            }
+        }
+    }
+
+    table->data_index = index;
+    table->data_index_size = capacity;
+    table->data_index_count = 0u;
+    table->data_index_deleted_count = 0u;
+    for (size_t i = 0; i < capacity; i++) {
+        if (index[i].state == MGL_HASH_STATE_OCCUPIED) table->data_index_count++;
+    }
+    table->data_index_cookie = mglMakeCookie(index, MGL_HASH_COOKIE_DATA_INDEX);
+    return 1;
+}
+
+static int mglRehashDataIndex(HashTable *table, size_t capacity)
+{
+    if (!mglDataIndexLooksSane(table) || !table->data_index) return 0;
+    size_t old_capacity = table->data_index_size;
+    if (capacity < MGL_HASH_MIN_CAPACITY ||
+        !mglIsPow2Size(capacity) ||
+        capacity > MGL_HASH_TABLE_MAX_CAPACITY ||
+        capacity > SIZE_MAX / sizeof(MGLHashDataIndexEntry)) {
+        return 0;
+    }
+    MGLHashDataIndexEntry *index = (MGLHashDataIndexEntry *)calloc(capacity, sizeof(*index));
+    if (!index) return 0;
+    for (size_t i = 0; i < old_capacity; i++) {
+        MGLHashDataIndexEntry *entry = &table->data_index[i];
+        if (entry->state == MGL_HASH_STATE_OCCUPIED &&
+            !mglInsertDataIndexReference(index, capacity, entry->data, entry->references)) {
+            free(index);
+            return 0;
+        }
+    }
+    MGLHashDataIndexEntry *old_index = table->data_index;
+    uintptr_t old_cookie = table->data_index_cookie;
+    table->data_index = index;
+    table->data_index_size = capacity;
+    table->data_index_count = 0u;
+    table->data_index_deleted_count = 0u;
+    for (size_t i = 0; i < capacity; i++) {
+        if (index[i].state == MGL_HASH_STATE_OCCUPIED) table->data_index_count++;
+    }
+    table->data_index_cookie = mglMakeCookie(index, MGL_HASH_COOKIE_DATA_INDEX);
+    if (mglCookieMatches(old_index, old_cookie, MGL_HASH_COOKIE_DATA_INDEX)) free(old_index);
+    return 1;
+}
+
+static int mglGrowDataIndex(HashTable *table)
+{
+    if (!mglDataIndexLooksSane(table) || !table->data_index) return 0;
+    size_t old_capacity = table->data_index_size;
+    if (old_capacity >= MGL_HASH_TABLE_MAX_CAPACITY ||
+        old_capacity > SIZE_MAX / 2u) {
+        return 0;
+    }
+    return mglRehashDataIndex(table, old_capacity * 2u);
+}
+
+static int mglCompactDataIndex(HashTable *table)
+{
+    return table && table->data_index
+        ? mglRehashDataIndex(table, table->data_index_size)
+        : 0;
+}
+
+static void mglAddDataIndexReference(HashTable *table, const void *data)
+{
+    if (!table || !data || !mglDataIndexLooksSane(table) || !table->data_index) return;
+    int found = 0;
+    size_t slot = mglFindDataIndexSlot(table->data_index, table->data_index_size,
+                                       data, 1, &found);
+    if (found) {
+        table->data_index[slot].references++;
+        return;
+    }
+    size_t usedCount = table->data_index_count + table->data_index_deleted_count;
+    bool consumesEmptySlot = slot == SIZE_MAX ||
+        table->data_index[slot].state == MGL_HASH_STATE_EMPTY;
+    if (slot == SIZE_MAX ||
+        (consumesEmptySlot &&
+         (usedCount + 1u) * MGL_HASH_LOAD_FACTOR_DEN >=
+             table->data_index_size * MGL_HASH_LOAD_FACTOR_NUM)) {
+        bool grow = (table->data_index_count + 1u) * MGL_HASH_LOAD_FACTOR_DEN >=
+                    table->data_index_size * MGL_HASH_LOAD_FACTOR_NUM;
+        int rehashed = grow
+            ? mglGrowDataIndex(table)
+            : mglCompactDataIndex(table);
+        if (!rehashed) {
+            mglDropDataIndex(table);
+            return;
+        }
+        slot = mglFindDataIndexSlot(table->data_index, table->data_index_size,
+                                    data, 1, &found);
+    }
+    if (slot == SIZE_MAX || found) {
+        mglDropDataIndex(table);
+        return;
+    }
+    if (table->data_index[slot].state == MGL_HASH_STATE_DELETED &&
+        table->data_index_deleted_count > 0u) {
+        table->data_index_deleted_count--;
+    }
+    table->data_index[slot].data = data;
+    table->data_index[slot].references = 1u;
+    table->data_index[slot].state = MGL_HASH_STATE_OCCUPIED;
+    table->data_index_count++;
+}
+
+static void mglRemoveDataIndexReference(HashTable *table, const void *data)
+{
+    if (!table || !data || !mglDataIndexLooksSane(table) || !table->data_index) return;
+    int found = 0;
+    size_t slot = mglFindDataIndexSlot(table->data_index, table->data_index_size,
+                                       data, 0, &found);
+    if (!found || slot == SIZE_MAX) {
+        mglDropDataIndex(table);
+        return;
+    }
+    MGLHashDataIndexEntry *entry = &table->data_index[slot];
+    if (entry->references > 1u) {
+        entry->references--;
+    } else {
+        entry->data = NULL;
+        entry->references = 0u;
+        entry->state = MGL_HASH_STATE_DELETED;
+        table->data_index_count--;
+        table->data_index_deleted_count++;
+        if (table->data_index_count == 0u) {
+            memset(table->data_index, 0,
+                   table->data_index_size * sizeof(*table->data_index));
+            table->data_index_deleted_count = 0u;
+        }
+    }
 }
 
 static inline uintptr_t mglMakeCookie(const void *ptr, uintptr_t salt)
@@ -138,6 +408,7 @@ static int mglRepairHashTableIfNeeded(HashTable *table, const char *where)
     table->current_name = saved_name;
     table->deletion_generation = 0u;
     mglInvalidateContainsDataCache(table);
+    mglDropDataIndex(table);
 
     return mglRehash(table, MGL_HASH_MIN_CAPACITY);
 }
@@ -157,10 +428,18 @@ int mglHashTableContainsData(HashTable *table, const void *data)
         return 0;
     }
 
-    /* O(1) fast path: if the same pointer was validated before and no
-     * deletion has occurred since, the pointer is still in the table.
-     * This eliminates the O(N) scan for the common hot-path case where
-     * the same bound VAO/program/FBO is validated repeatedly per-draw. */
+    if (mglRebuildDataIndex(table)) {
+        int found = 0;
+        size_t slot = mglFindDataIndexSlot(table->data_index,
+                                           table->data_index_size,
+                                           data,
+                                           0,
+                                           &found);
+        return found && slot != SIZE_MAX;
+    }
+
+    /* OOM fallback: preserve the previous bounded working-set cache before
+     * scanning the name table. The reverse index is optional. */
     for (size_t index = 0u; index < MGL_HASH_VALID_CACHE_CAPACITY; index++) {
         if (data == table->cached_valid_ptrs[index] &&
             table->deletion_generation == table->cached_valid_gens[index]) {
@@ -467,6 +746,11 @@ void initHashTable(HashTable *ptr, GLuint size)
     ptr->count = 0;
     ptr->deletion_generation = 0u;
     mglInvalidateContainsDataCache(ptr);
+    ptr->data_index = NULL;
+    ptr->data_index_size = 0u;
+    ptr->data_index_count = 0u;
+    ptr->data_index_deleted_count = 0u;
+    ptr->data_index_cookie = 0u;
 
     if (size > 0) {
         size_t desired = (size_t)size * 2u;
@@ -506,6 +790,7 @@ void destroyHashTable(HashTable *ptr)
     states_cookie = ptr->states_cookie;
 
     mglFreeStorageIfOwned(ptr, keys, states, keys_cookie, states_cookie, "destroy");
+    mglDropDataIndex(ptr);
 
     ptr->keys = NULL;
     ptr->states = NULL;
@@ -581,6 +866,8 @@ void insertHashElement(HashTable *table, GLuint name, void *data)
         return;
     }
 
+    int dataIndexReady = mglRebuildDataIndex(table);
+
     int found = 0;
     size_t slot = mglFindSlot(table, name, 1, &found);
     if (slot == SIZE_MAX) {
@@ -592,6 +879,7 @@ void insertHashElement(HashTable *table, GLuint name, void *data)
     if (!found) {
         table->count++;
     } else {
+        if (dataIndexReady) mglRemoveDataIndexReference(table, table->keys[slot].data);
         /* Replacing an existing name removes its old data pointer from the
          * table, so cached membership for that pointer is no longer valid. */
         table->deletion_generation++;
@@ -601,6 +889,7 @@ void insertHashElement(HashTable *table, GLuint name, void *data)
     table->keys[slot].name = name;
     table->keys[slot].data = data;
     table->states[slot] = MGL_HASH_STATE_OCCUPIED;
+    if (dataIndexReady) mglAddDataIndexReference(table, data);
 
     if (MGL_VERBOSE_HASH_LOGS) {
         fprintf(stderr,
@@ -628,10 +917,14 @@ void deleteHashElement(HashTable *table, GLuint name)
         return;
     }
 
+    int dataIndexReady = mglRebuildDataIndex(table);
+
     slot = mglFindSlot(table, name, 0, &found);
     if (!found || slot == SIZE_MAX) {
         return;
     }
+
+    if (dataIndexReady) mglRemoveDataIndexReference(table, table->keys[slot].data);
 
     /* Metal object lifecycle is owned by the caller.  Previous code here
      * nullified shader/program/texture/buffer mtl_data fields WITHOUT
@@ -698,6 +991,13 @@ void mglHashTableClearEntries(HashTable *table)
         table->keys[i].name = 0u;
         table->keys[i].data = NULL;
         table->states[i] = MGL_HASH_STATE_EMPTY;
+    }
+    if (mglDataIndexLooksSane(table) && table->data_index) {
+        memset(table->data_index, 0, table->data_index_size * sizeof(*table->data_index));
+        table->data_index_count = 0u;
+        table->data_index_deleted_count = 0u;
+    } else {
+        mglDropDataIndex(table);
     }
     table->count = 0u;
     /* Bump generation and invalidate cache on bulk clear. */

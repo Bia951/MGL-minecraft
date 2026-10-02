@@ -29,6 +29,12 @@ typedef struct {
     void *data;
 } HashObj;
 
+typedef struct {
+    const void *data;
+    size_t references;
+    unsigned char state;
+} MGLHashDataIndexEntry;
+
 #define MGL_HASH_VALID_CACHE_CAPACITY 8u
 
 typedef struct {
@@ -47,6 +53,12 @@ typedef struct {
     const void *cached_valid_ptrs[MGL_HASH_VALID_CACHE_CAPACITY];
     uint64_t cached_valid_gens[MGL_HASH_VALID_CACHE_CAPACITY];
     uint8_t cached_valid_next;
+    /* Optional O(1) membership index keyed by raw data pointer value. */
+    MGLHashDataIndexEntry *data_index;
+    size_t data_index_size;
+    size_t data_index_count;
+    size_t data_index_deleted_count;
+    uintptr_t data_index_cookie;
 } HashTable;
 
 HashTable *createHashTable(GLuint size);
