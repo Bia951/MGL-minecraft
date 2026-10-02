@@ -4112,10 +4112,10 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
     }
 }
 
-/* Prepare depth conversions as one phase before sampled bindings are replayed.
+/* Prepare sampled color/depth copies as one phase before bindings are replayed.
  * Closing the encoder here is deliberate: no texture bindings have been set
  * yet, and the caller restores buffers, pipeline and argument buffers once. */
-- (bool)prepareDepthReadCopiesForDraw
+- (bool)prepareSampledCopiesForDraw
 {
     BOOL endedEncoder = NO;
     const int stages[] = {_VERTEX_SHADER, _FRAGMENT_SHADER};
@@ -4137,6 +4137,17 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
                 expectedType:declared ? declared : expected];
             if (!object || !object->mtl_data) continue;
             id<MTLTexture> source = (__bridge id<MTLTexture>)object->mtl_data;
+            if (kind == MGLTextureDataKindFloat &&
+                [self textureCanUseGLSampledRenderTargetCopy:object source:source] &&
+                object->mtl_render_target_write_version != 0u &&
+                mglDecideYFlipForSampledRT(object, program) == MGL_YFLIP_USE_SAMPLED_COPY) {
+                if (!mglGLSampledCopyIsFresh(object, source)) {
+                    if (!endedEncoder) { [self endRenderEncoding]; endedEncoder = YES; }
+                    RETURN_FALSE_ON_FAILURE([self updateGLSampledRenderTargetCopyForTexture:object
+                        source:source reason:"draw_sample_preflight"]);
+                }
+                continue;
+            }
             if ((source.textureType != MTLTextureType2D && source.textureType != MTLTextureType2DArray) ||
                 source.sampleCount != 1 ||
                 !mglMetalPixelFormatHasDepth(source.pixelFormat)) continue;
@@ -4152,7 +4163,7 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
             if (kind == MGLTextureDataKindDepth) {
                 RETURN_FALSE_ON_FAILURE([self updateDepthCompareCopyForTexture:object]);
             } else {
-                RETURN_FALSE_ON_FAILURE([self updateDepthReadCopiesForTexture:object]);
+                RETURN_FALSE_ON_FAILURE([self updateDepthReadCopiesForTexture:object orientationMask:1u << orientation]);
             }
         }
     }
@@ -4186,7 +4197,7 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
                                                  computeEncoder:nil]);
     RETURN_FALSE_ON_FAILURE([self bindBufferSizeConstantsForRenderEncoder]);
     RETURN_FALSE_ON_FAILURE([self bindActiveTexturesToMTL]);
-    RETURN_FALSE_ON_FAILURE([self prepareDepthReadCopiesForDraw]);
+    RETURN_FALSE_ON_FAILURE([self prepareSampledCopiesForDraw]);
     RETURN_FALSE_ON_FAILURE([self restoreRenderEncoderAfterTextureUploadForDraw:"final-active-texture-bind"]);
     if (![self bindTexturesToCurrentRenderEncoder]) {
         RETURN_FALSE_ON_FAILURE([self restoreRenderEncoderAfterTextureUploadForDraw:"final-sampled-texture-bind"]);

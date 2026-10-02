@@ -4229,27 +4229,10 @@ create_new_command_buffer:
     static dispatch_once_t captureDirectoryOnce;
     dispatch_once(&captureDirectoryOnce, ^{ captureDirectory = getenv("MGL_CAPTURE_ATTACHMENTS_DIR"); });
 
-    /* Early-out: skip the per-attachment copy loop entirely when no texture
-     * in this FBO is a sampled render target.  The old code unconditionally
-     * iterated all color attachments on every endRenderPass and created a
-     * Y-flipped copy for each (~313 copies/frame, most never sampled).  The
-     * copy is only needed when the texture will be sampled by a non-yflip
-     * shader in a subsequent draw, which we can't know here — but we CAN skip
-     * textures that were never written (rtVer==0) or never flagged as RT.
-     *
-     * Iterate the actual FBO color attachments rather than the draw-buffer
-     * snapshot.  MC 1.21.11's render abstraction creates transient FBOs such
-     * as the GUI item atlas where the GL draw-buffer state can be incomplete
-     * by the time the Metal encoder ends, but the attachment itself is still
-     * the texture that was rendered and will be sampled immediately.
-     *
-     * NOTE: do NOT skip non-zero attachment levels here.  MC 1.21.11's
-     * terrain atlas is a mipmapped RT whose mip 1-4 are written by separate
-     * FBOs (one per mip level).  Skipping them left the Y-flip copy stale
-     * after those passes ended, so terrain sampling mip>0 fell back to the
-     * un-flipped Metal RT and rendered stripes.  The per-level blit inside
-     * updateGLSampledRenderTargetCopyForTexture handles non-zero levels
-     * correctly. */
+    /* Color copies are prepared from actual sampler bindings before draw
+     * replay. Ending a pass only preserves the write version and dirty mip
+     * mask, so an attachment overwritten again before sampling needs no copy.
+     * Keep this traversal for attachment captures and stale-cache release. */
     bool anySampledRT = false;
     for (GLuint attachmentIndex = 0u; attachmentIndex < MAX_COLOR_ATTACHMENTS; attachmentIndex++) {
         if (((fbo->color_attachment_bitfield >> attachmentIndex) & 1u) == 0u) {
@@ -4263,20 +4246,7 @@ create_new_command_buffer:
             break;
         }
     }
-    Texture *depthReadTexture = fbo->depth.textarget ? [self framebufferAttachmentTexture:&fbo->depth] : NULL;
-    id<MTLTexture> depthReadMTL = (depthReadTexture && depthReadTexture->mtl_data)
-        ? (__bridge id<MTLTexture>)(depthReadTexture->mtl_data)
-        : nil;
-    BOOL hasDepthReadCandidate =
-        depthReadTexture &&
-        depthReadMTL &&
-        depthReadTexture->is_render_target &&
-        depthReadTexture->mtl_render_target_write_version != 0u &&
-        mglMetalPixelFormatHasDepth(depthReadMTL.pixelFormat);
-
-    if (!anySampledRT && !hasDepthReadCandidate) {
-        return;
-    }
+    if (!anySampledRT) return;
 
     for (GLuint attachmentIndex = 0u; attachmentIndex < MAX_COLOR_ATTACHMENTS; attachmentIndex++) {
         if (((fbo->color_attachment_bitfield >> attachmentIndex) & 1u) == 0u) {
@@ -4353,14 +4323,12 @@ create_new_command_buffer:
             continue;
         }
 
-        [self updateGLSampledRenderTargetCopyForTexture:tex
-                                                 source:source
-                                                 reason:reason ? reason : "end_render_pass"];
+        /* Defer conversion until this version is actually sampled. The draw
+         * preflight handles all required copies before any texture binds. */
     }
 
-    if (hasDepthReadCandidate) {
-        [self updateDepthReadCopiesForTexture:depthReadTexture];
-    }
+    /* Depth read copies are also versioned and prepared by the sampling
+     * preflight, for the orientation the consuming draw actually requires. */
 }
 
 - (void) endRenderEncoding

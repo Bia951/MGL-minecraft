@@ -268,8 +268,15 @@ $(mgl_toolchain_lib): $(mgl_toolchain_obj)
 	@mkdir -p $(dir $@)
 	ar rcs $@ $^
 
-# Build GLFW shared library from pre-built static library
-$(build_dir)/libglfw.dylib: external/glfw/build/src/libglfw3.a $(mgl_lib)
+# Build GLFW from this checkout; cached archives can point at a different worktree.
+glfw_build_dir := $(build_dir)/glfw
+glfw_static_lib := $(glfw_build_dir)/src/libglfw3.a
+$(glfw_static_lib): $(wildcard external/glfw/src/*.[chm]) external/glfw/CMakeLists.txt external/glfw/src/CMakeLists.txt $(wildcard MGL/include/*.h)
+	cmake -S external/glfw -B $(glfw_build_dir) -DGLFW_BUILD_EXAMPLES=OFF -DGLFW_BUILD_TESTS=OFF -DGLFW_BUILD_DOCS=OFF -DBUILD_SHARED_LIBS=OFF -DCMAKE_OSX_ARCHITECTURES=$(shell uname -m)
+	cmake --build $(glfw_build_dir) --parallel 8
+
+# Build GLFW shared library from this checkout's static archive
+$(build_dir)/libglfw.dylib: $(glfw_static_lib) $(mgl_lib)
 	@echo "Creating GLFW shared library from static library..."
 	@mkdir -p $(dir $@)
 	$(CC) -shared -fPIC -dynamiclib \

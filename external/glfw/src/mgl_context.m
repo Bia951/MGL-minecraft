@@ -61,7 +61,14 @@ static void swapBuffersMGL(_GLFWwindow* window)
 
 static void swapIntervalMGL(int interval)
 {
-
+    _GLFWwindow* window = _glfwPlatformGetTls(&_glfw.contextSlot);
+    if (interval < 0) {
+        _glfwInputError(GLFW_INVALID_VALUE, "MGL: Adaptive swap intervals are not supported");
+        return;
+    }
+    @autoreleasepool {
+        [window->context.mgl.renderer setSwapInterval:interval];
+    }
 }
 
 static int extensionSupportedMGL(const char* extension)

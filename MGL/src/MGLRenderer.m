@@ -2223,9 +2223,9 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
     return cached;
 }
 
-- (BOOL)updateDepthReadCopiesForTexture:(Texture *)object
+- (BOOL)updateDepthReadCopiesForTexture:(Texture *)object orientationMask:(unsigned)requestedMask
 {
-    if (!object || !object->mtl_data || !object->mtl_depth_read_requested_mask) {
+    if (!object || !object->mtl_data || !requestedMask) {
         return NO;
     }
 
@@ -2246,7 +2246,7 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
 
     BOOL allFresh = YES;
     for (unsigned orientation = 0; orientation < 2; orientation++) {
-        if (!(object->mtl_depth_read_requested_mask & (1u << orientation))) continue;
+        if (!(requestedMask & (1u << orientation))) continue;
         id<MTLTexture> cached = (__bridge id<MTLTexture>)object->mtl_depth_read_data[orientation];
         BOOL shapeMatches = cached &&
             cached.width == source.width &&
@@ -2301,7 +2301,7 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
     }
 
     for (unsigned orientation = 0; orientation < 2; orientation++) {
-        if (!(object->mtl_depth_read_requested_mask & (1u << orientation))) continue;
+        if (!(requestedMask & (1u << orientation))) continue;
         if (object->mtl_depth_read_data[orientation]) {
             continue;
         }
@@ -2321,7 +2321,7 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
         object->mtl_depth_read_data[orientation] = (void *)CFBridgingRetain(destination);
     }
 
-    if (![self ensureWritableCommandBuffer:"depth_read_copy_end_pass"]) {
+    if (![self ensureWritableCommandBuffer:"depth_read_sample_preflight"]) {
         return NO;
     }
     id<MTLComputeCommandEncoder> encoder = mglProfileCompute(_currentCommandBuffer, __func__, __LINE__);
@@ -2332,7 +2332,7 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
     [encoder setComputePipelineState:isArray ? _depthReadArrayCopyPipeline : _depthReadCopyPipeline];
 
     for (unsigned orientation = 0; orientation < 2; orientation++) {
-        if (!(object->mtl_depth_read_requested_mask & (1u << orientation))) continue;
+        if (!(requestedMask & (1u << orientation))) continue;
         if (object->mtl_depth_read_version[orientation] == object->mtl_render_target_write_version &&
             object->mtl_render_target_write_version != 0u) continue;
         id<MTLTexture> destination = (__bridge id<MTLTexture>)object->mtl_depth_read_data[orientation];
@@ -2370,7 +2370,7 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
         }
     }
     [encoder endEncoding];
-    unsigned captureOrientation = (object->mtl_depth_read_requested_mask & 1u) ? 0u : 1u;
+    unsigned captureOrientation = (requestedMask & 1u) ? 0u : 1u;
     id<MTLTexture> sampled = (__bridge id<MTLTexture>)object->mtl_depth_read_data[captureOrientation];
     const char *captureDirectory = getenv("MGL_CAPTURE_ATTACHMENTS_DIR");
     BOOL captureFrame = captureDirectory && _dontCareFrameGeneration >= 180u && _dontCareFrameGeneration <= 181u;
@@ -8608,6 +8608,16 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
     METAL_UNLOCK();
 }
 
+// GLFW swap interval controls Metal presentation for this window/context.
+- (void)setSwapInterval:(int)interval
+{
+    METAL_LOCK();
+    _swapInterval = interval;
+    _layer.displaySyncEnabled = interval != 0;
+    NSLog(@"MGL PRESENT swapInterval=%d displaySyncEnabled=%d", interval, (int)_layer.displaySyncEnabled);
+    METAL_UNLOCK();
+}
+
 #pragma mark C interface to mtlSwapBuffers
 -(void) mtlSwapBuffers:(GLMContext) glm_ctx
 {
@@ -8922,7 +8932,14 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
                       (unsigned long)_drawable.texture.pixelFormat);
             }
 
-            [_currentCommandBuffer presentDrawable: _drawable];
+            if (_swapInterval > 1) {
+                NSInteger refreshRate = _view.window.screen.maximumFramesPerSecond;
+                if (refreshRate <= 0) refreshRate = 60;
+                [_currentCommandBuffer presentDrawable:_drawable
+                    afterMinimumDuration:(double)_swapInterval / (double)refreshRate];
+            } else {
+                [_currentCommandBuffer presentDrawable:_drawable];
+            }
             if (traceSwap) {
                 MGLTraceNSLog(@"MGL TRACE swap.present call=%llu cb=%p drawable=%p",
                       (unsigned long long)swapCall, _currentCommandBuffer, _drawable);
@@ -11549,6 +11566,8 @@ void* CppCreateMGLRendererAndBindToContext (void *glm_ctx)
     NSLog(@"MGL INFO: PROPER FIX - Creating Metal layer with AGX-safe settings");
 
     _layer = [[CAMetalLayer alloc] init];
+    _swapInterval = 1;
+    _layer.displaySyncEnabled = YES;
     if (!_layer) {
         NSLog(@"MGL ERROR: Failed to create Metal layer");
         return;

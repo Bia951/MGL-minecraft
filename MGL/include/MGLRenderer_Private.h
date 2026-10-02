@@ -173,6 +173,7 @@ static inline void mglMetalUnlock(os_unfair_lock *lock) {
 @interface MGLRenderer () {
     NSView *_view;
     CAMetalLayer *_layer;
+    int _swapInterval;
     id<CAMetalDrawable> _drawable;
     GLMContext  ctx;    // context macros need this exact name
     GLMState *_activeState;  // NULL = use live ctx->state (normal path)

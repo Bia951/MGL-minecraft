@@ -195,7 +195,7 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
 
 @interface MGLRenderer ()
 - (id<MTLTexture>)depthReadTextureForObject:(Texture *)object program:(Program *)program;
-- (BOOL)updateDepthReadCopiesForTexture:(Texture *)object;
+- (BOOL)updateDepthReadCopiesForTexture:(Texture *)object orientationMask:(unsigned)requestedMask;
 
 
 // === Draw batch scheduling and execution ===

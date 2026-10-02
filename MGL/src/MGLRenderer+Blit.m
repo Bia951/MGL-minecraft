@@ -757,39 +757,8 @@ typedef struct MGLBlitColorState {
         return NO;
     }
 
-    NSUInteger copyLevelCount = 1u;
-    if (source.mipmapLevelCount > 1u) {
-        GLuint highestGLLevel = tex->num_levels > 0u ? tex->num_levels - 1u : 0u;
-        if (tex->mipmap_levels > 0u && highestGLLevel >= tex->mipmap_levels) {
-            highestGLLevel = tex->mipmap_levels - 1u;
-        }
-
-        GLuint maxParamLevel = tex->params.max_level;
-        if (maxParamLevel != 1000u && maxParamLevel < highestGLLevel) {
-            highestGLLevel = maxParamLevel;
-        }
-
-        NSUInteger highestSourceLevel = source.mipmapLevelCount - 1u;
-        if (tex->params.base_level > highestGLLevel &&
-            (NSUInteger)tex->params.base_level <= highestSourceLevel) {
-            highestGLLevel = tex->params.base_level;
-        }
-        if ((NSUInteger)highestGLLevel > highestSourceLevel) {
-            highestGLLevel = (GLuint)highestSourceLevel;
-        }
-
-        copyLevelCount = (NSUInteger)highestGLLevel + 1u;
-    }
-
-    if (tex->mtl_gl_sampled_data &&
-        tex->mtl_gl_sampled_width == (GLuint)source.width &&
-        tex->mtl_gl_sampled_height == (GLuint)source.height &&
-        tex->mtl_gl_sampled_format == (GLuint)source.pixelFormat &&
-        tex->mtl_gl_sampled_levels == (GLuint)copyLevelCount &&
-        tex->mtl_gl_sampled_write_version == tex->mtl_render_target_write_version &&
-        tex->mtl_gl_sampled_dirty_mip_mask == 0u) {
-        return YES;
-    }
+    NSUInteger copyLevelCount = mglGLSampledCopyLevelCount(tex, source);
+    if (mglGLSampledCopyIsFresh(tex, source)) return YES;
 
     BOOL needsNewCopy =
         tex->mtl_gl_sampled_data == NULL ||
@@ -1382,7 +1351,6 @@ typedef struct MGLBlitColorState {
                         if (resolveEncoder) {
                             [resolveEncoder endEncoding];
                             mglMarkTextureLevelRenderTargetWritten(depthDrawObject, depthDrawAttachment->level);
-                            [self updateDepthReadCopiesForTexture:depthDrawObject];
                             if (depthStencilMask & GL_DEPTH_BUFFER_BIT) {
                                 mask &= ~GL_DEPTH_BUFFER_BIT;
                             }
@@ -1464,7 +1432,6 @@ typedef struct MGLBlitColorState {
                                                                        depthDrawSubresource.depthPlane)];
                                 [depthBlit endEncoding];
                                 mglMarkTextureLevelRenderTargetWritten(depthDrawObject, depthDrawAttachment->level);
-                            [self updateDepthReadCopiesForTexture:depthDrawObject];
                             }
                         }
                     }
@@ -1617,7 +1584,6 @@ typedef struct MGLBlitColorState {
                                     }
                                     [depthEncoder endEncoding];
                                     mglMarkTextureLevelRenderTargetWritten(depthDrawObject, depthDrawAttachment->level);
-                            [self updateDepthReadCopiesForTexture:depthDrawObject];
                                 }
                             }
                         } else {
@@ -1938,9 +1904,6 @@ typedef struct MGLBlitColorState {
         }
         if (drawTextureObject && drawFBOAttachment) {
             mglMarkTextureLevelRenderTargetWritten(drawTextureObject, drawFBOAttachment->level);
-            [self updateGLSampledRenderTargetCopyForTexture:drawTextureObject
-                                                     source:drawtexid
-                                                     reason:"blit_framebuffer_integer_msaa"];
         }
         return YES;
     }
@@ -1996,9 +1959,6 @@ typedef struct MGLBlitColorState {
         [integerBlit endEncoding];
         if (drawTextureObject && drawFBOAttachment) {
             mglMarkTextureLevelRenderTargetWritten(drawTextureObject, drawFBOAttachment->level);
-            [self updateGLSampledRenderTargetCopyForTexture:drawTextureObject
-                                                     source:drawtexid
-                                                     reason:"blit_framebuffer_integer_direct"];
         }
         return YES;
     }
@@ -2014,7 +1974,6 @@ typedef struct MGLBlitColorState {
     Framebuffer *drawfbo = st->drawfbo;
     GLenum filter = st->filter;
     FBOAttachment *drawFBOAttachment = st->drawFBOAttachment;
-    Texture *readTextureObject = st->readTextureObject;
     Texture *drawTextureObject = st->drawTextureObject;
     MGLMetalAttachmentSubresource readSubresource = st->readSubresource;
     MGLMetalAttachmentSubresource drawSubresource = st->drawSubresource;
@@ -2160,19 +2119,6 @@ typedef struct MGLBlitColorState {
         }
         if (drawTextureObject && drawFBOAttachment) {
             mglMarkTextureLevelRenderTargetWritten(drawTextureObject, drawFBOAttachment->level);
-            [self updateGLSampledRenderTargetCopyForTexture:drawTextureObject
-                                                     source:drawtexid
-                                                     reason:"blit_framebuffer_scaled"];
-        }
-        // When the source is also a render target, refresh its sampled copy
-        // so future fragment-shader samples see useCopy=1 instead of falling
-        // back to the direct texture (useCopy=0).
-        if (readTextureObject &&
-            readTextureObject->is_render_target &&
-            readtexid) {
-            [self updateGLSampledRenderTargetCopyForTexture:readTextureObject
-                                                     source:readtexid
-                                                     reason:"blit_framebuffer_scaled_src"];
         }
         return YES;
     }
@@ -2203,7 +2149,6 @@ typedef struct MGLBlitColorState {
     NSInteger copyDstY = st->copyDstY;
     NSInteger srcMetalY = st->srcMetalY;
     NSInteger dstMetalY = st->dstMetalY;
-    BOOL didMsaaResolve = st->didMsaaResolve;
     // start blit encoder
     id<MTLBlitCommandEncoder> blitCommandEncoder;
     blitCommandEncoder = mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
@@ -2249,22 +2194,6 @@ typedef struct MGLBlitColorState {
     }
     if (drawTextureObject && drawFBOAttachment) {
         mglMarkTextureLevelRenderTargetWritten(drawTextureObject, drawFBOAttachment->level);
-        [self updateGLSampledRenderTargetCopyForTexture:drawTextureObject
-                                                 source:drawtexid
-                                                 reason:"blit_framebuffer_copy"];
-    }
-    // When the source is also a render target, refresh its sampled copy
-    // so future fragment-shader samples use the synchronized copy instead
-    // of falling back to the direct texture (useCopy=0). Skip this when we
-    // performed an MSAA resolve — the resolved texture is a temporary and
-    // must not become the sampled copy of the (multisample) source object.
-    if (readTextureObject &&
-        readTextureObject->is_render_target &&
-        readtexid &&
-        !didMsaaResolve) {
-        [self updateGLSampledRenderTargetCopyForTexture:readTextureObject
-                                                 source:readtexid
-                                                 reason:"blit_framebuffer_copy_src"];
     }
 }
 
@@ -2943,12 +2872,6 @@ typedef struct MGLBlitColorState {
     mglMarkTextureLevelMetalFilled(tex, (GLuint)level, 0);
     tex->mtl_render_yflip_authority = (tex->mtl_render_target_write_version << 1) |
         (destinationBottomOrigin ? 1u : 0u);
-    if (destIsDepth) {
-        [self updateDepthReadCopiesForTexture:tex];
-    }
-    [self updateGLSampledRenderTargetCopyForTexture:tex
-                                             source:destTexture
-                                             reason:"copy_tex_sub_image_blit"];
     tex->dirty_bits &= ~(DIRTY_TEXTURE_DATA | DIRTY_TEXTURE_LEVEL);
     glm_ctx->state.dirty_bits |= DIRTY_TEX | DIRTY_TEX_BINDING;
     return YES;
@@ -3139,9 +3062,6 @@ typedef struct MGLBlitColorState {
     mglMarkTextureLevelMetalFilled(tex, (GLuint)level, bgraSize);
     tex->mtl_render_yflip_authority = (tex->mtl_render_target_write_version << 1) |
         (destinationBottomOrigin ? 1u : 0u);
-    [self updateGLSampledRenderTargetCopyForTexture:tex
-                                             source:texture
-                                             reason:"copy_tex_sub_image"];
     tex->dirty_bits &= ~(DIRTY_TEXTURE_DATA | DIRTY_TEXTURE_LEVEL);
     if (glm_ctx) {
         glm_ctx->state.dirty_bits |= DIRTY_TEX | DIRTY_TEX_BINDING;
