@@ -185,6 +185,7 @@ typedef struct SpirvResource_t {
     GLboolean sampler_unit_explicit;
     size_t  required_size;
     GLboolean is_opaque_uniform; /* SPIR-V image/sampler type, independent of its name or dimension. */
+    GLboolean has_image_type; /* Distinguishes an image from a pure sampler; dim 0 is valid 1D. */
     GLuint  image_dim;
     GLuint  image_arrayed;
     GLuint  image_multisampled;

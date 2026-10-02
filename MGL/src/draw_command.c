@@ -659,15 +659,15 @@ static void mglTrackPendingTextureRead(GLMContext ctx, Texture *texture)
     cb->texture_read_objects[cb->texture_read_count++] = texture;
 }
 
-/* Forward declaration: defined below, used by the program-aware hazard
- * guards in both mglTrackPendingSampledTextureReads and
- * mglFlushPendingDrawsForActiveTextures. */
-static bool mglStateSamplesTextureUnit(GLMContext ctx, GLuint unit);
+/* Declared GL sampler targets select bindings independently on each unit. */
+static void mglStateTextureTargetMasks(GLMContext ctx, uint16_t masks[TEXTURE_UNITS]);
 
 static void mglTrackPendingSampledTextureReads(GLMContext ctx)
 {
     if (!ctx) return;
 
+    uint16_t targets[TEXTURE_UNITS] = {0};
+    mglStateTextureTargetMasks(ctx, targets);
     unsigned *mask = ctx->state.active_texture_mask;
     for (int w = 0; w < 4; w++) {
         unsigned bits = mask[w];
@@ -679,25 +679,16 @@ static void mglTrackPendingSampledTextureReads(GLMContext ctx)
                 continue;
             }
 
-            /* Program-aware guard: only track textures as "read" on units
-             * the current program actually samples.  Without this, a texture
-             * left bound on an unsampled unit (e.g. FBO color attachment
-             * after glTexImage2D) would be falsely tracked as read, causing
-             * mglFlushPendingDrawsBeforeFramebufferTextureWrites to flush
-             * on the next draw. */
-            if (!mglStateSamplesTextureUnit(ctx, (GLuint)unit)) {
-                continue;
-            }
-
-            Texture *active = ctx->state.active_textures[unit];
-            if (active) {
-                mglTrackPendingTextureRead(ctx, active);
+            if (!targets[unit]) continue;
+            /* Unknown/no-program resources retain the old active binding. */
+            if (targets[unit] == (1u << _MAX_TEXTURE_TYPES) - 1u) {
+                mglTrackPendingTextureRead(ctx, ctx->state.active_textures[unit]);
             }
 
             TextureUnit *textureUnit = &ctx->state.texture_units[unit];
             for (int target = 0; target < _MAX_TEXTURE_TYPES; target++) {
                 Texture *bound = textureUnit->textures[target];
-                if (bound) {
+                if ((targets[unit] & (1u << target)) && bound) {
                     mglTrackPendingTextureRead(ctx, bound);
                 }
             }
@@ -1056,43 +1047,43 @@ void mglFlushPendingDrawsBeforeTextureWrite(GLMContext ctx, void *texture)
     }
 }
 
-/*
- * mglStateSamplesTextureUnit — 当前活跃 program 是否实际采样纹理单元 unit
- *
- * 遍历当前 monolithic program 或 pipeline 各 stage program，调用
- * mglProgramSamplesTextureUnit 判断是否有 sampler 资源解析到该 unit。
- * 无 program 且无 pipeline 时退化为保守返回 true（保留旧刷新行为）。
- */
-static bool mglStateSamplesTextureUnit(GLMContext ctx, GLuint unit)
+/* Only the selected stages of a separable pipeline contribute dependencies. */
+static void mglStateTextureTargetMasks(GLMContext ctx, uint16_t masks[TEXTURE_UNITS])
 {
-    if (!ctx) return true;
-
     Program *program = ctx->state.program;
-    if (program && mglProgramSamplesTextureUnit(program, unit)) {
-        return true;
-    }
-
-    /* Pipeline with separate stage programs. */
-    if (!program && ctx->state.program_pipeline) {
-        ProgramPipeline *pipeline = ctx->state.program_pipeline;
-        bool hasAnyStage = false;
-        for (int stage = 0; stage < _MAX_SHADER_TYPES; stage++) {
-            Program *stageProg = pipeline->stage_programs[stage];
-            if (!stageProg) continue;
-            hasAnyStage = true;
-            if (mglProgramSamplesTextureUnit(stageProg, unit)) {
-                return true;
-            }
+    bool hasProgram = program != NULL;
+    for (int stage = 0; stage < _MAX_SHADER_TYPES; stage++) {
+        if (stage == _COMPUTE_SHADER) continue;
+        Program *stageProgram = program;
+        if (!program && ctx->state.program_pipeline) {
+            stageProgram = ctx->state.program_pipeline->stage_programs[stage];
         }
-        /* Pipeline has stage programs but none sample this unit -> safe.
-         * Empty pipeline -> conservative. */
-        return !hasAnyStage;
+        if (stageProgram) {
+            hasProgram = true;
+            mglAccumulateProgramTextureTargetMasks(stageProgram, stage, masks);
+        }
     }
+    if (!hasProgram) {
+        for (GLuint unit = 0; unit < TEXTURE_UNITS; unit++) {
+            masks[unit] = (1u << _MAX_TEXTURE_TYPES) - 1u;
+        }
+    }
+}
 
-    /* No program and no pipeline: conservative. */
-    if (!program) return true;
-
-    return false;
+static void mglTraceTextureHazard(GLMContext ctx, int unit, uint16_t targets,
+                                  int target, Texture *texture)
+{
+    static int enabled = -1;
+    static uint64_t hits;
+    if (enabled < 0) enabled = getenv("MGL_TRACE_TEXTURE_HAZARDS") != NULL;
+    if (!enabled) return;
+    uint64_t hit = ++hits;
+    if (hit <= 32 || hit % 4096 == 0) {
+        MGLCommandBuffer *cb = &ctx->draw_command_buffer;
+        fprintf(stderr, "MGL TEXHAZARD hit=%llu program=%u unit=%d targets=0x%x target=%d texture=%u batches=%u commands=%u\n",
+                (unsigned long long)hit, ctx->state.program_name, unit, targets,
+                target, texture->name, cb->batch_count, cb->total_commands);
+    }
 }
 
 /*
@@ -1118,6 +1109,8 @@ void mglFlushPendingDrawsForActiveTextures(GLMContext ctx)
         return;
     }
 
+    uint16_t targets[TEXTURE_UNITS] = {0};
+    mglStateTextureTargetMasks(ctx, targets);
     unsigned *mask = ctx->state.active_texture_mask;
     for (int w = 0; w < 4; w++) {
         unsigned bits = mask[w];
@@ -1129,16 +1122,11 @@ void mglFlushPendingDrawsForActiveTextures(GLMContext ctx)
                 continue;
             }
 
-            /* Program-aware guard: skip units the current program/pipeline
-             * never samples.  This eliminates false-positive WAR flushes
-             * where a texture (e.g. FBO color attachment left bound after
-             * glTexImage2D) sits on a unit no sampler reads. */
-            if (!mglStateSamplesTextureUnit(ctx, (GLuint)unit)) {
-                continue;
-            }
-
+            if (!targets[unit]) continue;
             Texture *active = ctx->state.active_textures[unit];
-            if (active && mglPendingDrawsWriteTexture(ctx, active)) {
+            if (targets[unit] == (1u << _MAX_TEXTURE_TYPES) - 1u &&
+                active && mglPendingDrawsWriteTexture(ctx, active)) {
+                mglTraceTextureHazard(ctx, unit, targets[unit], -1, active);
                 MGL_PERF_INC(g_mglFlushReasonActiveTexWarSinceSwap);
                 mglFlushCommandBuffer(ctx);
                 return;
@@ -1147,7 +1135,9 @@ void mglFlushPendingDrawsForActiveTextures(GLMContext ctx)
             TextureUnit *textureUnit = &ctx->state.texture_units[unit];
             for (int target = 0; target < _MAX_TEXTURE_TYPES; target++) {
                 Texture *bound = textureUnit->textures[target];
-                if (bound && mglPendingDrawsWriteTexture(ctx, bound)) {
+                if ((targets[unit] & (1u << target)) &&
+                    bound && mglPendingDrawsWriteTexture(ctx, bound)) {
+                    mglTraceTextureHazard(ctx, unit, targets[unit], target, bound);
                     MGL_PERF_INC(g_mglFlushReasonActiveTexWarSinceSwap);
                     mglFlushCommandBuffer(ctx);
                     return;

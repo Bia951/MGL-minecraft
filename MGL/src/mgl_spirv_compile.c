@@ -4718,6 +4718,7 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
             ptr->spirv_resources_list[stage][res_type].list[i].is_opaque_uniform =
                 mglUniformConstantBaseTypeIsSamplerLike(reflected_basetype);
             ptr->spirv_resources_list[stage][res_type].list[i].image_dim = 0;
+            ptr->spirv_resources_list[stage][res_type].list[i].has_image_type = GL_FALSE;
             ptr->spirv_resources_list[stage][res_type].list[i].image_arrayed = 0;
             ptr->spirv_resources_list[stage][res_type].list[i].image_multisampled = 0;
 
@@ -4772,6 +4773,7 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
                 spvc_type image_type = reflected_type;
 
                 if (image_type) {
+                    ptr->spirv_resources_list[stage][res_type].list[i].has_image_type = GL_TRUE;
                     ptr->spirv_resources_list[stage][res_type].list[i].image_dim =
                         (GLuint)spvc_type_get_image_dimension(image_type);
                     ptr->spirv_resources_list[stage][res_type].list[i].image_arrayed =

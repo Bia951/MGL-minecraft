@@ -97,6 +97,13 @@ GLint mglSamplerResourceTextureUnit(Program *program, const SpirvResource *resou
 
 bool mglProgramSamplesTextureUnit(Program *program, GLuint unit);
 
+/* Accumulate GL texture-target bits for each sampled unit in one stage.
+ * Uses the declared image dimension, before any Metal texture lowering.
+ * Array elements resolve their own sampler units. Unknown resource kinds
+ * retain the conservative all-target mask. */
+void mglAccumulateProgramTextureTargetMasks(Program *program, int stage,
+                                          uint16_t masks[TEXTURE_UNITS]);
+
 #ifdef __cplusplus
 }
 #endif
