@@ -31,6 +31,8 @@
 #include "hash_table.h"
 #include "draw_command.h"
 
+#define MGL_BUFFER_BASE_TARGET_COUNT 4
+
 typedef struct GLSLState_t {
     glslang_resource_t  resrc;
     glslang_limits_t    limits;
@@ -157,7 +159,7 @@ typedef struct {
     ProgramPipeline *program_pipeline;
     TransformFeedback *transform_feedback;
 
-    BufferBase  buffer_base[_MAX_BUFFER_TYPES];
+    BufferBase  compact_buffer_bases[MGL_BUFFER_BASE_TARGET_COUNT];
 
     // glsl info
     GLSLState   glsl;
@@ -189,5 +191,22 @@ typedef struct {
     // put at end, big chunk of yuck
     GLMParams   var;
 } GLMState;
+
+static inline BufferBaseTarget *mglStateBufferBaseTargets(GLMState *state, int target)
+{
+    if (!state) return NULL;
+    switch (target) {
+        case _UNIFORM_BUFFER:
+            return state->compact_buffer_bases[0].buffers;
+        case _SHADER_STORAGE_BUFFER:
+            return state->compact_buffer_bases[1].buffers;
+        case _ATOMIC_COUNTER_BUFFER:
+            return state->compact_buffer_bases[2].buffers;
+        case _TRANSFORM_FEEDBACK_BUFFER:
+            return state->compact_buffer_bases[3].buffers;
+        default:
+            return NULL;
+    }
+}
 
 #endif /* mgl_types_state_h */

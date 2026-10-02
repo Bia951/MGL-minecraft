@@ -3654,12 +3654,13 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
             BufferBaseTarget *fallbackBuffers = NULL;
 
             Program *activeProgram = mglResolveProgramForStageFromState(ctx, stage);
-            if (spvc_type == SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT && activeProgram) {
+            if (spvc_type == SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT) {
+                if (!activeProgram) continue;
                 MGLPlainUniformVersion *version = _replayUniformVersions[stage];
                 buffers = version ? version->slots : activeProgram->plain_uniform_buffers;
-                fallbackBuffers = ctx->state.buffer_base[gl_buffer_type].buffers;
+                /* Plain uniforms belong to the Program, not GL indexed bindings. */
             } else {
-                buffers = ctx->state.buffer_base[gl_buffer_type].buffers;
+                buffers = mglStateBufferBaseTargets(&ctx->state, gl_buffer_type);
             }
             
             for (int i = 0; i < count; i++)
@@ -11075,7 +11076,7 @@ Buffer *getIndirectBuffer(GLMContext ctx)
         glm_ctx->state.transform_feedback->active &&
         !glm_ctx->state.transform_feedback->paused) {
         BufferBaseTarget *xfbSlot =
-            &glm_ctx->state.buffer_base[_TRANSFORM_FEEDBACK_BUFFER].buffers[0];
+            &mglStateBufferBaseTargets(&glm_ctx->state, _TRANSFORM_FEEDBACK_BUFFER)[0];
         if (xfbSlot->buf) {
             /* Lazily create Metal buffer backing if not yet created. */
             if (!xfbSlot->buf->data.mtl_data) {

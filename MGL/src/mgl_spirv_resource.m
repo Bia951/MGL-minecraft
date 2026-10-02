@@ -132,8 +132,8 @@ void mglVisitDrawBufferBindings(GLMContext ctx, MGLDrawBufferBindingVisitor visi
         SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT, SPVC_RESOURCE_TYPE_STORAGE_BUFFER,
         SPVC_RESOURCE_TYPE_ATOMIC_COUNTER };
     static const int targets[] = { _UNIFORM_BUFFER, _UNIFORM_CONSTANT,
-        _SHADER_STORAGE_BUFFER, _ATOMIC_COUNTER_BUFFER, _TEXTURE_BUFFER };
-    uint64_t baseMasks[5][MGL_BINDING_MASK_WORDS] = {{0}};
+        _SHADER_STORAGE_BUFFER, _ATOMIC_COUNTER_BUFFER };
+    uint64_t baseMasks[4][MGL_BINDING_MASK_WORDS] = {{0}};
     uint64_t plainMasks[_MAX_SHADER_TYPES][MGL_BINDING_MASK_WORDS] = {{0}};
     Program *programs[_MAX_SHADER_TYPES] = {0};
     GLuint programCount = 0;
@@ -197,13 +197,15 @@ void mglVisitDrawBufferBindings(GLMContext ctx, MGLDrawBufferBindingVisitor visi
             }
         }
     }
-    /* Texel-buffer backing is resolved through textures rather than the four
-     * shader-buffer resource classes. Preserve its existing dependencies. */
-    for (GLuint w = 0; w < MGL_BINDING_MASK_WORDS; w++) {
-        baseMasks[4][w] = UINT64_MAX;
-        if (!programCount) for (GLuint t = 0; t < 4; t++) baseMasks[t][w] = UINT64_MAX;
-    }
-    for (GLuint t = 0; t < 5; t++) {
+    /* Only indexed GL binding targets have state rows. Plain uniforms are
+     * visited from Program storage below; texture-buffer associations live on
+     * Texture objects and never populated the old indexed pseudo-target row. */
+    for (GLuint t = 0; t < 4; t++) {
+        if (t == 1) continue;
+        if (!programCount) {
+            for (GLuint w = 0; w < MGL_BINDING_MASK_WORDS; w++)
+                baseMasks[t][w] = UINT64_MAX;
+        }
         for (GLuint w = 0; w < MGL_BINDING_MASK_WORDS; w++) {
             uint64_t bits = baseMasks[t][w];
             while (bits) {
@@ -211,14 +213,7 @@ void mglVisitDrawBufferBindings(GLMContext ctx, MGLDrawBufferBindingVisitor visi
                 bits &= bits - 1u;
                 if (slot < MAX_BINDABLE_BUFFERS) {
                     const BufferBaseTarget *binding =
-                        &ctx->state.buffer_base[targets[t]].buffers[slot];
-                    /* Texture-buffer backing has no shader-block dependency
-                     * mask yet, so inspect all slots; empty slots cannot
-                     * contribute either a live GL buffer name or resolved
-                     * Buffer object and need no hash/hazard visitor work. */
-                    if (t == 4 && binding->buffer == 0 && binding->buf == NULL) {
-                        continue;
-                    }
+                        &mglStateBufferBaseTargets(&ctx->state, targets[t])[slot];
                     visit(ctx, binding,
                           ((uint64_t)(targets[t] + 1) * 131u) + slot, data);
                 }

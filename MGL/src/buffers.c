@@ -1261,14 +1261,14 @@ void mglDeleteBuffers(GLMContext ctx, GLsizei n, const GLuint *buffers)
             }
 
             // remove any dangling references in indexed buffer-base bindings
-            for (GLuint idx = 0; idx < _MAX_BUFFER_TYPES; idx++)
+            for (GLuint idx = 0; idx < MGL_BUFFER_BASE_TARGET_COUNT; idx++)
             {
                 for (GLuint i = 0; i < MAX_BINDABLE_BUFFERS; i++)
                 {
-                    if (ctx->state.buffer_base[idx].buffers[i].buf == ptr ||
-                        ctx->state.buffer_base[idx].buffers[i].buffer == buffer)
+                    BufferBaseTarget *slot = &ctx->state.compact_buffer_bases[idx].buffers[i];
+                    if (slot->buf == ptr || slot->buffer == buffer)
                     {
-                        bzero(&ctx->state.buffer_base[idx].buffers[i], sizeof(BufferBaseTarget));
+                        bzero(slot, sizeof(BufferBaseTarget));
                     }
                 }
             }
@@ -1429,7 +1429,7 @@ void mglBindBufferBase(GLMContext ctx, GLenum target, GLuint index, GLuint buffe
 
     buffer_index = bufferIndexFromTarget(ctx, target);
 
-    BufferBaseTarget *base_slot = &ctx->state.buffer_base[buffer_index].buffers[index];
+    BufferBaseTarget *base_slot = &mglStateBufferBaseTargets(&ctx->state, buffer_index)[index];
 
     if (buffer)
     {
@@ -1560,7 +1560,7 @@ void mglBindBufferRange(GLMContext ctx, GLenum target, GLuint index, GLuint buff
 
     buffer_index = bufferIndexFromTarget(ctx, target);
 
-    BufferBaseTarget *base_slot = &ctx->state.buffer_base[buffer_index].buffers[index];
+    BufferBaseTarget *base_slot = &mglStateBufferBaseTargets(&ctx->state, buffer_index)[index];
 
     if (!buffer)
     {
@@ -3362,7 +3362,7 @@ void mglBindBuffersRange(GLMContext ctx, GLenum target, GLuint first, GLsizei co
 
         if (name == 0u)
         {
-            BufferBaseTarget *base_slot = &ctx->state.buffer_base[buffer_index].buffers[index];
+            BufferBaseTarget *base_slot = &mglStateBufferBaseTargets(&ctx->state, buffer_index)[index];
             if (base_slot->buffer != 0 || base_slot->buf != NULL ||
                 base_slot->offset != 0 || base_slot->size != 0) {
                 mglFlushPendingDraws(ctx);

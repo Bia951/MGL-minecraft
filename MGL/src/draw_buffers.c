@@ -886,7 +886,7 @@ static bool mglCPUFeedbackResolveXFBSlot(GLMContext ctx,
     if (slotIndex >= MAX_BINDABLE_BUFFERS) {
         return false;
     }
-    BufferBaseTarget *slot = &ctx->state.buffer_base[_TRANSFORM_FEEDBACK_BUFFER].buffers[slotIndex];
+    BufferBaseTarget *slot = &mglStateBufferBaseTargets(&ctx->state, _TRANSFORM_FEEDBACK_BUFFER)[slotIndex];
     Buffer *buffer = slot->buf;
     if (!buffer || !buffer->data.buffer_data || buffer->size <= 0) {
         return false;

@@ -165,7 +165,7 @@ static NSUInteger mglABSizeConstantCapacity(Program *program, int stage)
                     const GLuint clientBinding =
                         mglClientBufferBindingForResourceElement(resourceType, resource, element);
                     BufferBaseTarget *base = clientBinding < MAX_BINDABLE_BUFFERS
-                        ? &state->buffer_base[bufferIndex].buffers[clientBinding] : NULL;
+                        ? &mglStateBufferBaseTargets(state, bufferIndex)[clientBinding] : NULL;
                     Buffer *bufferObject = base ? base->buf : NULL;
                     id<MTLBuffer> metalBuffer = nil;
                     NSUInteger offset = 0u;
@@ -253,7 +253,7 @@ static NSUInteger mglABSizeConstantCapacity(Program *program, int stage)
                         const GLuint clientBinding =
                             mglClientBufferBindingForResourceElement(resourceType, resource, element);
                         BufferBaseTarget *base = clientBinding < MAX_BINDABLE_BUFFERS
-                            ? &state->buffer_base[bufferIndex].buffers[clientBinding] : NULL;
+                            ? &mglStateBufferBaseTargets(state, bufferIndex)[clientBinding] : NULL;
                         Buffer *bufferObject = base ? base->buf : NULL;
                         id<MTLBuffer> metalBuffer = nil;
                         NSUInteger offset = 0u;
@@ -313,7 +313,7 @@ static NSUInteger mglABSizeConstantCapacity(Program *program, int stage)
                     const GLuint clientBinding =
                         mglClientBufferBindingForResourceElement(resourceType, resource, element);
                     BufferBaseTarget *base = clientBinding < MAX_BINDABLE_BUFFERS
-                        ? &state->buffer_base[bufferIndex].buffers[clientBinding] : NULL;
+                        ? &mglStateBufferBaseTargets(state, bufferIndex)[clientBinding] : NULL;
                     id<MTLBuffer> metalBuffer = base && base->buf
                         ? (__bridge id<MTLBuffer>)base->buf->data.mtl_data
                         : _argumentBufferFallbackStorage;
@@ -368,7 +368,7 @@ static NSUInteger mglABSizeConstantCapacity(Program *program, int stage)
             GLuint clientBinding = mglClientBufferBindingForResourceElement(
                 SPVC_RESOURCE_TYPE_STORAGE_BUFFER, resource, element);
             if (clientBinding >= MAX_BINDABLE_BUFFERS) continue;
-            BufferBaseTarget *base = &state->buffer_base[_SHADER_STORAGE_BUFFER].buffers[clientBinding];
+            BufferBaseTarget *base = &mglStateBufferBaseTargets(state, _SHADER_STORAGE_BUFFER)[clientBinding];
             if (!base->buf) continue;
             GLsizeiptr visible = base->size > 0 ? base->size : (base->buf->size - base->offset);
             if (visible < 0) visible = 0;

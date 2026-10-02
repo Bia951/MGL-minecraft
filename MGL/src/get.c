@@ -1128,7 +1128,7 @@ void mglGetInteger64i_v(GLMContext ctx, GLenum target, GLuint index, GLint64 *da
                     break;
             }
 
-            BufferBaseTarget *binding = &ctx->state.buffer_base[bufferIndex].buffers[index];
+            BufferBaseTarget *binding = &mglStateBufferBaseTargets(&ctx->state, bufferIndex)[index];
             switch (target) {
                 case GL_UNIFORM_BUFFER_BINDING:
                 case GL_TRANSFORM_FEEDBACK_BUFFER_BINDING:
@@ -1352,7 +1352,7 @@ void mglGetIntegeri_v(GLMContext ctx, GLenum target, GLuint index, GLint *data)
                     break;
             }
 
-            BufferBaseTarget *binding = &ctx->state.buffer_base[bufferIndex].buffers[index];
+            BufferBaseTarget *binding = &mglStateBufferBaseTargets(&ctx->state, bufferIndex)[index];
             switch (target) {
                 case GL_UNIFORM_BUFFER_BINDING:
                 case GL_TRANSFORM_FEEDBACK_BUFFER_BINDING:
