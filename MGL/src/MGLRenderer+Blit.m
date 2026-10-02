@@ -35,7 +35,165 @@ typedef struct MGLBlitColorState {
     double scaledDstMetalY;
 } MGLBlitColorState;
 
+/* Exact storage sizes for formats supported by the raw texture-buffer copy.
+ * Compressed, packed depth/stencil and stencil formats retain native row blits. */
+static NSUInteger mglCopyImageRawPixelSize(MTLPixelFormat format)
+{
+    switch (format) {
+        case MTLPixelFormatR8Unorm: case MTLPixelFormatR8Snorm:
+        case MTLPixelFormatR8Uint: case MTLPixelFormatR8Sint: return 1u;
+        case MTLPixelFormatR16Unorm: case MTLPixelFormatR16Snorm:
+        case MTLPixelFormatR16Uint: case MTLPixelFormatR16Sint:
+        case MTLPixelFormatR16Float: case MTLPixelFormatRG8Unorm:
+        case MTLPixelFormatRG8Snorm: case MTLPixelFormatRG8Uint:
+        case MTLPixelFormatRG8Sint: return 2u;
+        case MTLPixelFormatR32Float: case MTLPixelFormatR32Uint:
+        case MTLPixelFormatR32Sint: case MTLPixelFormatRG16Unorm:
+        case MTLPixelFormatRG16Snorm: case MTLPixelFormatRG16Uint:
+        case MTLPixelFormatRG16Sint: case MTLPixelFormatRG16Float:
+        case MTLPixelFormatRGBA8Unorm: case MTLPixelFormatRGBA8Unorm_sRGB:
+        case MTLPixelFormatRGBA8Snorm: case MTLPixelFormatRGBA8Uint:
+        case MTLPixelFormatRGBA8Sint: case MTLPixelFormatBGRA8Unorm:
+        case MTLPixelFormatBGRA8Unorm_sRGB: case MTLPixelFormatRGB10A2Unorm:
+        case MTLPixelFormatRGB10A2Uint: case MTLPixelFormatRG11B10Float:
+        case MTLPixelFormatRGB9E5Float: case MTLPixelFormatDepth32Float: return 4u;
+        case MTLPixelFormatRG32Float: case MTLPixelFormatRG32Uint:
+        case MTLPixelFormatRG32Sint: case MTLPixelFormatRGBA16Unorm:
+        case MTLPixelFormatRGBA16Snorm: case MTLPixelFormatRGBA16Uint:
+        case MTLPixelFormatRGBA16Sint: case MTLPixelFormatRGBA16Float: return 8u;
+        case MTLPixelFormatRGBA32Float: case MTLPixelFormatRGBA32Uint:
+        case MTLPixelFormatRGBA32Sint: return 16u;
+        default: return 0u;
+    }
+}
+
 @implementation MGLRenderer (Blit)
+/* Reverse physical rows without interpreting texels: NaN payloads, integer
+ * values, sRGB bytes and depth bits all pass through unchanged. The two
+ * private buffers are reused on our serial queue with tracked GPU hazards. */
+- (BOOL)copyImageFlippedRowsFromTexture:(id<MTLTexture>)source
+                                level:(NSUInteger)sourceLevel
+                               origin:(MTLOrigin)sourceOrigin
+                            toTexture:(id<MTLTexture>)destination
+                                level:(NSUInteger)destinationLevel
+                               origin:(MTLOrigin)destinationOrigin
+                                 size:(MTLSize)size
+                        bytesPerPixel:(NSUInteger)bytesPerPixel
+{
+    if (!_copyImageRowFlipPipeline) {
+        NSString *code = @"#include <metal_stdlib>\nusing namespace metal;\n"
+            "kernel void mgl_copy_image_flip(device const uchar* src [[buffer(0)]], "
+            "device uchar* dst [[buffer(1)]], constant uint4& p [[buffer(2)]], "
+            "uint2 g [[thread_position_in_grid]]) { "
+            "uint x = g.x * 16u; if (x >= p.y || g.y >= p.z) return; "
+            "uint s = (p.z - 1u - g.y) * p.x + x, d = g.y * p.x + x; "
+            "if (x + 16u <= p.y) "
+            "*reinterpret_cast<device uint4*>(dst + d) = *reinterpret_cast<device const uint4*>(src + s); "
+            "else for (uint i = 0; i < p.y - x; i++) dst[d+i] = src[s+i]; }";
+        NSError *error = nil;
+        id<MTLLibrary> library = [self newMetalLibraryWithSource:code options:nil
+            label:@"copy_image_raw_row_flip" error:&error];
+        id<MTLFunction> function = [library newFunctionWithName:@"mgl_copy_image_flip"];
+        if (function) _copyImageRowFlipPipeline = [_device newComputePipelineStateWithFunction:function error:&error];
+        if (!_copyImageRowFlipPipeline) {
+            NSLog(@"MGL ERROR: CopyImage row flip pipeline: %@", error);
+            return NO;
+        }
+    }
+    if (size.width > (NSUIntegerMax - 255u) / bytesPerPixel) return NO;
+    NSUInteger activeBytes = size.width * bytesPerPixel;
+    NSUInteger rowBytes = (activeBytes + 255u) & ~(NSUInteger)255u;
+    if (size.height > NSUIntegerMax / rowBytes || rowBytes > UINT32_MAX ||
+        size.height > UINT32_MAX || rowBytes * size.height > UINT32_MAX) return NO;
+    NSUInteger bufferBytes = rowBytes * size.height;
+    if (!_copyImageRowFlipSourceBuffer || _copyImageRowFlipSourceBuffer.length < bufferBytes) {
+        id<MTLBuffer> input = [_device newBufferWithLength:bufferBytes
+            options:MTLResourceStorageModePrivate | MTLResourceHazardTrackingModeTracked];
+        id<MTLBuffer> output = [_device newBufferWithLength:bufferBytes
+            options:MTLResourceStorageModePrivate | MTLResourceHazardTrackingModeTracked];
+        if (!input || !output) return NO;
+        input.label = @"CopyImage row flip input";
+        output.label = @"CopyImage row flip output";
+        _copyImageRowFlipSourceBuffer = input;
+        _copyImageRowFlipDestinationBuffer = output;
+    }
+
+    id<MTLBlitCommandEncoder> blit = nil;
+    id<MTLComputeCommandEncoder> compute = nil;
+    @try {
+        blit = mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
+        if (!blit) return NO;
+        [blit copyFromTexture:source sourceSlice:0 sourceLevel:sourceLevel
+            sourceOrigin:sourceOrigin sourceSize:size toBuffer:_copyImageRowFlipSourceBuffer
+            destinationOffset:0 destinationBytesPerRow:rowBytes destinationBytesPerImage:bufferBytes];
+        [blit endEncoding]; blit = nil;
+
+        compute = mglProfileCompute(_currentCommandBuffer, __func__, __LINE__);
+        if (!compute) return NO;
+        vector_uint4 params = {(uint32_t)rowBytes, (uint32_t)activeBytes,
+                              (uint32_t)size.height, 0u};
+        [compute setComputePipelineState:_copyImageRowFlipPipeline];
+        [compute setBuffer:_copyImageRowFlipSourceBuffer offset:0 atIndex:0];
+        [compute setBuffer:_copyImageRowFlipDestinationBuffer offset:0 atIndex:1];
+        [compute setBytes:&params length:sizeof(params) atIndex:2];
+        NSUInteger laneCount = _copyImageRowFlipPipeline.threadExecutionWidth;
+        NSUInteger rows = MIN((NSUInteger)8u, _copyImageRowFlipPipeline.maxTotalThreadsPerThreadgroup / laneCount);
+        NSUInteger columns = (activeBytes + 15u) / 16u;
+        [compute dispatchThreadgroups:MTLSizeMake((columns + laneCount - 1u) / laneCount,
+                                                  (size.height + rows - 1u) / rows, 1)
+            threadsPerThreadgroup:MTLSizeMake(laneCount, rows, 1)];
+        [compute endEncoding]; compute = nil;
+
+        blit = mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
+        if (!blit) return NO;
+        [blit copyFromBuffer:_copyImageRowFlipDestinationBuffer sourceOffset:0
+            sourceBytesPerRow:rowBytes sourceBytesPerImage:bufferBytes sourceSize:size
+            toTexture:destination destinationSlice:0 destinationLevel:destinationLevel
+            destinationOrigin:destinationOrigin];
+        [blit endEncoding]; blit = nil;
+    } @catch (NSException *exception) {
+        [compute endEncoding];
+        [blit endEncoding];
+        NSLog(@"MGL ERROR: CopyImage raw row flip: %@", exception);
+        return NO;
+    }
+    /* Opt-in validation in the real workload: read both texture regions and
+     * compare active bytes with reversed rows. No image capture or standalone
+     * test program is needed, and steady-state runs do not enter this path. */
+    static unsigned verifiedCopies = 0u;
+    if (mglEnvFlagEnabled("MGL_COPYIMAGE_VERIFY") && verifiedCopies < 3u) {
+        id<MTLBuffer> verification = [_device newBufferWithLength:bufferBytes * 2u
+            options:MTLResourceStorageModeShared];
+        if (!verification) return NO;
+        id<MTLBlitCommandEncoder> verifyBlit = mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
+        if (!verifyBlit) return NO;
+        [verifyBlit copyFromTexture:source sourceSlice:0 sourceLevel:sourceLevel
+            sourceOrigin:sourceOrigin sourceSize:size toBuffer:verification
+            destinationOffset:0 destinationBytesPerRow:rowBytes destinationBytesPerImage:bufferBytes];
+        [verifyBlit copyFromTexture:destination sourceSlice:0 sourceLevel:destinationLevel
+            sourceOrigin:destinationOrigin sourceSize:size toBuffer:verification
+            destinationOffset:bufferBytes destinationBytesPerRow:rowBytes destinationBytesPerImage:bufferBytes];
+        [verifyBlit endEncoding];
+        [self flushCommandBuffer:YES];
+        const uint8_t *bytes = verification.contents;
+        for (NSUInteger row = 0; row < size.height; row++) {
+            if (memcmp(bytes + (size.height - 1u - row) * rowBytes,
+                       bytes + bufferBytes + row * rowBytes, activeBytes) != 0) {
+                NSLog(@"MGL ERROR: CopyImage raw flip byte mismatch row=%lu fmt=%lu size=%lux%lu",
+                    (unsigned long)row, (unsigned long)source.pixelFormat,
+                    (unsigned long)size.width, (unsigned long)size.height);
+                return NO;
+            }
+        }
+        verifiedCopies++;
+        NSLog(@"MGL COPYIMAGE VERIFY bit-exact copy=%u fmt=%lu size=%lux%lu srcLevel=%lu dstLevel=%lu",
+            verifiedCopies, (unsigned long)source.pixelFormat,
+            (unsigned long)size.width, (unsigned long)size.height,
+            (unsigned long)sourceLevel, (unsigned long)destinationLevel);
+    }
+    return YES;
+}
+
 - (id<MTLSamplerState>)scaledBlitSamplerForFilter:(GLuint)filter
 {
     BOOL wantsNearest = (filter == GL_NEAREST);
@@ -4434,7 +4592,7 @@ typedef struct MGLBlitColorState {
         static unsigned s_depthCopyTraceCount = 0;
         if (s_depthCopyTraceCount < 16u) {
             s_depthCopyTraceCount++;
-            NSLog(@"MGL COPYIMAGE trace=%u src=%u dst=%u srcOrigin=%@ dstOrigin=%@ srcRT=%d dstRT=%d srcAuth=0x%x dstAuth=0x%x srcVer=%u dstVer=%u srcLevel=%d dstLevel=%d srcGLY=%d dstGLY=%d srcPhysicalY=%lu dstPhysicalY=%lu width=%d height=%d depth=%d",
+            NSLog(@"MGL COPYIMAGE trace=%u src=%u dst=%u srcOrigin=%@ dstOrigin=%@ srcRT=%d dstRT=%d srcAuth=0x%x dstAuth=0x%x srcVer=%u dstVer=%u srcLevel=%d dstLevel=%d srcGLY=%d dstGLY=%d srcPhysicalY=%lu dstPhysicalY=%lu width=%d height=%d depth=%d srcFmt=%lu dstFmt=%lu",
                   s_depthCopyTraceCount,
                   (unsigned)srcTex->name,
                   (unsigned)dstTex->name,
@@ -4454,95 +4612,118 @@ typedef struct MGLBlitColorState {
                   (unsigned long)destinationPhysicalY,
                   (int)width,
                   (int)height,
-                  (int)depth);
+                  (int)depth,
+                  (unsigned long)srcTexture.pixelFormat,
+                  (unsigned long)dstTexture.pixelFormat);
         }
     }
 
-    id<MTLBlitCommandEncoder> blitEncoder = mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
-    if (!blitEncoder) {
-        NSLog(@"MGL ERROR: mtlCopyImageSubData failed to create blit encoder");
-        mglDispatchError(glm_ctx, __FUNCTION__, GL_OUT_OF_MEMORY);
-        return;
-    }
+    NSUInteger rawPixelSize = mglCopyImageRawPixelSize(srcTexture.pixelFormat);
+    BOOL useRawFlip = srcBottomOrigin != dstBottomOrigin &&
+        srcType == MTLTextureType2D && dstType == MTLTextureType2D &&
+        srcTexture.sampleCount == 1u && dstTexture.sampleCount == 1u &&
+        srcTexture.pixelFormat == dstTexture.pixelFormat && rawPixelSize != 0u &&
+        srcTexture != dstTexture && !srcTexture.framebufferOnly && !dstTexture.framebufferOnly &&
+        srcTexture.storageMode != MTLStorageModeMemoryless && dstTexture.storageMode != MTLStorageModeMemoryless &&
+        depth == 1 && height >= 32 && mglEnvFlagEnabledDefaultOn("MGL_COPYIMAGE_GPU_FLIP");
+    if (useRawFlip) {
+        if (![self copyImageFlippedRowsFromTexture:srcTexture level:(NSUInteger)srcLevel
+            origin:MTLOriginMake((NSUInteger)srcX, sourcePhysicalY, 0)
+            toTexture:dstTexture level:(NSUInteger)dstLevel
+            origin:MTLOriginMake((NSUInteger)dstX, destinationPhysicalY, 0)
+            size:MTLSizeMake((NSUInteger)width, (NSUInteger)height, 1)
+            bytesPerPixel:rawPixelSize]) {
+            mglDispatchError(glm_ctx, __FUNCTION__, GL_OUT_OF_MEMORY);
+            return;
+        }
+    } else {
+        id<MTLBlitCommandEncoder> blitEncoder = mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
+        if (!blitEncoder) {
+            NSLog(@"MGL ERROR: mtlCopyImageSubData failed to create blit encoder");
+            mglDispatchError(glm_ctx, __FUNCTION__, GL_OUT_OF_MEMORY);
+            return;
+        }
 
-    @try {
-        for (NSUInteger i = 0; i < iterations; i++) {
-            NSUInteger curSrcSlice = srcSlice;
-            NSUInteger curSrcDepth = srcDepthPlane;
-            NSUInteger curDstSlice = dstSlice;
-            NSUInteger curDstDepth = dstDepthPlane;
+        @try {
+            for (NSUInteger i = 0; i < iterations; i++) {
+                NSUInteger curSrcSlice = srcSlice;
+                NSUInteger curSrcDepth = srcDepthPlane;
+                NSUInteger curDstSlice = dstSlice;
+                NSUInteger curDstDepth = dstDepthPlane;
 
-            if (srcType == MTLTextureType3D && dstType != MTLTextureType3D) {
-                /* 3D -> 2D/array: read depth plane i from src */
-                curSrcDepth = srcDepthPlane + i;
-                curSrcSlice = 0;
-                curDstSlice = dstSlice + i;
-            } else if (srcType != MTLTextureType3D && dstType == MTLTextureType3D) {
-                /* 2D/array -> 3D: read slice i from src, write to dst depth */
-                curSrcSlice = srcSlice + i;
-                curDstDepth = dstDepthPlane + i;
-                curDstSlice = 0;
-            } else if (srcType != MTLTextureType3D && dstType != MTLTextureType3D) {
-                /* 2D/array -> 2D/array: copy slice i to slice i */
-                curSrcSlice = srcSlice + i;
-                curDstSlice = dstSlice + i;
-            }
-            /* For 3D → 3D, single blit with srcSizeDepth = copyDepth */
+                if (srcType == MTLTextureType3D && dstType != MTLTextureType3D) {
+                    /* 3D -> 2D/array: read depth plane i from src */
+                    curSrcDepth = srcDepthPlane + i;
+                    curSrcSlice = 0;
+                    curDstSlice = dstSlice + i;
+                } else if (srcType != MTLTextureType3D && dstType == MTLTextureType3D) {
+                    /* 2D/array -> 3D: read slice i from src, write to dst depth */
+                    curSrcSlice = srcSlice + i;
+                    curDstDepth = dstDepthPlane + i;
+                    curDstSlice = 0;
+                } else if (srcType != MTLTextureType3D && dstType != MTLTextureType3D) {
+                    /* 2D/array -> 2D/array: copy slice i to slice i */
+                    curSrcSlice = srcSlice + i;
+                    curDstSlice = dstSlice + i;
+                }
+                /* For 3D → 3D, single blit with srcSizeDepth = copyDepth */
 
-            if (srcBottomOrigin == dstBottomOrigin) {
-                [blitEncoder copyFromTexture:srcTexture
-                                  sourceSlice:curSrcSlice
-                                  sourceLevel:(NSUInteger)srcLevel
-                                 sourceOrigin:MTLOriginMake((NSUInteger)srcX,
-                                                            sourcePhysicalY,
-                                                            curSrcDepth)
-                                   sourceSize:MTLSizeMake((NSUInteger)width,
-                                                          (NSUInteger)height,
-                                                          srcSizeDepth)
-                                     toTexture:dstTexture
-                              destinationSlice:curDstSlice
-                              destinationLevel:(NSUInteger)dstLevel
-                             destinationOrigin:MTLOriginMake((NSUInteger)dstX,
-                                                             destinationPhysicalY,
-                                                             curDstDepth)];
-            } else {
-                /* Metal blits preserve row order.  Copy one physical row at a
-                 * time to map matching GL rows when source and destination
-                 * storage origins differ. */
-                for (NSUInteger row = 0; row < (NSUInteger)height; row++) {
-                    NSUInteger srcRowY = srcBottomOrigin
-                        ? (NSUInteger)srcY + row
-                        : srcLevelHeight - 1u - ((NSUInteger)srcY + row);
-                    NSUInteger dstRowY = dstBottomOrigin
-                        ? (NSUInteger)dstY + row
-                        : dstLevelHeight - 1u - ((NSUInteger)dstY + row);
+                if (srcBottomOrigin == dstBottomOrigin) {
                     [blitEncoder copyFromTexture:srcTexture
                                       sourceSlice:curSrcSlice
                                       sourceLevel:(NSUInteger)srcLevel
                                      sourceOrigin:MTLOriginMake((NSUInteger)srcX,
-                                                                srcRowY,
+                                                                sourcePhysicalY,
                                                                 curSrcDepth)
-                                       sourceSize:MTLSizeMake((NSUInteger)width, 1u, srcSizeDepth)
+                                       sourceSize:MTLSizeMake((NSUInteger)width,
+                                                              (NSUInteger)height,
+                                                              srcSizeDepth)
                                          toTexture:dstTexture
                                   destinationSlice:curDstSlice
                                   destinationLevel:(NSUInteger)dstLevel
                                  destinationOrigin:MTLOriginMake((NSUInteger)dstX,
-                                                                 dstRowY,
+                                                                 destinationPhysicalY,
                                                                  curDstDepth)];
+                } else {
+                    /* Metal blits preserve row order.  Copy one physical row at a
+                     * time to map matching GL rows when source and destination
+                     * storage origins differ. */
+                    for (NSUInteger row = 0; row < (NSUInteger)height; row++) {
+                        NSUInteger srcRowY = srcBottomOrigin
+                            ? (NSUInteger)srcY + row
+                            : srcLevelHeight - 1u - ((NSUInteger)srcY + row);
+                        NSUInteger dstRowY = dstBottomOrigin
+                            ? (NSUInteger)dstY + row
+                            : dstLevelHeight - 1u - ((NSUInteger)dstY + row);
+                        [blitEncoder copyFromTexture:srcTexture
+                                          sourceSlice:curSrcSlice
+                                          sourceLevel:(NSUInteger)srcLevel
+                                         sourceOrigin:MTLOriginMake((NSUInteger)srcX,
+                                                                    srcRowY,
+                                                                    curSrcDepth)
+                                           sourceSize:MTLSizeMake((NSUInteger)width, 1u, srcSizeDepth)
+                                             toTexture:dstTexture
+                                      destinationSlice:curDstSlice
+                                      destinationLevel:(NSUInteger)dstLevel
+                                     destinationOrigin:MTLOriginMake((NSUInteger)dstX,
+                                                                     dstRowY,
+                                                                     curDstDepth)];
+                    }
                 }
             }
-        }
-        [blitEncoder endEncoding];
-    } @catch (NSException *exception) {
-        @try {
             [blitEncoder endEncoding];
-        } @catch (NSException *endException) {
-            NSLog(@"MGL WARNING: mtlCopyImageSubData failed to end blit encoder: %@",
-                  endException);
+        } @catch (NSException *exception) {
+            @try {
+                [blitEncoder endEncoding];
+            } @catch (NSException *endException) {
+                NSLog(@"MGL WARNING: mtlCopyImageSubData failed to end blit encoder: %@",
+                      endException);
+            }
+            NSLog(@"MGL ERROR: mtlCopyImageSubData blit failed: %@", exception);
+            mglDispatchError(glm_ctx, __FUNCTION__, GL_INVALID_OPERATION);
+            return;
         }
-        NSLog(@"MGL ERROR: mtlCopyImageSubData blit failed: %@", exception);
-        mglDispatchError(glm_ctx, __FUNCTION__, GL_INVALID_OPERATION);
-        return;
+
     }
 
     mglInvalidateSampledCopiesForTextureLevel(dstTex, (GLuint)dstLevel);
