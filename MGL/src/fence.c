@@ -51,6 +51,27 @@ int isSync(GLMContext ctx, GLsync sync)
     return 0;
 }
 
+static uint64_t mglElapsedMonotonicNanoseconds(struct timespec start,
+                                              struct timespec end)
+{
+    time_t seconds = end.tv_sec - start.tv_sec;
+    long nanoseconds = end.tv_nsec - start.tv_nsec;
+    if (nanoseconds < 0) {
+        seconds--;
+        nanoseconds += 1000000000L;
+    }
+    if (seconds < 0) {
+        return 0u;
+    }
+
+    uint64_t sec = (uint64_t)seconds;
+    uint64_t nsec = (uint64_t)nanoseconds;
+    if (sec > (UINT64_MAX - nsec) / 1000000000ull) {
+        return UINT64_MAX;
+    }
+    return sec * 1000000000ull + nsec;
+}
+
 GLsync mglFenceSync(GLMContext ctx, GLenum condition, GLbitfield flags)
 {
     Sync *ptr;
@@ -156,13 +177,17 @@ GLenum  mglClientWaitSync(GLMContext ctx, GLsync sync, GLbitfield flags, GLuint6
      * fence does not complete in time. */
     if (ctx->mtl_funcs.mtlGetSyncStatus)
     {
-        const uint64_t poll_interval_ns = 500000; /* 0.5 ms */
-        uint64_t elapsed_ns = 0;
+        const uint64_t poll_interval_ns = 50000; /* 50 us */
+        struct timespec start_time;
+        clock_gettime(CLOCK_MONOTONIC, &start_time);
 
-        while (elapsed_ns < timeout)
+        for (;;)
         {
             if (ctx->mtl_funcs.mtlGetSyncStatus(ctx, sync) == GL_SIGNALED)
             {
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                uint64_t elapsed_ns = mglElapsedMonotonicNanoseconds(start_time, now);
                 mglTraceLogExternal("MGL TRACE ClientWaitSync sync=%u timeout=%llu result=CONDITION_SATISFIED pollNs=%llu cb=%p prior=%p",
                                     sync->name, (unsigned long long)timeout,
                                     (unsigned long long)elapsed_ns,
@@ -170,15 +195,26 @@ GLenum  mglClientWaitSync(GLMContext ctx, GLsync sync, GLbitfield flags, GLuint6
                 return GL_CONDITION_SATISFIED;
             }
 
-            struct timespec ts;
-            ts.tv_sec = 0;
-            ts.tv_nsec = (long)poll_interval_ns;
-            nanosleep(&ts, NULL);
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            uint64_t elapsed_ns = mglElapsedMonotonicNanoseconds(start_time, now);
+            if (elapsed_ns >= timeout) {
+                break;
+            }
 
-            elapsed_ns += poll_interval_ns;
+            uint64_t remaining_ns = timeout - elapsed_ns;
+            uint64_t sleep_ns = remaining_ns < poll_interval_ns
+                ? remaining_ns : poll_interval_ns;
+            struct timespec sleep_time = {
+                .tv_sec = (time_t)(sleep_ns / 1000000000ull),
+                .tv_nsec = (long)(sleep_ns % 1000000000ull)
+            };
+            nanosleep(&sleep_time, NULL);
+            /* EINTR returns to the loop so both status and the real deadline
+             * are checked again; requested sleep is never counted as elapsed. */
         }
 
-        /* Final check after the timeout has elapsed. */
+        /* Final completion check at/after the monotonic deadline. */
         if (ctx->mtl_funcs.mtlGetSyncStatus(ctx, sync) == GL_SIGNALED)
         {
             mglTraceLogExternal("MGL TRACE ClientWaitSync sync=%u timeout=%llu result=CONDITION_SATISFIED final=1 cb=%p prior=%p",
