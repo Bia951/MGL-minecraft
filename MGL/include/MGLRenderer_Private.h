@@ -285,6 +285,7 @@ static inline void mglMetalUnlock(os_unfair_lock *lock) {
     id<MTLComputePipelineState> _copyImageRowFlipPipeline;
     id<MTLBuffer> _copyImageRowFlipSourceBuffer;
     id<MTLBuffer> _copyImageRowFlipDestinationBuffer;
+    MGLPlainUniformVersion *_replayUniformVersions[_MAX_SHADER_TYPES];
     NSMutableDictionary<NSNumber *, id<MTLComputePipelineState>> *_msaaIntegerResolvePipelineCache;
     NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *_clearRectPipelineCache;
     id<MTLDepthStencilState> _clearRectDepthState;

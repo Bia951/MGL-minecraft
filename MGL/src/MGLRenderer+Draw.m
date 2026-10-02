@@ -4731,6 +4731,10 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
     }
 
     BOOL useParallelEncode = [self parallelEncodeEnabled] && (largestParallelGroup >= 2u);
+    /* Uniform versions lazily materialize transient Metal buffers. Keep that
+     * shared version ownership on sequential replay until parallel workers
+     * have independent resource materialization. */
+    if (useParallelEncode && mglUniformVersionsEnabled()) useParallelEncode = NO;
     if (useParallelEncode && traceFlush) {
         MGLTraceNSLog(@"MGL TRACE parallelEncode ENABLED groups=%u eligibleBatches=%u",
                       parallelGroupCount, largestParallelGroup);
@@ -5197,6 +5201,12 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
      * _activeState points to ctx->state (which now holds the snapshot data).
      * In Stage 5.3 this will point to a per-worker GLMState copy instead. */
     _activeState = &glm_ctx->state;
+    _replayUniformVersions[_VERTEX_SHADER] = batch->plain_uniform_version
+        ? batch->plain_uniform_version : batch->vertex_plain_uniform_version;
+    _replayUniformVersions[_FRAGMENT_SHADER] = batch->plain_uniform_version
+        ? batch->plain_uniform_version : batch->fragment_plain_uniform_version;
+    glm_ctx->trusted_replay_uniform_versions[0] = _replayUniformVersions[_VERTEX_SHADER];
+    glm_ctx->trusted_replay_uniform_versions[1] = _replayUniformVersions[_FRAGMENT_SHADER];
     glm_ctx->state.dirty_bits = 0;
 
     static const GLuint kMGLFullReplayDirtyBits =
@@ -5221,6 +5231,11 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
             a->vertex_program_name != b->vertex_program_name ||
             a->fragment_program_name != b->fragment_program_name) {
             replayDirtyBits |= DIRTY_PROGRAM | DIRTY_BUFFER_BASE_STATE | DIRTY_BUFFER;
+        }
+        if (a->mono_uniform_generation != b->mono_uniform_generation ||
+            a->vertex_uniform_generation != b->vertex_uniform_generation ||
+            a->fragment_uniform_generation != b->fragment_uniform_generation) {
+            replayDirtyBits |= DIRTY_BUFFER_BASE_STATE | DIRTY_BUFFER;
         }
         if (a->vao_name != b->vao_name ||
             a->vertex_layout_hash != b->vertex_layout_hash) {
@@ -5272,6 +5287,9 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
 {
     /* Deactivate snapshot-based state access — revert to live ctx->state. */
     _activeState = nil;
+    memset(_replayUniformVersions, 0, sizeof(_replayUniformVersions));
+    memset(glm_ctx->trusted_replay_uniform_versions, 0,
+           sizeof(glm_ctx->trusted_replay_uniform_versions));
     glm_ctx->trusted_replay_vao = NULL;
     mglResetCommandBufferForContext(glm_ctx, &glm_ctx->draw_command_buffer);
     /* Task 4: Reset the snapshot arena now that all batch replay is complete
@@ -5281,10 +5299,10 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
         mglResetBatchArena(&_batchArena);
     }
     memcpy(&glm_ctx->state, savedState, sizeof(glm_ctx->state));
-    /* Replay has fully applied all pending state to Metal encoders.
-     * Clear dirty bits so the next defer-path draw starts clean instead of
-     * inheriting the stale DIRTY_ALL from savedState. */
-    glm_ctx->state.dirty_bits = 0;
+    /* Return to live Program storage after versioned replay; maps restored
+     * from savedState may still refer to an older transient version. */
+    glm_ctx->state.dirty_bits = mglUniformVersionsEnabled()
+        ? DIRTY_BUFFER_BASE_STATE | DIRTY_BUFFER : 0;
     mglRestoreProgramPipelinePair(glm_ctx, glm_ctx->state.program_name,
                                   glm_ctx->state.var.program_pipeline_binding);
     if (savedError == GL_NO_ERROR && replayError != GL_NO_ERROR) {

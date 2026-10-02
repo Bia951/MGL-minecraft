@@ -315,10 +315,9 @@ static uint16_t mglResourceTextureTargetMask(const SpirvResource *res, int type)
     return (uint16_t)(1u << target);
 }
 
-void mglAccumulateProgramTextureTargetMasks(Program *program, int stage,
-                                          uint16_t masks[TEXTURE_UNITS])
+static void mglBuildProgramTextureTargetMasks(Program *program, int stage,
+                                             uint16_t masks[TEXTURE_UNITS])
 {
-    if (!program || stage < 0 || stage >= _MAX_SHADER_TYPES) return;
     static const int types[] = {
         SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT, SPVC_RESOURCE_TYPE_SAMPLED_IMAGE,
         SPVC_RESOURCE_TYPE_SEPARATE_IMAGE, SPVC_RESOURCE_TYPE_STORAGE_IMAGE
@@ -343,5 +342,22 @@ void mglAccumulateProgramTextureTargetMasks(Program *program, int stage,
                 if (unit >= 0 && unit < TEXTURE_UNITS) masks[unit] |= targets;
             }
         }
+    }
+}
+
+void mglAccumulateProgramTextureTargetMasks(Program *program, int stage,
+                                            uint16_t masks[TEXTURE_UNITS])
+{
+    if (!program || stage < 0 || stage >= _MAX_SHADER_TYPES) return;
+
+    if (!program->sampler_texture_target_masks_valid[stage]) {
+        uint16_t *cached = program->sampler_texture_target_masks[stage];
+        memset(cached, 0, sizeof(program->sampler_texture_target_masks[stage]));
+        mglBuildProgramTextureTargetMasks(program, stage, cached);
+        program->sampler_texture_target_masks_valid[stage] = GL_TRUE;
+    }
+
+    for (GLuint unit = 0; unit < TEXTURE_UNITS; unit++) {
+        masks[unit] |= program->sampler_texture_target_masks[stage][unit];
     }
 }

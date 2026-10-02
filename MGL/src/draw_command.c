@@ -36,6 +36,17 @@
 
 #define MGL_ARENA_INITIAL_CAPACITY  (4u * 1024u * 1024u)  /* 4 MB */
 
+int mglUniformVersionsEnabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = getenv("MGL_UNIFORM_VERSIONS");
+        /* Keep immutable replay opt-in until whole-frame measurements show a win. */
+        enabled = (value && value[0] != '\0' && strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return enabled;
+}
+
 struct MGLBatchArenaChunk {
     struct MGLBatchArenaChunk *next;
     size_t                     offset;
@@ -178,6 +189,143 @@ static void mglDestroyTransientBuffer(GLMContext ctx, Buffer *buffer)
     free(buffer);
 }
 
+void mglRetainPlainUniformVersion(MGLPlainUniformVersion *version)
+{
+    if (version && version->refcount != UINT32_MAX) {
+        version->refcount++;
+    }
+}
+
+void mglReleasePlainUniformVersion(GLMContext ctx, MGLPlainUniformVersion *version)
+{
+    if (!version || version->refcount == 0u || --version->refcount != 0u) {
+        return;
+    }
+
+    for (GLuint i = 0; i < version->buffer_count; i++) {
+        Buffer *buffer = &version->buffers[i];
+        if (ctx && ctx->mtl_funcs.release_buffer_metal_data) {
+            ctx->mtl_funcs.release_buffer_metal_data(ctx, buffer);
+        }
+    }
+    free(version->data_bytes);
+    free(version->buffers);
+    free(version);
+}
+
+void mglInvalidateProgramPlainUniformVersion(GLMContext ctx, Program *program)
+{
+    if (!program || !program->plain_uniform_current_version) {
+        return;
+    }
+
+    MGLPlainUniformVersion *version = program->plain_uniform_current_version;
+    program->plain_uniform_current_version = NULL;
+    mglReleasePlainUniformVersion(ctx, version);
+}
+
+MGLPlainUniformVersion *mglGetProgramPlainUniformVersion(GLMContext ctx,
+                                                         Program *program)
+{
+    if (!ctx || !program) {
+        return NULL;
+    }
+
+    MGLPlainUniformVersion *cached = program->plain_uniform_current_version;
+    if (cached && cached->generation == program->plain_uniform_generation) {
+        mglRetainPlainUniformVersion(cached);
+        return cached;
+    }
+    mglInvalidateProgramPlainUniformVersion(ctx, program);
+
+    MGLPlainUniformVersion *version = calloc(1, sizeof(*version));
+    if (!version) {
+        return NULL;
+    }
+    version->generation = program->plain_uniform_generation;
+    version->refcount = 1u; /* Program cache ownership. */
+
+    GLuint buffer_count = 0u;
+    size_t data_bytes_size = 0u;
+    for (GLuint slot = 0; slot < MAX_BINDABLE_BUFFERS; slot++) {
+        Buffer *source = program->plain_uniform_buffers[slot].buf;
+        if (!source) {
+            continue;
+        }
+        buffer_count++;
+
+        size_t copy_size = source->size > 0 ? (size_t)source->size : 0u;
+        if (copy_size == 0u) {
+            continue;
+        }
+        if (!source->data.buffer_data || source->data.buffer_size < copy_size ||
+            data_bytes_size > SIZE_MAX - 15u) {
+            mglReleasePlainUniformVersion(ctx, version);
+            return NULL;
+        }
+        data_bytes_size = (data_bytes_size + 15u) & ~(size_t)15u;
+        if (copy_size > SIZE_MAX - data_bytes_size) {
+            mglReleasePlainUniformVersion(ctx, version);
+            return NULL;
+        }
+        data_bytes_size += copy_size;
+    }
+    if (buffer_count > 0u) {
+        version->buffers = calloc(buffer_count, sizeof(*version->buffers));
+        if (!version->buffers) {
+            mglReleasePlainUniformVersion(ctx, version);
+            return NULL;
+        }
+    }
+    if (data_bytes_size > 0u) {
+        version->data_bytes = malloc(data_bytes_size);
+        if (!version->data_bytes) {
+            mglReleasePlainUniformVersion(ctx, version);
+            return NULL;
+        }
+    }
+
+    size_t data_offset = 0u;
+    for (GLuint slot = 0; slot < MAX_BINDABLE_BUFFERS; slot++) {
+        const BufferBaseTarget *source_binding = &program->plain_uniform_buffers[slot];
+        Buffer *source = source_binding->buf;
+        if (!source) {
+            continue;
+        }
+        Buffer *copy = &version->buffers[version->buffer_count++];
+        *copy = *source;
+        copy->name = 0u;
+        copy->data.mtl_data = NULL;
+        copy->data.buffer_data = 0;
+        copy->data.buffer_size = 0;
+        copy->data.dirty_bits = DIRTY_BUFFER_ADDR;
+        copy->mapped = GL_FALSE;
+        copy->mapped_ptr = NULL;
+        copy->transient_batch_buffer = GL_TRUE;
+        copy->last_write_src_ptr = NULL;
+        copy->last_write_src_hash = 0u;
+
+        size_t copy_size = copy->size > 0 ? (size_t)copy->size : 0u;
+        if (copy_size > 0u) {
+            data_offset = (data_offset + 15u) & ~(size_t)15u;
+            void *bytes = (uint8_t *)version->data_bytes + data_offset;
+            memcpy(bytes, (const void *)(uintptr_t)source->data.buffer_data, copy_size);
+            copy->data.buffer_data = (vm_address_t)(uintptr_t)bytes;
+            copy->data.buffer_size = copy_size;
+            data_offset += copy_size;
+        }
+
+        BufferBaseTarget *destination = &version->slots[slot];
+        *destination = *source_binding;
+        destination->buffer = 0u;
+        destination->buf = copy;
+    }
+
+    program->plain_uniform_current_version = version;
+    mglRetainPlainUniformVersion(version); /* Batch ownership. */
+    return version;
+}
+
 static void mglReleaseBatch(GLMContext ctx, MGLDrawBatch *batch)
 {
     if (!batch) return;
@@ -208,6 +356,18 @@ static void mglReleaseBatch(GLMContext ctx, MGLDrawBatch *batch)
         batch->vao_snapshot = NULL;
     }
     batch->source_vao = NULL;
+    if (batch->plain_uniform_version) {
+        mglReleasePlainUniformVersion(ctx, batch->plain_uniform_version);
+        batch->plain_uniform_version = NULL;
+    }
+    if (batch->vertex_plain_uniform_version) {
+        mglReleasePlainUniformVersion(ctx, batch->vertex_plain_uniform_version);
+        batch->vertex_plain_uniform_version = NULL;
+    }
+    if (batch->fragment_plain_uniform_version) {
+        mglReleasePlainUniformVersion(ctx, batch->fragment_plain_uniform_version);
+        batch->fragment_plain_uniform_version = NULL;
+    }
     if (batch->retained_program) {
         mglReleaseProgramReference(ctx, (Program *)batch->retained_program);
         batch->retained_program = NULL;
@@ -258,10 +418,10 @@ static Program *mglRetainBatchProgram(GLMContext ctx, MGLDrawBatch *batch, Progr
     return program;
 }
 
-static void mglRetainBatchProgramReferences(GLMContext ctx, MGLDrawBatch *batch)
+static bool mglRetainBatchProgramReferences(GLMContext ctx, MGLDrawBatch *batch)
 {
     if (!ctx || !batch) {
-        return;
+        return false;
     }
 
     (void)mglRetainBatchProgram(ctx,
@@ -271,13 +431,20 @@ static void mglRetainBatchProgramReferences(GLMContext ctx, MGLDrawBatch *batch)
                                 &batch->retained_program);
 
     if (ctx->state.program_name != 0u || !ctx->state.program_pipeline) {
-        return;
+        Program *program = (Program *)batch->retained_program;
+        if (program && mglUniformVersionsEnabled()) {
+            batch->plain_uniform_version = mglGetProgramPlainUniformVersion(ctx, program);
+            if (!batch->plain_uniform_version) return false;
+            batch->mono_uniform_generation =
+                ((MGLPlainUniformVersion *)batch->plain_uniform_version)->generation;
+        }
+        return true;
     }
 
     ProgramPipeline *pipeline = ctx->state.program_pipeline;
     if (!mglObjectPointerLooksPlausible(pipeline) ||
         !mglPointerRangeIsReadable(pipeline, sizeof(*pipeline))) {
-        return;
+        return mglUniformVersionsEnabled() ? false : true;
     }
 
     (void)mglRetainBatchProgram(ctx,
@@ -290,6 +457,24 @@ static void mglRetainBatchProgramReferences(GLMContext ctx, MGLDrawBatch *batch)
                                 pipeline->stage_programs[_FRAGMENT_SHADER],
                                 0u,
                                 &batch->retained_fragment_program);
+
+    Program *vertexProgram = (Program *)batch->retained_vertex_program;
+    if (vertexProgram && mglUniformVersionsEnabled()) {
+        batch->vertex_plain_uniform_version =
+            mglGetProgramPlainUniformVersion(ctx, vertexProgram);
+        if (!batch->vertex_plain_uniform_version) return false;
+        batch->vertex_uniform_generation =
+            ((MGLPlainUniformVersion *)batch->vertex_plain_uniform_version)->generation;
+    }
+    Program *fragmentProgram = (Program *)batch->retained_fragment_program;
+    if (fragmentProgram && mglUniformVersionsEnabled()) {
+        batch->fragment_plain_uniform_version =
+            mglGetProgramPlainUniformVersion(ctx, fragmentProgram);
+        if (!batch->fragment_plain_uniform_version) return false;
+        batch->fragment_uniform_generation =
+            ((MGLPlainUniformVersion *)batch->fragment_plain_uniform_version)->generation;
+    }
+    return true;
 }
 
 static bool mglInitializeBatchStateSnapshot(GLMContext ctx, MGLDrawBatch *batch)
@@ -331,7 +516,10 @@ static bool mglInitializeBatchStateSnapshot(GLMContext ctx, MGLDrawBatch *batch)
     MGL_PERF_ADD(g_mglSnapshotBytesAllocatedSinceSwap,
                  sizeof(GLMState) + sizeof(VertexArray));
 
-    mglRetainBatchProgramReferences(ctx, batch);
+    if (!mglRetainBatchProgramReferences(ctx, batch)) {
+        MGL_SIGNPOST_END(InitBatchSnapshot);
+        return false;
+    }
     MGL_SIGNPOST_END(InitBatchSnapshot);
     return true;
 }
@@ -1431,6 +1619,24 @@ void mglComputeStateKey(GLMContext ctx, GLenum mode, bool uses_elements, MGLStat
             ? pipeline->stage_programs[_FRAGMENT_SHADER]->name
             : 0u;
     }
+    if (mglUniformVersionsEnabled()) {
+        if (ctx->state.program_name != 0u && ctx->state.program) {
+            out->mono_uniform_generation = ctx->state.program->plain_uniform_generation;
+        } else if (out->program_pipeline_name != 0u) {
+            ProgramPipeline *pipeline = ctx->state.program_pipeline;
+            if (!pipeline || pipeline->name != out->program_pipeline_name) {
+                pipeline = (ProgramPipeline *)searchHashTable(
+                    &ctx->state.program_pipeline_table,
+                    out->program_pipeline_name);
+            }
+            if (pipeline) {
+                Program *vertex = pipeline->stage_programs[_VERTEX_SHADER];
+                Program *fragment = pipeline->stage_programs[_FRAGMENT_SHADER];
+                out->vertex_uniform_generation = vertex ? vertex->plain_uniform_generation : 0u;
+                out->fragment_uniform_generation = fragment ? fragment->plain_uniform_generation : 0u;
+            }
+        }
+    }
     out->vao_name = ctx->state.vao ? ctx->state.vao->name : 0;
     out->fbo_name = ctx->state.framebuffer ? ctx->state.framebuffer->name : 0;
 
@@ -2418,7 +2624,10 @@ static bool mglInitializeStreamMergedBatch(GLMContext ctx,
     MGL_PERF_ADD(g_mglSnapshotBytesAllocatedSinceSwap,
                  sizeof(GLMState) + sizeof(VertexArray));
 
-    mglRetainBatchProgramReferences(ctx, batch);
+    if (!mglRetainBatchProgramReferences(ctx, batch)) {
+        MGL_SIGNPOST_END(InitStreamMergedBatch);
+        return false;
+    }
     MGL_SIGNPOST_END(InitStreamMergedBatch);
     return true;
 }

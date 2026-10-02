@@ -215,6 +215,18 @@ typedef struct SpirvResourceList_t {
     SpirvResource   *list;
 } SpirvResourceList;
 
+/* Immutable CPU snapshot of the per-location buffers used by plain uniforms.
+ * The Program owns one reference while current; recorded batches retain
+ * additional references until replay teardown. */
+typedef struct MGLPlainUniformVersion_t {
+    uint64_t generation;
+    uint32_t refcount;
+    Buffer *buffers;
+    GLuint buffer_count;
+    void *data_bytes;
+    BufferBaseTarget slots[MAX_BINDABLE_BUFFERS];
+} MGLPlainUniformVersion;
+
 #define MGL_SAMPLER_UNIFORM_CACHE_CAPACITY 64u
 typedef struct MGLSamplerUniformMatch_t {
     SpirvResource *resource;
@@ -266,6 +278,11 @@ typedef struct Program_t {
     GLint sampler_units_by_stage[_MAX_SHADER_TYPES][TEXTURE_UNITS];
     GLboolean sampler_units_explicit[TEXTURE_UNITS];
     GLboolean sampler_units_explicit_by_stage[_MAX_SHADER_TYPES][TEXTURE_UNITS];
+    /* Final GL texture-target mask per sampler unit, derived from reflected
+     * resources and current sampler-unit state. Invalidated by relink or a
+     * sampler uniform update. */
+    uint16_t sampler_texture_target_masks[_MAX_SHADER_TYPES][TEXTURE_UNITS];
+    GLboolean sampler_texture_target_masks_valid[_MAX_SHADER_TYPES];
     GLboolean sampler_metal_slot_shared[TEXTURE_UNITS];
     GLboolean sampler_metal_slot_shared_valid[TEXTURE_UNITS];
     MGLSamplerUniformCacheEntry sampler_uniform_cache[MGL_SAMPLER_UNIFORM_CACHE_CAPACITY];
@@ -292,6 +309,8 @@ typedef struct Program_t {
      * renderer's bounded MSL texture type cache. */
     uint64_t msl_texture_cache_instance_id;
     uint64_t msl_texture_cache_generation;
+    uint64_t plain_uniform_generation;
+    MGLPlainUniformVersion *plain_uniform_current_version;
     GLboolean program_separable;
     /* Per-stage source slots for draw buffer dependency tracking. Resource
      * classes are UBO, plain uniform, SSBO, and atomic counter. */

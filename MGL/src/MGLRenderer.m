@@ -1560,6 +1560,17 @@ Buffer *mglRendererGetValidatedBuffer(GLMContext ctx, Buffer *candidate, const c
 
     /* Fast path: hashtable membership implies memory is valid (table holds
      * a live reference), so we can skip the vm_region_64 syscall. */
+    /* Recorded uniform versions own contiguous wrapper pools. Confirm their
+     * identity without dereferencing an untrusted candidate pointer. */
+    for (unsigned i = 0; ctx && i < 2u; i++) {
+        MGLPlainUniformVersion *version = ctx->trusted_replay_uniform_versions[i];
+        if (!version || !version->buffers) continue;
+        uintptr_t start = (uintptr_t)version->buffers;
+        uintptr_t offset = candidateAddress - start;
+        if (candidateAddress >= start &&
+            offset < (size_t)version->buffer_count * sizeof(Buffer) &&
+            offset % sizeof(Buffer) == 0u) return candidate;
+    }
     if (ctx && mglRendererPointerInHashTable(&ctx->state.buffer_table, candidate)) {
         return candidate;
     }
@@ -3644,7 +3655,8 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
 
             Program *activeProgram = mglResolveProgramForStageFromState(ctx, stage);
             if (spvc_type == SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT && activeProgram) {
-                buffers = activeProgram->plain_uniform_buffers;
+                MGLPlainUniformVersion *version = _replayUniformVersions[stage];
+                buffers = version ? version->slots : activeProgram->plain_uniform_buffers;
                 fallbackBuffers = ctx->state.buffer_base[gl_buffer_type].buffers;
             } else {
                 buffers = ctx->state.buffer_base[gl_buffer_type].buffers;

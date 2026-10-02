@@ -45,7 +45,25 @@
 static GLMContext mglUniformResolveContext(GLMContext ctx, const char *func)
 {
     GLMContext current = MGLgetCurrentContext();
-    if (!current || !mglPointerRangeIsReadable(current, sizeof(*current))) {
+    if (!current) {
+        fprintf(stderr,
+                "MGL WARNING: dropping uniform update in %s with invalid current ctx=%p arg=%p\n",
+                func ? func : "(null)",
+                (void *)current,
+                (void *)ctx);
+        return NULL;
+    }
+
+    /* The current context is a thread-local pointer installed by the context
+     * lifecycle. Unbinding clears it; destroyGLMContext clears the current
+     * context before freeing it or restores the prior TLS context when
+     * destroying a non-current one. When the API argument agrees, avoid
+     * repeating a VM-region walk for every scalar/vector uniform update. */
+    if (ctx == current) {
+        return current;
+    }
+
+    if (!mglPointerRangeIsReadable(current, sizeof(*current))) {
         fprintf(stderr,
                 "MGL WARNING: dropping uniform update in %s with invalid current ctx=%p arg=%p\n",
                 func ? func : "(null)",
@@ -1072,6 +1090,8 @@ static GLboolean mglSetSamplerUniformUnit(GLMContext ctx, GLint location, GLint 
             program->sampler_units_explicit_by_stage[match->stage][slot] = GL_TRUE;
         }
     }
+    memset(program->sampler_texture_target_masks_valid, 0,
+           sizeof(program->sampler_texture_target_masks_valid));
     if (mglTraceLogIsEnabled()) {
         MGLSamplerUniformMatch *first = &entry->matches[0];
         mglTraceLogExternal("SAMPLER_UNIFORM_SET program=%u location=%d unit=%d firstStage=%d firstBinding=%u firstName=%s resources=%u",
@@ -2093,20 +2113,9 @@ static void mglUniformCore(GLMContext ctx, GLint location, void *ptr,
         return;
     }
 
-    /*
-     * Deferred batches replay against live Program-owned uniform storage
-     * (the state snapshot only captures buffer binding pointers, not
-     * contents), and delta replay skips rebinding uniform buffers when
-     * consecutive batch keys match.  Both mechanisms are only correct if
-     * all pending draws are replayed BEFORE this mutation lands:
-     * otherwise a draw recorded before the glUniform* call replays with
-     * the new bytes (GL ordering violation), and a same-key draw recorded
-     * after it keeps the encoder bound to the previous MTLBuffer.  Flush
-     * unconditionally whenever the bytes actually change — this also
-     * resets the replay delta chain.  Identical uploads still return
-     * early above, preserving the hot-path optimization.
-     */
-    mglFlushPendingDraws(ctx);
+    /* Versioned replay owns immutable uniform bytes. Legacy replay still
+     * needs to execute old draws before changing Program-owned storage. */
+    if (!mglUniformVersionsEnabled()) mglFlushPendingDraws(ctx);
 
     bool bindingLayoutChanged = (buf == NULL || uniformSlot->size != size);
 
@@ -2123,10 +2132,16 @@ static void mglUniformCore(GLMContext ctx, GLint location, void *ptr,
         return;
     }
 
-    initBufferData(ctx, buf, size, ptr, true);
+    kern_return_t uploadResult = initBufferData(ctx, buf, size, ptr, true);
+    if (uploadResult != KERN_SUCCESS) {
+        return;
+    }
     uniformSlot->buffer = buf->name;
     uniformSlot->offset = 0;
     uniformSlot->size = size;
+
+    mglInvalidateProgramPlainUniformVersion(ctx, program);
+    program->plain_uniform_generation++;
 
     ctx->state.dirty_bits |= bindingLayoutChanged
         ? DIRTY_BUFFER_BASE_STATE

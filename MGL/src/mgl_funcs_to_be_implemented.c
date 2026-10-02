@@ -2357,6 +2357,9 @@ void mglCopyImageSubData(GLMContext ctx, GLuint srcName, GLenum srcTarget, GLint
 		return;
 	}
 
+	/* Copy must follow pending source writes and precede destination reads. */
+	mglFlushPendingDraws(ctx);
+
 	// Use Metal blit to copy texture regions
 	ctx->mtl_funcs.mtlCopyImageSubData(ctx, srcTex, srcLevel, srcX, srcY, srcZ,
 	                                    dstTex, dstLevel, dstX, dstY, dstZ,

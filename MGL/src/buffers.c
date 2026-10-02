@@ -1694,7 +1694,10 @@ kern_return_t initBufferData(GLMContext ctx, Buffer *ptr, GLsizeiptr size, const
         return 0;
     }
 
-    mglFlushPendingDrawsForBuffer(ctx, ptr);
+    /* Program-owned plain uniforms are preserved by draw versions (or by
+     * the legacy uniform caller's explicit flush). General GL buffers still
+     * need the buffer mutation hazard boundary. */
+    if (!isUniformConstant) mglFlushPendingDrawsForBuffer(ctx, ptr);
 
     /* MGL_SYNC_STRICT: 强制 full flush + commit + waitUntilCompleted，用于排查回归 */
     if (ctx->sync_strict) {

@@ -2828,6 +2828,9 @@ void mglBlitFramebuffer(GLMContext ctx, GLint srcX0, GLint srcY0, GLint srcX1, G
             }
         }
     }
+    /* Deferred source draws must execute before shadow/GPU blit reads, and
+     * pending destination reads must execute before it is overwritten. */
+    if (mask != 0u) mglFlushPendingDraws(ctx);
     if (mask & GL_STENCIL_BUFFER_BIT) {
         mglBlitStencilShadow(ctx, srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1);
     }

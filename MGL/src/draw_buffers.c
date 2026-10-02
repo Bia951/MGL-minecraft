@@ -239,6 +239,7 @@ static void mglDropCurrentVAO(GLMContext ctx)
 static VertexArray *mglGetSafeCurrentVAO(GLMContext ctx, const char *caller)
 {
     VertexArray *vao;
+    bool tableMember;
 
     if (!ctx)
         return NULL;
@@ -247,9 +248,22 @@ static VertexArray *mglGetSafeCurrentVAO(GLMContext ctx, const char *caller)
     if (!vao)
         return NULL;
 
-    if (!mglObjectPointerLooksPlausible(vao) ||
-        !mglHashTableContainsData(&STATE(vao_table), vao) ||
-        !mglPointerRangeIsReadable(vao, sizeof(*vao)))
+    if (!mglObjectPointerLooksPlausible(vao))
+    {
+        static uint64_t invalid_vao_count = 0;
+        if (should_log_throttled(&invalid_vao_count, 8, 1000)) {
+            fprintf(stderr,
+                    "MGL WARNING: %s: dropping invalid current VAO pointer %p\n",
+                    caller ? caller : "draw",
+                    (void *)vao);
+        }
+        mglDropCurrentVAO(ctx);
+        return NULL;
+    }
+
+    /* A table member is still owned by vao_table, so its allocation is live. */
+    tableMember = mglHashTableContainsData(&STATE(vao_table), vao);
+    if (!tableMember)
     {
         static uint64_t invalid_vao_count = 0;
         if (should_log_throttled(&invalid_vao_count, 8, 1000)) {
@@ -447,9 +461,11 @@ bool validate_program(GLMContext ctx)
 
     if (program) {
         GLuint expectedName = 0u;
-        GLboolean pointerReadable =
-            mglObjectPointerLooksPlausible(program) &&
-            mglPointerRangeIsReadable(program, sizeof(*program));
+        GLboolean pointerPlausible = mglObjectPointerLooksPlausible(program);
+        GLboolean tableMember = pointerPlausible &&
+            mglHashTableContainsData(&STATE(program_table), program);
+        GLboolean pointerReadable = tableMember ||
+            (pointerPlausible && mglPointerRangeIsReadable(program, sizeof(*program)));
         if (pointerReadable) {
             expectedName = ctx->state.program_name ? ctx->state.program_name : program->name;
         }

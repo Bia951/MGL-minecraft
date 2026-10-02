@@ -42,6 +42,7 @@
 #include "mgl_metal_ref.h"
 #include "mgl_uniform_reflection.h"
 #include "mgl_spirv_compile.h"
+#include "draw_command.h"
 
 
 static _Atomic uint64_t mglNextMSLTextureCacheInstanceID = 1u;
@@ -319,6 +320,7 @@ void mglFreeProgram(GLMContext ctx, Program *ptr)
      * program.  The real glslang_program_t is deleted at the end of
      * mglLinkProgram.  Do NOT call glslang_program_delete here — it would
      * dereference the marker as if it were a glslang object. */
+    mglInvalidateProgramPlainUniformVersion(ctx, ptr);
     ptr->linked_glsl_program = NULL;
 
     mglClearSamplerUniformCache(ptr);
@@ -864,6 +866,9 @@ void mglLinkProgram(GLMContext ctx, GLuint program)
 
     mglFlushPendingDraws(ctx);
 
+    mglInvalidateProgramPlainUniformVersion(ctx, pptr);
+    pptr->plain_uniform_generation++;
+
     /* Cached sampler locations hold pointers into reflection lists. Drop them
      * before relinking can replace those lists, including failed relinks. */
     mglClearSamplerUniformCache(pptr);
@@ -876,6 +881,8 @@ void mglLinkProgram(GLMContext ctx, GLuint program)
     pptr->usesFragCoordParams = GL_FALSE;
     pptr->vertexAttribUsageMask = 0u;
     pptr->pointSizeStageUsageMask = 0u;
+    memset(pptr->sampler_texture_target_masks_valid, 0,
+           sizeof(pptr->sampler_texture_target_masks_valid));
     memset(pptr->draw_buffer_slot_masks_valid, 0,
            sizeof(pptr->draw_buffer_slot_masks_valid));
     memset(pptr->msl_named_argument_cache, 0, sizeof(pptr->msl_named_argument_cache));

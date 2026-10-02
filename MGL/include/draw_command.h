@@ -31,6 +31,8 @@ extern "C" {
 
 struct GLMContextRec_t;
 typedef struct GLMContextRec_t *GLMContext;
+struct Program_t;
+struct MGLPlainUniformVersion_t;
 
 #define MGL_MAX_DRAWS_PER_BATCH   4096
 #define MGL_MAX_BATCHES           128
@@ -102,6 +104,9 @@ typedef struct {
     uint64_t texture_hash;
     uint64_t render_state_hash;
     uint64_t vertex_layout_hash;
+    uint64_t mono_uniform_generation;
+    uint64_t vertex_uniform_generation;
+    uint64_t fragment_uniform_generation;
 } MGLStateKey;
 
 typedef struct {
@@ -115,6 +120,12 @@ typedef struct {
     void           *retained_program;
     void           *retained_vertex_program;
     void           *retained_fragment_program;
+    struct MGLPlainUniformVersion_t *plain_uniform_version;
+    struct MGLPlainUniformVersion_t *vertex_plain_uniform_version;
+    struct MGLPlainUniformVersion_t *fragment_plain_uniform_version;
+    uint64_t        mono_uniform_generation;
+    uint64_t        vertex_uniform_generation;
+    uint64_t        fragment_uniform_generation;
     void           *stream_vertex_buffer;
     void           *stream_index_buffer;
     size_t          stream_vertex_bytes;
@@ -176,6 +187,18 @@ void mglFlushPendingDrawsForVertexArray(GLMContext ctx, void *vao);
 void mglFlushPendingDrawsForTexture(GLMContext ctx, void *texture);
 void mglFlushPendingDrawsBeforeTextureWrite(GLMContext ctx, void *texture);
 void mglFlushPendingDrawsForActiveTextures(GLMContext ctx);
+
+/* Immutable per-Program plain-uniform snapshots used by deferred draw replay.
+ * get() returns a batch-owned reference, creating a Program-cached version
+ * lazily when needed. */
+struct MGLPlainUniformVersion_t *mglGetProgramPlainUniformVersion(
+    GLMContext ctx, struct Program_t *program);
+void mglRetainPlainUniformVersion(struct MGLPlainUniformVersion_t *version);
+void mglReleasePlainUniformVersion(GLMContext ctx,
+                                   struct MGLPlainUniformVersion_t *version);
+void mglInvalidateProgramPlainUniformVersion(
+    GLMContext ctx, struct Program_t *program);
+int mglUniformVersionsEnabled(void);
 
 /* MGL_BIND_NO_FLUSH (default ON; =0 off): pure texture/buffer rebinds skip
  * unconditional full flush; content mutation paths still flush. */
