@@ -845,8 +845,7 @@ void mglBindFramebuffer(GLMContext ctx, GLenum target, GLuint framebuffer)
     VertexArray *currentVAO = ctx->state.vao;
     if (currentVAO &&
         (!mglObjectPointerLooksPlausible(currentVAO) ||
-         !mglHashTableContainsData(&ctx->state.vao_table, currentVAO) ||
-         !mglPointerRangeIsReadable(currentVAO, sizeof(*currentVAO))))
+         !mglHashTableContainsData(&ctx->state.vao_table, currentVAO)))
     {
         fprintf(stderr, "MGL WARNING: VAO pointer polluted before BindFramebuffer: vao=%p not in sane VAO table, resetting\n",
                 (void *)currentVAO);
@@ -918,7 +917,7 @@ void mglBindFramebuffer(GLMContext ctx, GLenum target, GLuint framebuffer)
         mglNormalizeReadBufferForFramebufferBinding(ctx, ptr);
     }
 
-    if (drawTargetChanged || readTargetChanged)
+    if ((drawTargetChanged || readTargetChanged) && mglTraceLogIsEnabled())
     {
         static uint64_t s_fbindTraceCount = 0;
         uint64_t hit = ++s_fbindTraceCount;
@@ -2754,24 +2753,26 @@ void mglGetNamedFramebufferAttachmentParameteriv(GLMContext ctx, GLuint framebuf
 
 void mglBlitFramebuffer(GLMContext ctx, GLint srcX0, GLint srcY0, GLint srcX1, GLint srcY1, GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1, GLbitfield mask, GLenum filter)
 {
-    static uint64_t s_blitTraceCount = 0;
-    uint64_t blitHit = ++s_blitTraceCount;
-    if (blitHit <= 128ull ||
-        (mask & (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)) != 0u ||
-        (blitHit % 512ull) == 0ull) {
-        Framebuffer *drawFbo = ctx ? ctx->state.framebuffer : NULL;
-        Framebuffer *readFbo = ctx ? ctx->state.readbuffer : NULL;
-        mglTraceLogExternal("BLIT_FRAMEBUFFER call=%llu src=(%d,%d)-(%d,%d) dst=(%d,%d)-(%d,%d) mask=0x%x filter=0x%x drawFbo=%u readFbo=%u drawBuf=0x%x readBuf=0x%x depthStencil=%d",
-                            (unsigned long long)blitHit,
-                            srcX0, srcY0, srcX1, srcY1,
-                            dstX0, dstY0, dstX1, dstY1,
-                            (unsigned)mask,
-                            (unsigned)filter,
-                            (unsigned)mglTraceSafeFramebufferName(ctx, drawFbo),
-                            (unsigned)mglTraceSafeFramebufferName(ctx, readFbo),
-                            (unsigned)(ctx ? ctx->state.draw_buffer : 0u),
-                            (unsigned)(ctx ? ctx->state.read_buffer : 0u),
-                            (mask & (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)) != 0u ? 1 : 0);
+    if (mglTraceLogIsEnabled()) {
+        static uint64_t s_blitTraceCount = 0;
+        uint64_t blitHit = ++s_blitTraceCount;
+        if (blitHit <= 128ull ||
+            (mask & (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)) != 0u ||
+            (blitHit % 512ull) == 0ull) {
+            Framebuffer *drawFbo = ctx ? ctx->state.framebuffer : NULL;
+            Framebuffer *readFbo = ctx ? ctx->state.readbuffer : NULL;
+            mglTraceLogExternal("BLIT_FRAMEBUFFER call=%llu src=(%d,%d)-(%d,%d) dst=(%d,%d)-(%d,%d) mask=0x%x filter=0x%x drawFbo=%u readFbo=%u drawBuf=0x%x readBuf=0x%x depthStencil=%d",
+                                (unsigned long long)blitHit,
+                                srcX0, srcY0, srcX1, srcY1,
+                                dstX0, dstY0, dstX1, dstY1,
+                                (unsigned)mask,
+                                (unsigned)filter,
+                                (unsigned)mglTraceSafeFramebufferName(ctx, drawFbo),
+                                (unsigned)mglTraceSafeFramebufferName(ctx, readFbo),
+                                (unsigned)(ctx ? ctx->state.draw_buffer : 0u),
+                                (unsigned)(ctx ? ctx->state.read_buffer : 0u),
+                                (mask & (GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT)) != 0u ? 1 : 0);
+        }
     }
 
     if (MGL_VERBOSE_FBO_LOGS) {
