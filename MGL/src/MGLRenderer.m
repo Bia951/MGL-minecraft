@@ -2334,34 +2334,47 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
         }
     }
     [encoder endEncoding];
-    id<MTLTexture> direct = (__bridge id<MTLTexture>)object->mtl_depth_read_data[0];
-    if (direct && (object->mtl_depth_read_requested_mask & 1u) != 0u &&
-        source.textureType == MTLTextureType2D &&
+    unsigned captureOrientation = (object->mtl_depth_read_requested_mask & 1u) ? 0u : 1u;
+    id<MTLTexture> sampled = (__bridge id<MTLTexture>)object->mtl_depth_read_data[captureOrientation];
+    const char *captureDirectory = getenv("MGL_CAPTURE_ATTACHMENTS_DIR");
+    BOOL captureFrame = captureDirectory && _dontCareFrameGeneration >= 180u && _dontCareFrameGeneration <= 181u;
+    if (sampled && source.textureType == MTLTextureType2D &&
         mglEnvFlagEnabled("MGL_CAPTURE_DEPTH_READ") && source.pixelFormat == MTLPixelFormatDepth32Float &&
-        object->mtl_render_target_write_version >= 500u) {
+        (captureFrame || (!captureDirectory && object->mtl_render_target_write_version >= 500u))) {
         static GLuint captured[32]; static unsigned count;
         bool seen = false;
         for (unsigned i=0;i<count;i++) if (captured[i]==object->name) seen=true;
-        if (!seen && count<32) {
-            captured[count++]=object->name;
+        if (captureFrame || (!seen && count<32)) {
+            if (!seen && count<32) captured[count++]=object->name;
             NSUInteger width=source.width,height=source.height,pitch=(width*sizeof(float)+255u)&~255u;
             id<MTLBuffer> original=[_device newBufferWithLength:pitch*height options:MTLResourceStorageModeShared];
             id<MTLBuffer> converted=[_device newBufferWithLength:pitch*height options:MTLResourceStorageModeShared];
             id<MTLBlitCommandEncoder> capture=[_currentCommandBuffer blitCommandEncoder];
-            for (unsigned i=0;i<2;i++) [capture copyFromTexture:i?direct:source sourceSlice:0 sourceLevel:0
+            for (unsigned i=0;i<2;i++) [capture copyFromTexture:i?sampled:source sourceSlice:0 sourceLevel:0
                 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(width,height,1) toBuffer:i?converted:original
                 destinationOffset:0 destinationBytesPerRow:pitch destinationBytesPerImage:pitch*height];
             [capture endEncoding];
-            GLuint name=object->name;
+            GLuint name=object->name, version=object->mtl_render_target_write_version;
+            NSString *directory = captureFrame ? [NSString stringWithUTF8String:captureDirectory] : nil;
             [_currentCommandBuffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
                 if(cb.status!=MTLCommandBufferStatusCompleted)return;
                 float minimum=1,maximum=0,error=0; NSUInteger filled=0;
                 for(NSUInteger y=0;y<height;y++) {
-                    float *a=(float *)((uint8_t *)original.contents+y*pitch);
+                    NSUInteger sourceY = captureOrientation ? height - 1u - y : y;
+                    float *a=(float *)((uint8_t *)original.contents+sourceY*pitch);
                     float *b=(float *)((uint8_t *)converted.contents+y*pitch);
                     for(NSUInteger x=0;x<width;x++) { minimum=fminf(minimum,b[x]);maximum=fmaxf(maximum,b[x]);error=fmaxf(error,fabsf(a[x]-b[x]));filled+=b[x]<1; }
                 }
-                NSLog(@"MGL DEPTH READ VERIFY texture=%u min=%g max=%g populated=%lu/%lu error=%g",name,minimum,maximum,(unsigned long)filled,(unsigned long)(width*height),error);
+                NSLog(@"MGL DEPTH READ VERIFY texture=%u orientation=%u version=%u min=%g max=%g populated=%lu/%lu error=%g",name,captureOrientation,version,minimum,maximum,(unsigned long)filled,(unsigned long)(width*height),error);
+                if (directory) {
+                    for (unsigned i=0; i<2; i++) {
+                        id<MTLBuffer> buffer = i ? converted : original;
+                        NSMutableData *data=[NSMutableData dataWithLength:width*height*sizeof(float)];
+                        for(NSUInteger y=0;y<height;y++) memcpy((uint8_t *)data.mutableBytes+y*width*sizeof(float), (uint8_t *)buffer.contents+y*pitch, width*sizeof(float));
+                        NSString *path=[NSString stringWithFormat:@"%@/mgl-depth-%u-%u-%s-o%u-%lux%lu.raw",directory,name,version,i?"sampled":"native",captureOrientation,(unsigned long)width,(unsigned long)height];
+                        [data writeToFile:path atomically:YES];
+                    }
+                }
             }];
         }
     }

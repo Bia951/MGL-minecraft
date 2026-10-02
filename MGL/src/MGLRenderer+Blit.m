@@ -3929,6 +3929,10 @@ typedef struct MGLBlitColorState {
      * and fall back to per-level authoritative instead. */
     bool readbackDone = false;
     bool skip3DReadback = MGLCapabilityHasBug(&_capability, MGL_BUG_3D_GETBYTES_SLICE_OOB);
+    NSUInteger dstLevelHeight = MAX((NSUInteger)1u,
+                                    dstTexture.height >> (NSUInteger)dstLevel);
+    BOOL dstBottomOrigin = NO;
+    NSUInteger dstPhysicalY = 0u;
     if ((!skip3DReadback || dstType != MTLTextureType3D) &&
         dstTexture.storageMode != MTLStorageModePrivate &&
         dstTex->faces && (NSUInteger)dstLevel < dstTex->num_levels) {
@@ -3943,6 +3947,11 @@ typedef struct MGLBlitColorState {
                 [self synchronizeRenderPassForTextureReadback:dstTexture
                                                        reason:"copyImageSubData.blitReadback"];
                 [self flushCommandBuffer: YES];
+                dstBottomOrigin = !dstTex->is_render_target ||
+                    mglRTWriteAuthorityIsCurrentAndUsesOriginal(dstTex);
+                dstPhysicalY = dstBottomOrigin
+                    ? (NSUInteger)dstY
+                    : dstLevelHeight - ((NSUInteger)dstY + (NSUInteger)height);
 
                 NSUInteger copyWidth = MAX((NSUInteger)width, 1u);
                 NSUInteger copyHeight = MAX((NSUInteger)height, 1u);
@@ -3963,19 +3972,19 @@ typedef struct MGLBlitColorState {
                             dstMtlSlice = ((NSUInteger)dstZ + s) % 6;
                             dstFace = (GLuint)dstMtlSlice;
                             dstRegion = MTLRegionMake2D((NSUInteger)dstX,
-                                                        (NSUInteger)dstY,
+                                                        dstPhysicalY,
                                                         copyWidth, copyHeight);
                         } else if (dstType == MTLTextureType2DArray) {
                             dstMtlSlice = (NSUInteger)dstZ + s;
                             dstFace = 0;
                             dstRegion = MTLRegionMake2D((NSUInteger)dstX,
-                                                        (NSUInteger)dstY,
+                                                        dstPhysicalY,
                                                         copyWidth, copyHeight);
                         } else {
                             dstMtlSlice = 0;
                             dstFace = 0;
                             dstRegion = MTLRegionMake2D((NSUInteger)dstX,
-                                                        (NSUInteger)dstY,
+                                                        dstPhysicalY,
                                                         copyWidth, copyHeight);
                         }
 
@@ -4008,8 +4017,9 @@ typedef struct MGLBlitColorState {
                                     dstSliceOff = ((NSUInteger)dstZ + s) * slicePitch;
                                 }
                                 for (NSUInteger y = 0; y < copyHeight; y++) {
+                                    NSUInteger cpuRow = dstBottomOrigin ? y : copyHeight - 1u - y;
                                     size_t dstOff = dstSliceOff +
-                                        ((NSUInteger)dstY + y) * curDstLvl->pitch +
+                                        ((NSUInteger)dstY + cpuRow) * curDstLvl->pitch +
                                         (NSUInteger)dstX * dstMetalBpp;
                                     if (dstOff + rowBytes <= curDstLvl->data_size) {
                                         memcpy((uint8_t *)(uintptr_t)curDstLvl->data + dstOff,
@@ -4059,6 +4069,11 @@ typedef struct MGLBlitColorState {
                     [self synchronizeRenderPassForTextureReadback:dstTexture
                                                            reason:"copyImageSubData.fmtConvReadback"];
                     [self flushCommandBuffer: YES];
+                    dstBottomOrigin = !dstTex->is_render_target ||
+                        mglRTWriteAuthorityIsCurrentAndUsesOriginal(dstTex);
+                    dstPhysicalY = dstBottomOrigin
+                        ? (NSUInteger)dstY
+                        : dstLevelHeight - ((NSUInteger)dstY + (NSUInteger)height);
 
                     NSUInteger copyWidth = MAX((NSUInteger)width, 1u);
                     NSUInteger copyHeight = MAX((NSUInteger)height, 1u);
@@ -4078,17 +4093,17 @@ typedef struct MGLBlitColorState {
                                 dstType == MTLTextureTypeCubeArray) {
                                 dstMtlSlice = ((NSUInteger)dstZ + s) % 6;
                                 dstRegion = MTLRegionMake2D((NSUInteger)dstX,
-                                                            (NSUInteger)dstY,
+                                                            dstPhysicalY,
                                                             copyWidth, copyHeight);
                             } else if (dstType == MTLTextureType2DArray) {
                                 dstMtlSlice = (NSUInteger)dstZ + s;
                                 dstRegion = MTLRegionMake2D((NSUInteger)dstX,
-                                                            (NSUInteger)dstY,
+                                                            dstPhysicalY,
                                                             copyWidth, copyHeight);
                             } else {
                                 dstMtlSlice = 0;
                                 dstRegion = MTLRegionMake2D((NSUInteger)dstX,
-                                                            (NSUInteger)dstY,
+                                                            dstPhysicalY,
                                                             copyWidth, copyHeight);
                             }
 
@@ -4141,8 +4156,9 @@ typedef struct MGLBlitColorState {
                                         dstSliceOff = ((NSUInteger)dstZ + s) * slicePitch;
                                     }
                                     for (NSUInteger y = 0; y < copyHeight; y++) {
+                                        NSUInteger cpuRow = dstBottomOrigin ? y : copyHeight - 1u - y;
                                         size_t dstOff = dstSliceOff +
-                                            ((NSUInteger)dstY + y) * curDstLvl->pitch +
+                                            ((NSUInteger)dstY + cpuRow) * curDstLvl->pitch +
                                             (NSUInteger)dstX * cpuBpp;
                                         if (dstOff + cpuRowBytes <= curDstLvl->data_size) {
                                             memcpy((uint8_t *)(uintptr_t)curDstLvl->data + dstOff,
@@ -4318,6 +4334,53 @@ typedef struct MGLBlitColorState {
         [self endRenderEncoding];
     }
 
+    /* Resolve origins after pending render-pass clears have been recorded.
+     * CopyImageSubData coordinates name GL texel rows.  RTs can use either
+     * GL-bottom-origin storage or Metal-top-origin storage; ordinary textures
+     * are stored in GL-bottom-origin order. */
+    BOOL srcBottomOrigin = !srcTex->is_render_target ||
+        mglRTWriteAuthorityIsCurrentAndUsesOriginal(srcTex);
+    BOOL dstBottomOrigin = !dstTex->is_render_target ||
+        mglRTWriteAuthorityIsCurrentAndUsesOriginal(dstTex);
+    NSUInteger srcLevelHeight = MAX((NSUInteger)1u, srcTexture.height >> (NSUInteger)srcLevel);
+    NSUInteger dstLevelHeight = MAX((NSUInteger)1u, dstTexture.height >> (NSUInteger)dstLevel);
+    NSUInteger sourcePhysicalY = srcBottomOrigin
+        ? (NSUInteger)srcY
+        : srcLevelHeight - ((NSUInteger)srcY + (NSUInteger)height);
+    NSUInteger destinationPhysicalY = dstBottomOrigin
+        ? (NSUInteger)dstY
+        : dstLevelHeight - ((NSUInteger)dstY + (NSUInteger)height);
+
+    if (mglEnvFlagEnabled("MGL_CAPTURE_DEPTH_READ") &&
+        (mglMetalPixelFormatHasDepth(srcTexture.pixelFormat) ||
+         mglMetalPixelFormatHasDepth(dstTexture.pixelFormat))) {
+        static unsigned s_depthCopyTraceCount = 0;
+        if (s_depthCopyTraceCount < 16u) {
+            s_depthCopyTraceCount++;
+            NSLog(@"MGL DEPTH COPYIMAGE trace=%u src=%u dst=%u srcOrigin=%@ dstOrigin=%@ srcRT=%d dstRT=%d srcAuth=0x%x dstAuth=0x%x srcVer=%u dstVer=%u srcLevel=%d dstLevel=%d srcGLY=%d dstGLY=%d srcPhysicalY=%lu dstPhysicalY=%lu width=%d height=%d depth=%d",
+                  s_depthCopyTraceCount,
+                  (unsigned)srcTex->name,
+                  (unsigned)dstTex->name,
+                  srcBottomOrigin ? @"GL-bottom" : @"Metal-top",
+                  dstBottomOrigin ? @"GL-bottom" : @"Metal-top",
+                  srcTex->is_render_target ? 1 : 0,
+                  dstTex->is_render_target ? 1 : 0,
+                  (unsigned)srcTex->mtl_render_yflip_authority,
+                  (unsigned)dstTex->mtl_render_yflip_authority,
+                  (unsigned)srcTex->mtl_render_target_write_version,
+                  (unsigned)dstTex->mtl_render_target_write_version,
+                  (int)srcLevel,
+                  (int)dstLevel,
+                  (int)srcY,
+                  (int)dstY,
+                  (unsigned long)sourcePhysicalY,
+                  (unsigned long)destinationPhysicalY,
+                  (int)width,
+                  (int)height,
+                  (int)depth);
+        }
+    }
+
     id<MTLBlitCommandEncoder> blitEncoder = [_currentCommandBuffer blitCommandEncoder];
     if (!blitEncoder) {
         NSLog(@"MGL ERROR: mtlCopyImageSubData failed to create blit encoder");
@@ -4349,21 +4412,48 @@ typedef struct MGLBlitColorState {
             }
             /* For 3D → 3D, single blit with srcSizeDepth = copyDepth */
 
-            [blitEncoder copyFromTexture:srcTexture
-                              sourceSlice:curSrcSlice
-                              sourceLevel:(NSUInteger)srcLevel
-                             sourceOrigin:MTLOriginMake((NSUInteger)srcX,
-                                                        (NSUInteger)srcY,
-                                                        curSrcDepth)
-                               sourceSize:MTLSizeMake((NSUInteger)width,
-                                                      (NSUInteger)height,
-                                                      srcSizeDepth)
-                                 toTexture:dstTexture
-                          destinationSlice:curDstSlice
-                          destinationLevel:(NSUInteger)dstLevel
-                         destinationOrigin:MTLOriginMake((NSUInteger)dstX,
-                                                         (NSUInteger)dstY,
-                                                         curDstDepth)];
+            if (srcBottomOrigin == dstBottomOrigin) {
+                [blitEncoder copyFromTexture:srcTexture
+                                  sourceSlice:curSrcSlice
+                                  sourceLevel:(NSUInteger)srcLevel
+                                 sourceOrigin:MTLOriginMake((NSUInteger)srcX,
+                                                            sourcePhysicalY,
+                                                            curSrcDepth)
+                                   sourceSize:MTLSizeMake((NSUInteger)width,
+                                                          (NSUInteger)height,
+                                                          srcSizeDepth)
+                                     toTexture:dstTexture
+                              destinationSlice:curDstSlice
+                              destinationLevel:(NSUInteger)dstLevel
+                             destinationOrigin:MTLOriginMake((NSUInteger)dstX,
+                                                             destinationPhysicalY,
+                                                             curDstDepth)];
+            } else {
+                /* Metal blits preserve row order.  Copy one physical row at a
+                 * time to map matching GL rows when source and destination
+                 * storage origins differ. */
+                for (NSUInteger row = 0; row < (NSUInteger)height; row++) {
+                    NSUInteger srcRowY = srcBottomOrigin
+                        ? (NSUInteger)srcY + row
+                        : srcLevelHeight - 1u - ((NSUInteger)srcY + row);
+                    NSUInteger dstRowY = dstBottomOrigin
+                        ? (NSUInteger)dstY + row
+                        : dstLevelHeight - 1u - ((NSUInteger)dstY + row);
+                    [blitEncoder copyFromTexture:srcTexture
+                                      sourceSlice:curSrcSlice
+                                      sourceLevel:(NSUInteger)srcLevel
+                                     sourceOrigin:MTLOriginMake((NSUInteger)srcX,
+                                                                srcRowY,
+                                                                curSrcDepth)
+                                       sourceSize:MTLSizeMake((NSUInteger)width, 1u, srcSizeDepth)
+                                         toTexture:dstTexture
+                                  destinationSlice:curDstSlice
+                                  destinationLevel:(NSUInteger)dstLevel
+                                 destinationOrigin:MTLOriginMake((NSUInteger)dstX,
+                                                                 dstRowY,
+                                                                 curDstDepth)];
+                }
+            }
         }
         [blitEncoder endEncoding];
     } @catch (NSException *exception) {
