@@ -4427,13 +4427,14 @@ typedef struct MGLBlitColorState {
         ? (NSUInteger)dstY
         : dstLevelHeight - ((NSUInteger)dstY + (NSUInteger)height);
 
-    if (mglEnvFlagEnabled("MGL_CAPTURE_DEPTH_READ") &&
-        (mglMetalPixelFormatHasDepth(srcTexture.pixelFormat) ||
-         mglMetalPixelFormatHasDepth(dstTexture.pixelFormat))) {
+    if (mglEnvFlagEnabled("MGL_TRACE_COPYIMAGE") ||
+        (mglEnvFlagEnabled("MGL_CAPTURE_DEPTH_READ") &&
+         (mglMetalPixelFormatHasDepth(srcTexture.pixelFormat) ||
+          mglMetalPixelFormatHasDepth(dstTexture.pixelFormat)))) {
         static unsigned s_depthCopyTraceCount = 0;
         if (s_depthCopyTraceCount < 16u) {
             s_depthCopyTraceCount++;
-            NSLog(@"MGL DEPTH COPYIMAGE trace=%u src=%u dst=%u srcOrigin=%@ dstOrigin=%@ srcRT=%d dstRT=%d srcAuth=0x%x dstAuth=0x%x srcVer=%u dstVer=%u srcLevel=%d dstLevel=%d srcGLY=%d dstGLY=%d srcPhysicalY=%lu dstPhysicalY=%lu width=%d height=%d depth=%d",
+            NSLog(@"MGL COPYIMAGE trace=%u src=%u dst=%u srcOrigin=%@ dstOrigin=%@ srcRT=%d dstRT=%d srcAuth=0x%x dstAuth=0x%x srcVer=%u dstVer=%u srcLevel=%d dstLevel=%d srcGLY=%d dstGLY=%d srcPhysicalY=%lu dstPhysicalY=%lu width=%d height=%d depth=%d",
                   s_depthCopyTraceCount,
                   (unsigned)srcTex->name,
                   (unsigned)dstTex->name,
@@ -4546,10 +4547,9 @@ typedef struct MGLBlitColorState {
 
     mglInvalidateSampledCopiesForTextureLevel(dstTex, (GLuint)dstLevel);
 
-    /* Flush the command buffer to ensure the blit is executed before any
-     * subsequent readback (e.g. glGetTexImage).  Without this, the blit
-     * may still be pending in the command buffer when the readback occurs. */
-    [self flushCommandBuffer: NO];
+    /* Keep GPU copies in order on the current command buffer. CPU readback
+     * below synchronizes and waits when it actually needs the copied bytes;
+     * a GPU-only destination does not require a separate submission here. */
 
     bool readbackDone = [self copyImageSubDataPostBlitReadback:dstTex
                                                         dstTexture:dstTexture

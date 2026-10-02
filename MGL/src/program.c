@@ -46,6 +46,24 @@
 
 static _Atomic uint64_t mglNextMSLTextureCacheInstanceID = 1u;
 
+static void mglClearSamplerUniformCache(Program *program)
+{
+    if (!program) {
+        return;
+    }
+
+    for (GLuint i = 0; i < MGL_SAMPLER_UNIFORM_CACHE_CAPACITY; i++) {
+        free(program->sampler_uniform_cache[i].matches);
+        memset(&program->sampler_uniform_cache[i], 0,
+               sizeof(program->sampler_uniform_cache[i]));
+    }
+    program->sampler_uniform_cache_next = 0u;
+    memset(program->sampler_metal_slot_shared, 0,
+           sizeof(program->sampler_metal_slot_shared));
+    memset(program->sampler_metal_slot_shared_valid, 0,
+           sizeof(program->sampler_metal_slot_shared_valid));
+}
+
 static GLboolean mglPointerLooksMallocOwned(const void *ptr)
 {
     uintptr_t value = (uintptr_t)ptr;
@@ -303,6 +321,8 @@ void mglFreeProgram(GLMContext ctx, Program *ptr)
      * dereference the marker as if it were a glslang object. */
     ptr->linked_glsl_program = NULL;
 
+    mglClearSamplerUniformCache(ptr);
+
     mglSafeReleaseMetalObj((void **)&ptr->mtl_data);
 
     for(int i=0; i<_MAX_SHADER_TYPES; i++)
@@ -532,6 +552,8 @@ void mglDeleteProgram(GLMContext ctx, GLuint program)
     }
 
     mglFlushPendingDraws(ctx);
+
+    mglClearSamplerUniformCache(ptr);
 
     deleteHashElement(&STATE(program_table), program);
     
@@ -841,6 +863,10 @@ void mglLinkProgram(GLMContext ctx, GLuint program)
     }
 
     mglFlushPendingDraws(ctx);
+
+    /* Cached sampler locations hold pointers into reflection lists. Drop them
+     * before relinking can replace those lists, including failed relinks. */
+    mglClearSamplerUniformCache(pptr);
 
     pptr->uses_vertex_id = GL_FALSE;
     pptr->uses_primitive_id = GL_FALSE;

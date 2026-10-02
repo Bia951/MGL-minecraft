@@ -4181,24 +4181,30 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
     }
     RETURN_FALSE_ON_FAILURE([self updateDirtyBaseBufferList:&state->vertex_buffer_map_list]);
     RETURN_FALSE_ON_FAILURE([self updateDirtyBaseBufferList:&state->fragment_buffer_map_list]);
-    RETURN_FALSE_ON_FAILURE([self bindVertexBuffersToCurrentRenderEncoder]);
-    RETURN_FALSE_ON_FAILURE([self bindFragmentBuffersToCurrentRenderEncoder]);
-    Program *vertexProgram = mglResolveProgramForStageFromState(glm_ctx, _VERTEX_SHADER);
-    Program *fragmentProgram = mglResolveProgramForStageFromState(glm_ctx, _FRAGMENT_SHADER);
-    RETURN_FALSE_ON_FAILURE([self bindArgumentBuffersForProgram:vertexProgram
-                                                          stage:_VERTEX_SHADER
-                                                        context:glm_ctx
-                                                  renderEncoder:_currentRenderEncoder
-                                                 computeEncoder:nil]);
-    RETURN_FALSE_ON_FAILURE([self bindArgumentBuffersForProgram:fragmentProgram
-                                                          stage:_FRAGMENT_SHADER
-                                                        context:glm_ctx
-                                                  renderEncoder:_currentRenderEncoder
-                                                 computeEncoder:nil]);
-    RETURN_FALSE_ON_FAILURE([self bindBufferSizeConstantsForRenderEncoder]);
+    /* Uploads and sampled-copy conversions can close this encoder. Prepare
+     * them before binding draw resources, so those bindings are not thrown
+     * away and immediately replayed on the replacement encoder. */
     RETURN_FALSE_ON_FAILURE([self bindActiveTexturesToMTL]);
     RETURN_FALSE_ON_FAILURE([self prepareSampledCopiesForDraw]);
-    RETURN_FALSE_ON_FAILURE([self restoreRenderEncoderAfterTextureUploadForDraw:"final-active-texture-bind"]);
+    if (!_currentRenderEncoder) {
+        RETURN_FALSE_ON_FAILURE([self restoreRenderEncoderAfterTextureUploadForDraw:"final-active-texture-bind"]);
+    } else {
+        RETURN_FALSE_ON_FAILURE([self bindVertexBuffersToCurrentRenderEncoder]);
+        RETURN_FALSE_ON_FAILURE([self bindFragmentBuffersToCurrentRenderEncoder]);
+        Program *vertexProgram = mglResolveProgramForStageFromState(glm_ctx, _VERTEX_SHADER);
+        Program *fragmentProgram = mglResolveProgramForStageFromState(glm_ctx, _FRAGMENT_SHADER);
+        RETURN_FALSE_ON_FAILURE([self bindArgumentBuffersForProgram:vertexProgram
+                                                              stage:_VERTEX_SHADER
+                                                            context:glm_ctx
+                                                      renderEncoder:_currentRenderEncoder
+                                                     computeEncoder:nil]);
+        RETURN_FALSE_ON_FAILURE([self bindArgumentBuffersForProgram:fragmentProgram
+                                                              stage:_FRAGMENT_SHADER
+                                                            context:glm_ctx
+                                                      renderEncoder:_currentRenderEncoder
+                                                     computeEncoder:nil]);
+        RETURN_FALSE_ON_FAILURE([self bindBufferSizeConstantsForRenderEncoder]);
+    }
     if (![self bindTexturesToCurrentRenderEncoder]) {
         RETURN_FALSE_ON_FAILURE([self restoreRenderEncoderAfterTextureUploadForDraw:"final-sampled-texture-bind"]);
         RETURN_FALSE_ON_FAILURE([self bindTexturesToCurrentRenderEncoder]);

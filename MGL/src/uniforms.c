@@ -919,6 +919,10 @@ static GLboolean mglMetalSamplerSlotSharedAcrossResources(Program *program, GLui
         return GL_FALSE;
     }
 
+    if (program->sampler_metal_slot_shared_valid[metal_binding]) {
+        return program->sampler_metal_slot_shared[metal_binding];
+    }
+
     unsigned hits = 0u;
     for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++) {
         for (size_t rt = 0; rt < sizeof(sampler_resource_types) / sizeof(sampler_resource_types[0]); rt++) {
@@ -936,199 +940,145 @@ static GLboolean mglMetalSamplerSlotSharedAcrossResources(Program *program, GLui
                 }
 
                 if (++hits > 1u) {
+                    program->sampler_metal_slot_shared[metal_binding] = GL_TRUE;
+                    program->sampler_metal_slot_shared_valid[metal_binding] = GL_TRUE;
                     return GL_TRUE;
                 }
             }
         }
     }
 
-    return GL_FALSE;
+    program->sampler_metal_slot_shared[metal_binding] = hits > 1u ? GL_TRUE : GL_FALSE;
+    program->sampler_metal_slot_shared_valid[metal_binding] = GL_TRUE;
+    return program->sampler_metal_slot_shared[metal_binding];
+}
+
+/* Reflection is immutable between links. Cache both sampler matches and
+ * negative lookups, retaining every stage/type alias used by the old scan. */
+static MGLSamplerUniformCacheEntry *mglSamplerUniformMatches(Program *program,
+                                                           GLint location)
+{
+    static const int types[] = {
+        SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT, SPVC_RESOURCE_TYPE_SAMPLED_IMAGE,
+        SPVC_RESOURCE_TYPE_SEPARATE_IMAGE, SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS,
+        SPVC_RESOURCE_TYPE_STORAGE_IMAGE
+    };
+    for (GLuint i = 0; i < MGL_SAMPLER_UNIFORM_CACHE_CAPACITY; i++) {
+        MGLSamplerUniformCacheEntry *entry = &program->sampler_uniform_cache[i];
+        if (entry->valid && entry->location == location) return entry;
+    }
+
+    SpirvResource *primary = NULL;
+    int primaryType = -1;
+    for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES && !primary; stage++) {
+        for (size_t t = 0; t < sizeof(types) / sizeof(types[0]) && !primary; t++) {
+            SpirvResourceList *list = mglUniformSafeResourceList(program, stage, types[t], __FUNCTION__);
+            if (!list) continue;
+            for (GLuint i = 0; i < list->count; i++) {
+                SpirvResource *res = &list->list[i];
+                if (mglUniformResourceLooksSamplerLike(res, types[t]) &&
+                    mglUniformLocationMatchesResource(res, types[t], location)) {
+                    primary = res;
+                    primaryType = types[t];
+                    break;
+                }
+            }
+        }
+    }
+
+    MGLSamplerUniformCacheEntry *entry =
+        &program->sampler_uniform_cache[program->sampler_uniform_cache_next];
+    program->sampler_uniform_cache_next =
+        (program->sampler_uniform_cache_next + 1u) % MGL_SAMPLER_UNIFORM_CACHE_CAPACITY;
+    free(entry->matches);
+    memset(entry, 0, sizeof(*entry));
+    entry->location = location;
+    if (!primary) {
+        entry->valid = GL_TRUE;
+        return entry;
+    }
+
+    /* Grow only on cache misses; matching uses the original validated rules. */
+    for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++) {
+        for (size_t t = 0; t < sizeof(types) / sizeof(types[0]); t++) {
+            SpirvResourceList *list = mglUniformSafeResourceList(program, stage, types[t], __FUNCTION__);
+            if (!list) continue;
+            for (GLuint i = 0; i < list->count; i++) {
+                SpirvResource *res = &list->list[i];
+                if (!mglSamplerResourceMatchesUniformWrite(res, types[t], location, primary, primaryType)) continue;
+                MGLSamplerUniformMatch *matches = realloc(entry->matches,
+                    (entry->match_count + 1u) * sizeof(*matches));
+                if (!matches) {
+                    free(entry->matches);
+                    memset(entry, 0, sizeof(*entry));
+                    return NULL;
+                }
+                entry->matches = matches;
+                GLint element = location - res->uniform_location;
+                matches[entry->match_count++] = (MGLSamplerUniformMatch){
+                    .resource = res, .array_element = element > 0 ? element : 0,
+                    .stage = stage, .resource_type = types[t]
+                };
+            }
+        }
+    }
+    entry->valid = GL_TRUE;
+    return entry;
 }
 
 static GLboolean mglSetSamplerUniformUnit(GLMContext ctx, GLint location, GLint unit)
 {
-    static const int sampler_resource_types[] = {
-        SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT,
-        SPVC_RESOURCE_TYPE_SAMPLED_IMAGE,
-        SPVC_RESOURCE_TYPE_SEPARATE_IMAGE,
-        SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS,
-        SPVC_RESOURCE_TYPE_STORAGE_IMAGE
-    };
-
     ctx = mglUniformResolveContext(ctx, __FUNCTION__);
-    if (!ctx || location < 0) {
-        return GL_FALSE;
-    }
-
+    if (!ctx || location < 0) return GL_FALSE;
     Program *program = mglUniformGetCurrentProgram(ctx, __FUNCTION__);
-    if (!program) {
-        return GL_FALSE;
-    }
+    if (!program) return GL_FALSE;
+    MGLSamplerUniformCacheEntry *entry = mglSamplerUniformMatches(program, location);
+    if (!entry) { ERROR_RETURN_VALUE(GL_OUT_OF_MEMORY, GL_TRUE); }
+    if (!entry->match_count) return GL_FALSE;
+    if (unit < 0 || unit >= TEXTURE_UNITS) { ERROR_RETURN_VALUE(GL_INVALID_VALUE, GL_TRUE); }
 
-    GLboolean matched = GL_FALSE;
-    GLboolean needs_update = GL_FALSE;
-    const char *firstMatchedName = NULL;
-    GLuint firstMatchedBinding = 0u;
-    int firstMatchedStage = -1;
-    SpirvResource *primaryResource = NULL;
-    int primaryResourceType = -1;
-
-    for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++) {
-        for (size_t rt = 0; rt < sizeof(sampler_resource_types) / sizeof(sampler_resource_types[0]); rt++) {
-            int res_type = sampler_resource_types[rt];
-            SpirvResourceList *resources = mglUniformSafeResourceList(program, stage, res_type, __FUNCTION__);
-            if (!resources) {
-                continue;
-            }
-
-            for (GLuint i = 0; i < resources->count; i++) {
-                SpirvResource *res = &resources->list[i];
-                if (!mglUniformResourceLooksSamplerLike(res, res_type) ||
-                    !mglUniformLocationMatchesResource(res, res_type, location)) {
-                    continue;
-                }
-
-                matched = GL_TRUE;
-                if (!firstMatchedName) {
-                    firstMatchedName = res->name;
-                    firstMatchedBinding = res->binding;
-                    firstMatchedStage = stage;
-                }
-                if (!primaryResource) {
-                    primaryResource = res;
-                    primaryResourceType = res_type;
-                }
-            }
+    GLboolean needsUpdate = GL_FALSE;
+    for (GLuint i = 0; i < entry->match_count; i++) {
+        MGLSamplerUniformMatch *match = &entry->matches[i];
+        SpirvResource *res = match->resource;
+        GLuint slot = res->binding + (GLuint)match->array_element;
+        if (match->array_element == 0 &&
+            (res->sampler_unit != unit || !res->sampler_unit_explicit)) needsUpdate = GL_TRUE;
+        if (slot < TEXTURE_UNITS) {
+            GLboolean shared = mglMetalSamplerSlotSharedAcrossResources(program, slot);
+            if (program->sampler_units_by_stage[match->stage][slot] != unit ||
+                !program->sampler_units_explicit_by_stage[match->stage][slot] ||
+                (!shared && (program->sampler_units[slot] != unit ||
+                             !program->sampler_units_explicit[slot]))) needsUpdate = GL_TRUE;
         }
     }
+    if (!needsUpdate) return GL_TRUE;
+    mglFlushPendingDraws(ctx);
 
-    if (!matched) {
-        return GL_FALSE;
-    }
-
-    if (unit < 0 || unit >= TEXTURE_UNITS) {
-        ERROR_RETURN_VALUE(GL_INVALID_VALUE, GL_TRUE);
-    }
-
-    GLuint matchedResourceCount = 0u;
-    for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++) {
-        for (size_t rt = 0; rt < sizeof(sampler_resource_types) / sizeof(sampler_resource_types[0]); rt++) {
-            int res_type = sampler_resource_types[rt];
-            SpirvResourceList *resources = mglUniformSafeResourceList(program, stage, res_type, __FUNCTION__);
-            if (!resources) {
-                continue;
+    for (GLuint i = 0; i < entry->match_count; i++) {
+        MGLSamplerUniformMatch *match = &entry->matches[i];
+        SpirvResource *res = match->resource;
+        GLuint slot = res->binding + (GLuint)match->array_element;
+        if (match->array_element == 0) {
+            res->sampler_unit = unit;
+            res->sampler_unit_explicit = GL_TRUE;
+        }
+        if (slot < TEXTURE_UNITS) {
+            if (!mglMetalSamplerSlotSharedAcrossResources(program, slot)) {
+                program->sampler_units[slot] = unit;
+                program->sampler_units_explicit[slot] = GL_TRUE;
             }
-
-            for (GLuint i = 0; i < resources->count; i++) {
-                SpirvResource *res = &resources->list[i];
-                if (!mglSamplerResourceMatchesUniformWrite(res,
-                                                           res_type,
-                                                           location,
-                                                           primaryResource,
-                                                           primaryResourceType)) {
-                    continue;
-                }
-
-                matchedResourceCount++;
-                if (res->sampler_unit != unit || !res->sampler_unit_explicit) {
-                    needs_update = GL_TRUE;
-                } else if (res->binding < TEXTURE_UNITS) {
-                    GLboolean shared_slot =
-                        mglMetalSamplerSlotSharedAcrossResources(program, res->binding);
-                    if (program->sampler_units_by_stage[stage][res->binding] != unit ||
-                        !program->sampler_units_explicit_by_stage[stage][res->binding] ||
-                        (!shared_slot &&
-                         (program->sampler_units[res->binding] != unit ||
-                          !program->sampler_units_explicit[res->binding]))) {
-                        needs_update = GL_TRUE;
-                    }
-                }
-            }
+            program->sampler_units_by_stage[match->stage][slot] = unit;
+            program->sampler_units_explicit_by_stage[match->stage][slot] = GL_TRUE;
         }
     }
-
-    if (needs_update) {
-        mglFlushPendingDraws(ctx);
+    if (mglTraceLogIsEnabled()) {
+        MGLSamplerUniformMatch *first = &entry->matches[0];
+        mglTraceLogExternal("SAMPLER_UNIFORM_SET program=%u location=%d unit=%d firstStage=%d firstBinding=%u firstName=%s resources=%u",
+            program->name, location, unit, first->stage, first->resource->binding,
+            mglSafeCStringForLog(first->resource->name), entry->match_count);
     }
-
-    GLboolean changed = GL_FALSE;
-    GLboolean explicit_changed = GL_FALSE;
-    GLuint updatedResourceCount = 0u;
-
-    for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++) {
-        for (size_t rt = 0; rt < sizeof(sampler_resource_types) / sizeof(sampler_resource_types[0]); rt++) {
-            int res_type = sampler_resource_types[rt];
-            SpirvResourceList *resources = mglUniformSafeResourceList(program, stage, res_type, __FUNCTION__);
-            if (!resources) {
-                continue;
-            }
-
-            for (GLuint i = 0; i < resources->count; i++) {
-                SpirvResource *res = &resources->list[i];
-                if (!mglSamplerResourceMatchesUniformWrite(res,
-                                                           res_type,
-                                                           location,
-                                                           primaryResource,
-                                                           primaryResourceType)) {
-                    continue;
-                }
-
-                updatedResourceCount++;
-                GLint array_element = location - res->uniform_location;
-                if (array_element < 0) {
-                    array_element = 0;
-                }
-                GLuint metal_slot = res->binding + (GLuint)array_element;
-                if (array_element == 0 && res->sampler_unit != unit) {
-                    changed = GL_TRUE;
-                    res->sampler_unit = unit;
-                }
-                if (array_element == 0 && !res->sampler_unit_explicit) {
-                    explicit_changed = GL_TRUE;
-                    res->sampler_unit_explicit = GL_TRUE;
-                }
-
-                if (metal_slot < TEXTURE_UNITS) {
-                    GLboolean shared_slot =
-                        mglMetalSamplerSlotSharedAcrossResources(program, metal_slot);
-                    if (!shared_slot && program->sampler_units[metal_slot] != unit) {
-                        changed = GL_TRUE;
-                        program->sampler_units[metal_slot] = unit;
-                    }
-                    if (!shared_slot && !program->sampler_units_explicit[metal_slot]) {
-                        explicit_changed = GL_TRUE;
-                        program->sampler_units_explicit[metal_slot] = GL_TRUE;
-                    }
-                    if (program->sampler_units_by_stage[stage][metal_slot] != unit) {
-                        changed = GL_TRUE;
-                        program->sampler_units_by_stage[stage][metal_slot] = unit;
-                    }
-                    if (!program->sampler_units_explicit_by_stage[stage][metal_slot]) {
-                        explicit_changed = GL_TRUE;
-                        program->sampler_units_explicit_by_stage[stage][metal_slot] = GL_TRUE;
-                    }
-                }
-            }
-        }
-    }
-
-    if (changed || explicit_changed) {
-        static unsigned long long s_sampler_uniform_update_count = 0;
-        unsigned long long hit = ++s_sampler_uniform_update_count;
-        mglTraceLogExternal("SAMPLER_UNIFORM_SET program=%u location=%d unit=%d firstStage=%d firstBinding=%u firstName=%s resources=%u/%u changed=%d explicitChanged=%d hit=%llu",
-                            (unsigned)program->name,
-                            (int)location,
-                            (int)unit,
-                            firstMatchedStage,
-                            (unsigned)firstMatchedBinding,
-                            mglSafeCStringForLog(firstMatchedName),
-                            (unsigned)updatedResourceCount,
-                            (unsigned)matchedResourceCount,
-                            changed ? 1 : 0,
-                            explicit_changed ? 1 : 0,
-                            hit);
-        ctx->state.dirty_bits |= DIRTY_TEX_BINDING | DIRTY_SAMPLER;
-    }
+    ctx->state.dirty_bits |= DIRTY_TEX_BINDING | DIRTY_SAMPLER;
     return GL_TRUE;
 }
 

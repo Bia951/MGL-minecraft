@@ -215,6 +215,21 @@ typedef struct SpirvResourceList_t {
     SpirvResource   *list;
 } SpirvResourceList;
 
+#define MGL_SAMPLER_UNIFORM_CACHE_CAPACITY 64u
+typedef struct MGLSamplerUniformMatch_t {
+    SpirvResource *resource;
+    GLint array_element;
+    uint8_t stage;
+    uint8_t resource_type;
+} MGLSamplerUniformMatch;
+
+typedef struct MGLSamplerUniformCacheEntry_t {
+    GLint location;
+    GLuint match_count;
+    MGLSamplerUniformMatch *matches;
+    GLboolean valid;
+} MGLSamplerUniformCacheEntry;
+
 #define MAX_ATTACHED_SHADERS_PER_STAGE 8
 #define MGL_MSL_NAMED_ARGUMENT_CACHE_CAPACITY 64u
 
@@ -251,6 +266,10 @@ typedef struct Program_t {
     GLint sampler_units_by_stage[_MAX_SHADER_TYPES][TEXTURE_UNITS];
     GLboolean sampler_units_explicit[TEXTURE_UNITS];
     GLboolean sampler_units_explicit_by_stage[_MAX_SHADER_TYPES][TEXTURE_UNITS];
+    GLboolean sampler_metal_slot_shared[TEXTURE_UNITS];
+    GLboolean sampler_metal_slot_shared_valid[TEXTURE_UNITS];
+    MGLSamplerUniformCacheEntry sampler_uniform_cache[MGL_SAMPLER_UNIFORM_CACHE_CAPACITY];
+    uint8_t sampler_uniform_cache_next;
     GLboolean uses_vertex_id;
     GLboolean uses_primitive_id;
     /* MSL query result cache (env-gated by MGL_MSL_CACHE, default ON; =0 off).
