@@ -348,6 +348,11 @@ void mglReleaseGLSampledTextureCopy(GLMContext ctx, Texture *tex, const char *re
         tex->mtl_depth_read_data[orientation] = NULL;
         tex->mtl_depth_read_version[orientation] = 0u;
     }
+    if (tex->mtl_depth_compare_data && ctx && ctx->mtl_funcs.mtlDeleteMTLObj) {
+        ctx->mtl_funcs.mtlDeleteMTLObj(ctx, tex->mtl_depth_compare_data);
+    }
+    tex->mtl_depth_compare_data = NULL;
+    tex->mtl_depth_compare_version = 0u;
     tex->mtl_gl_sampled_width = 0u;
     tex->mtl_gl_sampled_height = 0u;
     tex->mtl_gl_sampled_format = 0u;

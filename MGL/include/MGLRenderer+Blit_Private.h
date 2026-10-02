@@ -124,6 +124,8 @@ void mglMarkTextureLevelRenderTargetWrittenImpl(Texture *tex,
                                                   writesColor:(BOOL)writesColor
                                                   writesDepth:(BOOL)writesDepth;
 - (id<MTLDepthStencilState>)clearRectDepthState;
+- (id<MTLTexture>)depthCompareTextureForObject:(Texture *)object program:(Program *)program;
+- (BOOL)updateDepthCompareCopyForTexture:(Texture *)object;
 
 // === Multisample resolve ===
 - (id<MTLTexture>)resolvedReadbackTextureForMultisampleTexture:(id<MTLTexture>)sourceTexture

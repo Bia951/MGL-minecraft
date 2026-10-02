@@ -544,6 +544,8 @@ typedef struct MGLBlitColorState {
         mglSafeReleaseMetalObj(&tex->mtl_depth_read_data[orientation]);
         tex->mtl_depth_read_version[orientation] = 0;
     }
+    mglSafeReleaseMetalObj(&tex->mtl_depth_compare_data);
+    tex->mtl_depth_compare_version = 0u;
     tex->mtl_gl_sampled_width = 0u;
     tex->mtl_gl_sampled_height = 0u;
     tex->mtl_gl_sampled_format = 0u;
@@ -1139,6 +1141,160 @@ typedef struct MGLBlitColorState {
     desc.depthWriteEnabled = YES;
     _clearRectDepthState = [_device newDepthStencilStateWithDescriptor:desc];
     return _clearRectDepthState;
+}
+
+- (id<MTLTexture>)depthCompareTextureForObject:(Texture *)object program:(Program *)program
+{
+    if (!object || !object->mtl_data) {
+        return nil;
+    }
+
+    id<MTLTexture> source = (__bridge id<MTLTexture>)object->mtl_data;
+    if (!source ||
+        source.pixelFormat != MTLPixelFormatDepth32Float ||
+        source.sampleCount != 1u ||
+        (source.textureType != MTLTextureType2D && source.textureType != MTLTextureType2DArray)) {
+        return source;
+    }
+
+    if (!object->is_render_target ||
+        mglDecideYFlipForSampledRT(object, program) != MGL_YFLIP_USE_SAMPLED_COPY) {
+        return source;
+    }
+
+    id<MTLTexture> cached = (__bridge id<MTLTexture>)object->mtl_depth_compare_data;
+    if (cached &&
+        object->mtl_depth_compare_version == object->mtl_render_target_write_version &&
+        cached.width == source.width &&
+        cached.height == source.height &&
+        cached.textureType == source.textureType &&
+        cached.arrayLength == source.arrayLength &&
+        cached.mipmapLevelCount == source.mipmapLevelCount) {
+        return cached;
+    }
+
+    /* Preflight must refresh a missing/stale mirror before binding it. */
+    return nil;
+}
+
+- (BOOL)updateDepthCompareCopyForTexture:(Texture *)object
+{
+    if (!object || !object->mtl_data || !object->is_render_target || _currentRenderEncoder) {
+        return NO;
+    }
+
+    id<MTLTexture> source = (__bridge id<MTLTexture>)object->mtl_data;
+    if (!source ||
+        source.pixelFormat != MTLPixelFormatDepth32Float ||
+        source.sampleCount != 1u ||
+        (source.textureType != MTLTextureType2D && source.textureType != MTLTextureType2DArray) ||
+        source.mipmapLevelCount == 0u) {
+        return NO;
+    }
+
+    id<MTLTexture> destination = (__bridge id<MTLTexture>)object->mtl_depth_compare_data;
+    BOOL shapeMatches = destination &&
+        destination.width == source.width &&
+        destination.height == source.height &&
+        destination.textureType == source.textureType &&
+        destination.arrayLength == source.arrayLength &&
+        destination.mipmapLevelCount == source.mipmapLevelCount &&
+        destination.pixelFormat == MTLPixelFormatDepth32Float;
+    if (shapeMatches &&
+        object->mtl_depth_compare_version == object->mtl_render_target_write_version) {
+        return YES;
+    }
+
+    if (!shapeMatches) {
+        mglSafeReleaseMetalObj(&object->mtl_depth_compare_data);
+        object->mtl_depth_compare_version = 0u;
+
+        MTLTextureDescriptor *descriptor =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+                                                               width:source.width
+                                                              height:source.height
+                                                           mipmapped:source.mipmapLevelCount > 1u];
+        descriptor.textureType = source.textureType;
+        descriptor.arrayLength = source.arrayLength;
+        descriptor.mipmapLevelCount = source.mipmapLevelCount;
+        descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        descriptor.storageMode = MTLStorageModePrivate;
+        destination = [_device newTextureWithDescriptor:descriptor];
+        if (!destination) {
+            return NO;
+        }
+        object->mtl_depth_compare_data = (void *)CFBridgingRetain(destination);
+    }
+
+    id<MTLRenderPipelineState> pipeline =
+        [self scaledDepthBlitPipelineForPixelFormat:MTLPixelFormatDepth32Float];
+    id<MTLSamplerState> sampler = [self scaledBlitSamplerForFilter:GL_NEAREST];
+    if (!pipeline || !sampler ||
+        ![self ensureWritableCommandBuffer:"depth_compare_copy_end_pass"]) {
+        return NO;
+    }
+
+    id<MTLRenderCommandEncoder> encoder = nil;
+    for (NSUInteger level = 0; level < source.mipmapLevelCount; level++) {
+        NSUInteger levelWidth = mglMetalTextureLevelDimension(source.width, level);
+        NSUInteger levelHeight = mglMetalTextureLevelDimension(source.height, level);
+        NSUInteger sliceCount = source.textureType == MTLTextureType2DArray
+            ? source.arrayLength : 1u;
+        for (NSUInteger slice = 0; slice < sliceCount; slice++) {
+            @autoreleasepool {
+                id<MTLTexture> input = source;
+                if (source.textureType == MTLTextureType2DArray || source.mipmapLevelCount > 1u) {
+                    input = [source newTextureViewWithPixelFormat:source.pixelFormat
+                                                      textureType:MTLTextureType2D
+                                                           levels:NSMakeRange(level, 1u)
+                                                           slices:NSMakeRange(slice, 1u)];
+                }
+                if (!input) {
+                    if (encoder) [encoder endEncoding];
+                    return NO;
+                }
+
+                MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+                pass.depthAttachment.texture = destination;
+                pass.depthAttachment.level = level;
+                pass.depthAttachment.slice = slice;
+                pass.depthAttachment.loadAction = MTLLoadActionDontCare;
+                pass.depthAttachment.storeAction = MTLStoreActionStore;
+                encoder = [_currentCommandBuffer renderCommandEncoderWithDescriptor:pass];
+                if (!encoder) {
+                    return NO;
+                }
+
+                /* The fullscreen depth draw writes the same values while
+                 * mirroring rows, preserving compare-sampler texture format. */
+                MGLScaledBlitParams params = {0};
+                params.uvRect = (vector_float4){0.0f, 1.0f, 1.0f, 0.0f};
+                [encoder setRenderPipelineState:pipeline];
+                [encoder setDepthStencilState:[self clearRectDepthState]];
+                [encoder setVertexBytes:&params length:sizeof(params) atIndex:0];
+                [encoder setFragmentTexture:input atIndex:0];
+                [encoder setFragmentSamplerState:sampler atIndex:0];
+                [encoder setViewport:(MTLViewport){0.0, 0.0,
+                    (double)levelWidth, (double)levelHeight, 0.0, 1.0}];
+                [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+                [encoder endEncoding];
+                encoder = nil;
+            }
+        }
+    }
+
+    object->mtl_depth_compare_version = object->mtl_render_target_write_version;
+    if (mglEnvFlagEnabled("MGL_CAPTURE_DEPTH_READ")) {
+        static unsigned traceCount;
+        if (traceCount++ < 16u) {
+            NSLog(@"MGL DEPTH COMPARE COPY texture=%u version=%u format=%lu size=%lux%lu levels=%lu slices=%lu",
+                  object->name, object->mtl_depth_compare_version,
+                  (unsigned long)destination.pixelFormat,
+                  (unsigned long)destination.width, (unsigned long)destination.height,
+                  (unsigned long)destination.mipmapLevelCount, (unsigned long)destination.arrayLength);
+        }
+    }
+    return YES;
 }
 
 /* Depth/stencil blit path for mtlBlitFramebuffer.

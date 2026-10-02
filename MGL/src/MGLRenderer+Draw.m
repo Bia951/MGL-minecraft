@@ -2048,6 +2048,8 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
                 texture = mglSampledTextureViewForBaseLevel(ptr, texture);
                 if (expectedKind == MGLTextureDataKindFloat && mglMetalPixelFormatHasDepth(texture.pixelFormat)) {
                     texture = mglSampledTextureViewForBaseLevel(ptr, [self depthReadTextureForObject:ptr program:currentProgram]);
+                } else if (expectedKind == MGLTextureDataKindDepth) {
+                    texture = mglSampledTextureViewForBaseLevel(ptr, [self depthCompareTextureForObject:ptr program:currentProgram]);
                 }
             }
             if (texture && expectedType != 0 && texture.textureType != expectedType) {
@@ -2520,6 +2522,8 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
                 texture = mglSampledTextureViewForBaseLevel(ptr, (__bridge id<MTLTexture>)ptr->mtl_data);
                 if (expectedKind == MGLTextureDataKindFloat && mglMetalPixelFormatHasDepth(texture.pixelFormat)) {
                     texture = mglSampledTextureViewForBaseLevel(ptr, [self depthReadTextureForObject:ptr program:sampleProgram]);
+                } else if (expectedKind == MGLTextureDataKindDepth) {
+                    texture = mglSampledTextureViewForBaseLevel(ptr, [self depthCompareTextureForObject:ptr program:sampleProgram]);
                 }
             }
             if (![self resolveFragmentSampledYFlipAndSampler:ptr
@@ -4104,8 +4108,10 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
         for (GLuint i = 0; program && i < count; i++) {
             SpirvResourceList *resources = &program->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_SAMPLED_IMAGE];
             SpirvResource *resource = i < resources->count ? &resources->list[i] : NULL;
+            MGLTextureDataKind kind = [self getProgramExpectedTextureDataKind:stage
+                type:SPVC_RESOURCE_TYPE_SAMPLED_IMAGE index:(int)i];
             if (mglShouldSkipStageTextureResource(program, stage, SPVC_RESOURCE_TYPE_SAMPLED_IMAGE, resource) ||
-                [self getProgramExpectedTextureDataKind:stage type:SPVC_RESOURCE_TYPE_SAMPLED_IMAGE index:(int)i] != MGLTextureDataKindFloat) continue;
+                (kind != MGLTextureDataKindFloat && kind != MGLTextureDataKindDepth)) continue;
             GLuint binding = [self getProgramBinding:stage type:SPVC_RESOURCE_TYPE_SAMPLED_IMAGE index:(int)i];
             MTLTextureType declared = [self getProgramDeclaredTextureType:stage type:SPVC_RESOURCE_TYPE_SAMPLED_IMAGE index:(int)i];
             MTLTextureType expected = [self getProgramExpectedTextureType:stage type:SPVC_RESOURCE_TYPE_SAMPLED_IMAGE index:(int)i];
@@ -4118,10 +4124,18 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
                 !mglMetalPixelFormatHasDepth(source.pixelFormat)) continue;
             unsigned orientation = object->is_render_target &&
                 mglDecideYFlipForSampledRT(object, program) == MGL_YFLIP_USE_SAMPLED_COPY;
-            object->mtl_depth_read_requested_mask |= 1u << orientation;
-            if ([self depthReadTextureForObject:object program:program]) continue;
+            if (kind == MGLTextureDataKindDepth) {
+                if ([self depthCompareTextureForObject:object program:program]) continue;
+            } else {
+                object->mtl_depth_read_requested_mask |= 1u << orientation;
+                if ([self depthReadTextureForObject:object program:program]) continue;
+            }
             if (!endedEncoder) { [self endRenderEncoding]; endedEncoder = YES; }
-            RETURN_FALSE_ON_FAILURE([self updateDepthReadCopiesForTexture:object]);
+            if (kind == MGLTextureDataKindDepth) {
+                RETURN_FALSE_ON_FAILURE([self updateDepthCompareCopyForTexture:object]);
+            } else {
+                RETURN_FALSE_ON_FAILURE([self updateDepthReadCopiesForTexture:object]);
+            }
         }
     }
     return true;
