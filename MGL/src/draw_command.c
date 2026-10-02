@@ -30,6 +30,7 @@
 #include "mgl_frame_activity.h"
 #include "mgl_trace_log.h"
 #include "mgl_sampler_compat.h"
+#include "mgl_spirv_resource.h"
 
 /* === Task 4: Snapshot Arena (bump allocator) === */
 
@@ -519,6 +520,9 @@ static void mglTrackPendingReadRange(GLMContext ctx, Buffer *buffer, uint64_t st
         MGLBufferReadRange *range = &cb->buffer_read_ranges[i];
         if (range->buffer == buffer &&
             mglRangesOverlapOrTouch(range->start, range->end, start, end)) {
+            /* Existing ranges are already disjoint and fully coalesced.
+             * A contained read cannot connect any additional range. */
+            if (range->start <= start && range->end >= end) return;
             if (start < range->start) range->start = start;
             if (end > range->end) range->end = end;
             mergedIndex = i;
@@ -1190,36 +1194,22 @@ static void mglHashBufferBaseBinding(uint64_t *hash,
     *hash ^= mglRotateLeft64((uint64_t)binding->size, (salt + 37u) & 63);
 }
 
+static void mglHashDrawBufferBinding(GLMContext ctx, const BufferBaseTarget *binding,
+                                    uint64_t salt, void *data)
+{
+    mglHashBufferBaseBinding(data, binding, salt);
+    if (binding->buffer) {
+        Buffer *resolved = searchHashTable(&ctx->state.buffer_table, binding->buffer);
+        if (resolved && resolved != binding->buf) {
+            *(uint64_t *)data ^= mglRotateLeft64((uint64_t)(uintptr_t)resolved, (salt + 11u) & 63u);
+        }
+    }
+}
+
 static uint64_t mglComputeDrawBufferBindingHash(GLMContext ctx)
 {
     uint64_t hash = 0;
-
-    const int draw_buffer_targets[] = {
-        _UNIFORM_BUFFER,
-        _UNIFORM_CONSTANT,
-        _SHADER_STORAGE_BUFFER,
-        _ATOMIC_COUNTER_BUFFER,
-        _TEXTURE_BUFFER
-    };
-
-    for (size_t t = 0; t < sizeof(draw_buffer_targets) / sizeof(draw_buffer_targets[0]); t++) {
-        int target = draw_buffer_targets[t];
-        for (int i = 0; i < MAX_BINDABLE_BUFFERS; i++) {
-            mglHashBufferBaseBinding(&hash,
-                                     &ctx->state.buffer_base[target].buffers[i],
-                                     ((uint64_t)(target + 1) * 131u) + (uint64_t)i);
-        }
-    }
-
-    Program *program = ctx->state.program;
-    if (program) {
-        for (int i = 0; i < MAX_BINDABLE_BUFFERS; i++) {
-            mglHashBufferBaseBinding(&hash,
-                                     &program->plain_uniform_buffers[i],
-                                     0x700u + (uint64_t)i);
-        }
-    }
-
+    mglVisitDrawBufferBindings(ctx, mglHashDrawBufferBinding, &hash);
     return hash;
 }
 
@@ -1780,39 +1770,23 @@ static uint64_t mglTrackPendingBufferMapReads(GLMContext ctx,
     return activeCount;
 }
 
-/* Plain (loose) uniforms live in per-Program Buffer objects.  When a
- * pipeline is bound, ctx->state.program may be NULL while the pipeline's
- * stage programs still own plain-uniform buffers that pending deferred
- * draws read at replay time.  Track those stages too, otherwise a
- * glUniform* routed to a stage program would not flush the draws that
- * depend on its previous contents. */
-static void mglTrackPipelinePlainUniformReads(GLMContext ctx, uint64_t *activeCount)
+static void mglTrackDrawBufferBinding(GLMContext ctx, const BufferBaseTarget *binding,
+                                     uint64_t salt, void *data)
 {
-    if (!ctx || !activeCount) return;
-
-    ProgramPipeline *pipeline = ctx->state.program_pipeline;
-    if (!pipeline && ctx->state.var.program_pipeline_binding != 0u) {
-        pipeline = (ProgramPipeline *)searchHashTable(&ctx->state.program_pipeline_table,
-                                                      ctx->state.var.program_pipeline_binding);
-    }
-    if (!pipeline) return;
-
-    for (int stage = 0; stage < _MAX_SHADER_TYPES; stage++) {
-        Program *program = pipeline->stage_programs[stage];
-        if (!program) continue;
-
-        for (int i = 0; i < MAX_BINDABLE_BUFFERS; i++) {
-            BufferBaseTarget *binding = &program->plain_uniform_buffers[i];
-            if (!binding->buf) continue;
-            (*activeCount)++;
-            if (binding->size > 0 && binding->offset >= 0) {
-                mglTrackPendingReadBytes(ctx,
-                                         binding->buf,
-                                         (uint64_t)binding->offset,
-                                         (uint64_t)binding->size);
-            } else {
-                mglTrackPendingReadWholeBuffer(ctx, binding->buf);
-            }
+    (void)salt;
+    Buffer *resolved = binding->buffer
+        ? searchHashTable(&ctx->state.buffer_table, binding->buffer) : NULL;
+    /* The renderer can recover an invalid pointer by GL name. Track both
+     * identities without dereferencing a potentially stale pointer. */
+    Buffer *sources[2] = { binding->buf, resolved != binding->buf ? resolved : NULL };
+    for (GLuint i = 0; i < 2; i++) {
+        Buffer *buffer = sources[i];
+        if (!buffer) continue;
+        (*(uint64_t *)data)++;
+        if (binding->size > 0 && binding->offset >= 0) {
+            mglTrackPendingReadBytes(ctx, buffer, (uint64_t)binding->offset, (uint64_t)binding->size);
+        } else {
+            mglTrackPendingReadWholeBuffer(ctx, buffer);
         }
     }
 }
@@ -1820,86 +1794,15 @@ static void mglTrackPipelinePlainUniformReads(GLMContext ctx, uint64_t *activeCo
 static void mglTrackPendingBaseBufferReads(GLMContext ctx)
 {
     if (!ctx) return;
-
     uint64_t activeCount = 0;
-
-    bool mapsCurrent =
-        mglHazardMapFastPathEnabled() &&
-        (ctx->state.dirty_bits & (DIRTY_PROGRAM | DIRTY_BUFFER_BASE_STATE)) == 0u &&
-        (ctx->state.vertex_buffer_map_list.count > 0u ||
-         ctx->state.fragment_buffer_map_list.count > 0u);
-
-    if (mapsCurrent) {
-        activeCount += mglTrackPendingBufferMapReads(
-            ctx, &ctx->state.vertex_buffer_map_list);
-        activeCount += mglTrackPendingBufferMapReads(
-            ctx, &ctx->state.fragment_buffer_map_list);
-
-        Program *program = ctx->state.program;
-        if (program) {
-            for (int i = 0; i < MAX_BINDABLE_BUFFERS; i++) {
-                BufferBaseTarget *binding = &program->plain_uniform_buffers[i];
-                if (!binding->buf) continue;
-                activeCount++;
-                if (binding->size > 0 && binding->offset >= 0) {
-                    mglTrackPendingReadBytes(ctx,
-                                             binding->buf,
-                                             (uint64_t)binding->offset,
-                                             (uint64_t)binding->size);
-                } else {
-                    mglTrackPendingReadWholeBuffer(ctx, binding->buf);
-                }
-            }
-        }
-        mglTrackPipelinePlainUniformReads(ctx, &activeCount);
-
-        MGL_PERF_ADD(g_mglHazardActiveBindingsSinceSwap, activeCount);
-        return;
+    mglVisitDrawBufferBindings(ctx, mglTrackDrawBufferBinding, &activeCount);
+    /* Keep packed-buffer map dependencies in addition to their plain-uniform
+     * sources. Reflection also covers stages outside these V/F maps. */
+    if (mglHazardMapFastPathEnabled() &&
+        (ctx->state.dirty_bits & (DIRTY_PROGRAM | DIRTY_BUFFER_BASE_STATE)) == 0u) {
+        activeCount += mglTrackPendingBufferMapReads(ctx, &ctx->state.vertex_buffer_map_list);
+        activeCount += mglTrackPendingBufferMapReads(ctx, &ctx->state.fragment_buffer_map_list);
     }
-
-    const int trackedTargets[] = {
-        _UNIFORM_BUFFER,
-        _UNIFORM_CONSTANT,
-        _SHADER_STORAGE_BUFFER,
-        _ATOMIC_COUNTER_BUFFER,
-        _TEXTURE_BUFFER
-    };
-
-    for (size_t t = 0; t < sizeof(trackedTargets) / sizeof(trackedTargets[0]); t++) {
-        int target = trackedTargets[t];
-        for (int i = 0; i < MAX_BINDABLE_BUFFERS; i++) {
-            BufferBaseTarget *binding = &ctx->state.buffer_base[target].buffers[i];
-            if (!binding->buf) continue;
-            activeCount++;
-            if (binding->size > 0 && binding->offset >= 0) {
-                mglTrackPendingReadBytes(ctx,
-                                         binding->buf,
-                                         (uint64_t)binding->offset,
-                                         (uint64_t)binding->size);
-            } else {
-                mglTrackPendingReadWholeBuffer(ctx, binding->buf);
-            }
-        }
-    }
-
-    Program *program = ctx->state.program;
-    if (program) {
-        for (int i = 0; i < MAX_BINDABLE_BUFFERS; i++) {
-            BufferBaseTarget *binding = &program->plain_uniform_buffers[i];
-            if (!binding->buf) continue;
-            activeCount++;
-            if (binding->size > 0 && binding->offset >= 0) {
-                mglTrackPendingReadBytes(ctx,
-                                         binding->buf,
-                                         (uint64_t)binding->offset,
-                                         (uint64_t)binding->size);
-            } else {
-                mglTrackPendingReadWholeBuffer(ctx, binding->buf);
-            }
-        }
-    }
-    mglTrackPipelinePlainUniformReads(ctx, &activeCount);
-
     MGL_PERF_ADD(g_mglHazardActiveBindingsSinceSwap, activeCount);
 }
 
