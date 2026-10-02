@@ -247,18 +247,20 @@ static Program *mglUniformValidateProgramPointer(GLMContext ctx, Program *progra
         return NULL;
     }
 
-    if (mglObjectPointerLooksPlausible(program) &&
+    GLboolean pointerPlausible = mglObjectPointerLooksPlausible(program);
+    /* A table member is a live Program allocation. Check identity before
+     * probing VM regions, which is needed only for deleted retained objects. */
+    if (pointerPlausible &&
         mglHashTableContainsData(&ctx->state.program_table, program)) {
         return program;
     }
 
-    GLboolean pointerReadable =
-        mglObjectPointerLooksPlausible(program) &&
-        mglPointerRangeIsReadable(program, sizeof(*program));
-    GLuint expectedName = pointerReadable ? program->name : 0u;
-
-    if (!pointerReadable ||
-        !mglProgramPointerUsableForName(ctx, program, expectedName)) {
+    if (!pointerPlausible ||
+        !mglPointerRangeIsReadable(program, sizeof(*program)) ||
+        program->name == 0u ||
+        !program->delete_status ||
+        program->refcount <= 0 ||
+        program->linked_glsl_program == NULL) {
         fprintf(stderr,
                 "MGL WARNING: %s dropping invalid program pointer %p\n",
                 func ? func : "uniform",
@@ -2003,7 +2005,13 @@ static GLboolean mglUniformBufferDataWouldChange(Buffer *buf, GLsizeiptr size, c
     return memcmp((const void *)(uintptr_t)buf->data.buffer_data, data, (size_t)size) != 0;
 }
 
-static bool checkUniformUploadParams(GLMContext ctx, GLint location, const void *ptr, GLsizei count, size_t element_size, GLsizeiptr *size_out)
+static bool checkUniformUploadParamsWithReadability(GLMContext ctx,
+                                                    GLint location,
+                                                    const void *ptr,
+                                                    GLsizei count,
+                                                    size_t element_size,
+                                                    GLsizeiptr *size_out,
+                                                    bool knownReadable)
 {
     if (!checkUniformParams(ctx, location)) {
         return false;
@@ -2029,7 +2037,7 @@ static bool checkUniformUploadParams(GLMContext ctx, GLint location, const void 
         return false;
     }
 
-    if (total > 0 && !mglPointerRangeIsReadable(ptr, total)) {
+    if (total > 0 && !knownReadable && !mglPointerRangeIsReadable(ptr, total)) {
         fprintf(stderr,
                 "MGL WARNING: dropping uniform update location=%d count=%d bytes=%zu unreadable value=%p\n",
                 location,
@@ -2045,6 +2053,13 @@ static bool checkUniformUploadParams(GLMContext ctx, GLint location, const void 
         *size_out = (GLsizeiptr)total;
     }
     return true;
+}
+
+static bool checkUniformUploadParams(GLMContext ctx, GLint location, const void *ptr,
+                                     GLsizei count, size_t element_size, GLsizeiptr *size_out)
+{
+    return checkUniformUploadParamsWithReadability(ctx, location, ptr, count,
+                                                   element_size, size_out, false);
 }
 
 static SpirvResource *mglFindPlainUniformResource(Program *program, GLint location)
@@ -2089,7 +2104,8 @@ static void mglUploadPlainUniformMat3fv(GLMContext ctx,
                                         GLboolean transpose,
                                         const GLfloat *value);
 
-void mglUniform(GLMContext ctx, GLint location, void *ptr, GLsizeiptr size)
+static void mglUniformCore(GLMContext ctx, GLint location, void *ptr,
+                           GLsizeiptr size, bool knownReadable)
 {
     ctx = mglUniformResolveContext(ctx, __FUNCTION__);
     if (!ctx) {
@@ -2102,7 +2118,7 @@ void mglUniform(GLMContext ctx, GLint location, void *ptr, GLsizeiptr size)
         mglUniformSetError(ctx, GL_INVALID_VALUE);
         return;
     }
-    if (size > 0 && !mglPointerRangeIsReadable(ptr, (size_t)size)) {
+    if (size > 0 && !knownReadable && !mglPointerRangeIsReadable(ptr, (size_t)size)) {
         fprintf(stderr,
                 "MGL WARNING: dropping uniform update location=%d bytes=%lld unreadable value=%p\n",
                 location,
@@ -2167,23 +2183,30 @@ void mglUniform(GLMContext ctx, GLint location, void *ptr, GLsizeiptr size)
         : DIRTY_BUFFER;
 }
 
+void mglUniform(GLMContext ctx, GLint location, void *ptr, GLsizeiptr size)
+{
+    mglUniformCore(ctx, location, ptr, size, false);
+}
+
 static void mglUniformDoubleVectorAsFloat(GLMContext ctx,
                                           GLint location,
                                           const GLdouble *value,
                                           GLsizei count,
-                                          size_t components)
+                                          size_t components,
+                                          bool knownReadable)
 {
     GLsizeiptr sourceBytes = 0;
     size_t scalarCount;
     GLfloat stackValues[16];
     GLfloat *converted = stackValues;
 
-    if (!checkUniformUploadParams(ctx,
-                                  location,
-                                  value,
-                                  count,
-                                  components * sizeof(GLdouble),
-                                  &sourceBytes)) {
+    if (!checkUniformUploadParamsWithReadability(ctx,
+                                                location,
+                                                value,
+                                                count,
+                                                components * sizeof(GLdouble),
+                                                &sourceBytes,
+                                                knownReadable)) {
         return;
     }
 
@@ -2212,7 +2235,8 @@ static void mglUniformDoubleVectorAsFloat(GLMContext ctx,
     }
 
     (void)sourceBytes;
-    mglUniform(ctx, location, converted, (GLsizeiptr)(scalarCount * sizeof(GLfloat)));
+    mglUniformCore(ctx, location, converted,
+                   (GLsizeiptr)(scalarCount * sizeof(GLfloat)), true);
 
     if (converted != stackValues) {
         free(converted);
@@ -2221,17 +2245,17 @@ static void mglUniformDoubleVectorAsFloat(GLMContext ctx,
 
 void mglUniform1d(GLMContext ctx, GLint location, GLdouble x)
 {
-    mglUniformDoubleVectorAsFloat(ctx, location, &x, 1, 1);
+    mglUniformDoubleVectorAsFloat(ctx, location, &x, 1, 1, true);
 }
 
 void mglUniform1dv(GLMContext ctx, GLint location, GLsizei count, const GLdouble *value)
 {
-    mglUniformDoubleVectorAsFloat(ctx, location, value, count, 1);
+    mglUniformDoubleVectorAsFloat(ctx, location, value, count, 1, false);
 }
 
 void mglUniform1f(GLMContext ctx, GLint location, GLfloat v0)
 {
-    mglUniform(ctx, location, &v0, sizeof(GLfloat));
+    mglUniformCore(ctx, location, &v0, sizeof(GLfloat), true);
 }
 
 void mglUniform1fv(GLMContext ctx, GLint location, GLsizei count, const GLfloat *value)
@@ -2245,7 +2269,7 @@ void mglUniform1i(GLMContext ctx, GLint location, GLint v0)
         return;
     }
 
-    mglUniform(ctx, location, &v0, sizeof(GLint));
+    mglUniformCore(ctx, location, &v0, sizeof(GLint), true);
 }
 
 void mglUniform1iv(GLMContext ctx, GLint location, GLsizei count, const GLint *value)
@@ -2264,7 +2288,7 @@ void mglUniform1ui(GLMContext ctx, GLint location, GLuint v0)
         return;
     }
 
-    mglUniform(ctx, location, &v0, sizeof(GLuint));
+    mglUniformCore(ctx, location, &v0, sizeof(GLuint), true);
 }
 
 void mglUniform1uiv(GLMContext ctx, GLint location, GLsizei count, const GLuint *value)
@@ -2282,19 +2306,19 @@ void mglUniform2d(GLMContext ctx, GLint location, volatile GLdouble x, volatile 
 {
     GLdouble data[] = {x, y};
     
-    mglUniformDoubleVectorAsFloat(ctx, location, data, 1, 2);
+    mglUniformDoubleVectorAsFloat(ctx, location, data, 1, 2, true);
 }
 
 void mglUniform2dv(GLMContext ctx, GLint location, GLsizei count, const GLdouble *value)
 {
-    mglUniformDoubleVectorAsFloat(ctx, location, value, count, 2);
+    mglUniformDoubleVectorAsFloat(ctx, location, value, count, 2, false);
 }
 
 void mglUniform2f(GLMContext ctx, GLint location, GLfloat v0, GLfloat v1)
 {
     GLfloat data[] = {v0, v1};
     
-    mglUniform(ctx, location, data, 2 * sizeof(GLfloat));
+    mglUniformCore(ctx, location, data, 2 * sizeof(GLfloat), true);
 }
 
 void mglUniform2fv(GLMContext ctx, GLint location, GLsizei count, const GLfloat *value)
@@ -2306,7 +2330,7 @@ void mglUniform2i(GLMContext ctx, GLint location, GLint v0, GLint v1)
 {
     GLint data[] = {v0, v1};
     
-    mglUniform(ctx, location, data, 2 * sizeof(GLint));
+    mglUniformCore(ctx, location, data, 2 * sizeof(GLint), true);
 }
 
 void mglUniform2iv(GLMContext ctx, GLint location, GLsizei count, const GLint *value)
@@ -2318,7 +2342,7 @@ void mglUniform2ui(GLMContext ctx, GLint location, GLuint v0, GLuint v1)
 {
     GLuint data[] = {v0, v1};
     
-    mglUniform(ctx, location, data, 2 * sizeof(GLuint));
+    mglUniformCore(ctx, location, data, 2 * sizeof(GLuint), true);
 }
 
 void mglUniform2uiv(GLMContext ctx, GLint location, GLsizei count, const GLuint *value)
@@ -2330,19 +2354,19 @@ void mglUniform3d(GLMContext ctx, GLint location, GLdouble x, GLdouble y, GLdoub
 {
     GLdouble data[] = {x, y, z};
     
-    mglUniformDoubleVectorAsFloat(ctx, location, data, 1, 3);
+    mglUniformDoubleVectorAsFloat(ctx, location, data, 1, 3, true);
 }
 
 void mglUniform3dv(GLMContext ctx, GLint location, GLsizei count, const GLdouble *value)
 {
-    mglUniformDoubleVectorAsFloat(ctx, location, value, count, 3);
+    mglUniformDoubleVectorAsFloat(ctx, location, value, count, 3, false);
 }
 
 void mglUniform3f(GLMContext ctx, GLint location, GLfloat v0, GLfloat v1, GLfloat v2)
 {
     GLfloat data[] = {v0, v1, v2};
     
-    mglUniform(ctx, location, data, 3 * sizeof(GLfloat));
+    mglUniformCore(ctx, location, data, 3 * sizeof(GLfloat), true);
 }
 
 void mglUniform3fv(GLMContext ctx, GLint location, GLsizei count, const GLfloat *value)
@@ -2354,7 +2378,7 @@ void mglUniform3i(GLMContext ctx, GLint location, GLint v0, GLint v1, GLint v2)
 {
     GLint data[] = {v0, v1, v2};
     
-    mglUniform(ctx, location, data, 3 * sizeof(GLint));
+    mglUniformCore(ctx, location, data, 3 * sizeof(GLint), true);
 }
 
 void mglUniform3iv(GLMContext ctx, GLint location, GLsizei count, const GLint *value)
@@ -2366,7 +2390,7 @@ void mglUniform3ui(GLMContext ctx, GLint location, GLuint v0, GLuint v1, GLuint 
 {
     GLuint data[] = {v0, v1, v2};
     
-    mglUniform(ctx, location, (void *)data, 3 * sizeof(GLuint));
+    mglUniformCore(ctx, location, (void *)data, 3 * sizeof(GLuint), true);
 }
 
 void mglUniform3uiv(GLMContext ctx, GLint location, GLsizei count, const GLuint *value)
@@ -2378,19 +2402,19 @@ void mglUniform4d(GLMContext ctx, GLint location, GLdouble x, GLdouble y, GLdoub
 {
     GLdouble data[] = {x, y, z, w};
     
-    mglUniformDoubleVectorAsFloat(ctx, location, data, 1, 4);
+    mglUniformDoubleVectorAsFloat(ctx, location, data, 1, 4, true);
 }
 
 void mglUniform4dv(GLMContext ctx, GLint location, GLsizei count, const GLdouble *value)
 {
-    mglUniformDoubleVectorAsFloat(ctx, location, value, count, 4);
+    mglUniformDoubleVectorAsFloat(ctx, location, value, count, 4, false);
 }
 
 void mglUniform4f(GLMContext ctx, GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3)
 {
     GLfloat data[] = {v0, v1, v2, v3};
     
-    mglUniform(ctx, location, (void *)data, 4 * sizeof(GLfloat));
+    mglUniformCore(ctx, location, (void *)data, 4 * sizeof(GLfloat), true);
 }
 
 void mglUniform4fv(GLMContext ctx, GLint location, GLsizei count, const GLfloat *value)
@@ -2402,7 +2426,7 @@ void mglUniform4i(GLMContext ctx, GLint location, GLint v0, GLint v1, GLint v2, 
 {
     GLint data[] = {v0, v1, v2, v3};
     
-    mglUniform(ctx, location, data, 4 * sizeof(GLint));
+    mglUniformCore(ctx, location, data, 4 * sizeof(GLint), true);
 }
 
 void mglUniform4iv(GLMContext ctx, GLint location, GLsizei count, const GLint *value)
@@ -2414,7 +2438,7 @@ void mglUniform4ui(GLMContext ctx, GLint location, GLuint v0, GLuint v1, GLuint 
 {
     GLuint data[] = {v0, v1, v2, v3};
     
-    mglUniform(ctx, location, data, 4 * sizeof(GLuint));
+    mglUniformCore(ctx, location, data, 4 * sizeof(GLuint), true);
 }
 
 void mglUniform4uiv(GLMContext ctx, GLint location, GLsizei count, const GLuint *value)

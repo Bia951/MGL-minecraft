@@ -216,6 +216,9 @@ typedef struct GLMContextRec_t {
     BufferData  *temp_element_buffer;
 
     MGLCommandBuffer draw_command_buffer;
+    /* Non-NULL only while ctx->state.vao points at a live, owned replay
+     * snapshot. Used as an identity fast path before pointer validation. */
+    VertexArray    *trusted_replay_vao;
     bool            draw_defer_enabled;
     bool            sync_strict;
 

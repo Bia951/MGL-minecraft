@@ -5151,6 +5151,9 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
     MGL_SIGNPOST_BEGIN(RestoreStateForBatch);
     if (batch->state_snapshot) {
         memcpy(&glm_ctx->state, batch->state_snapshot, sizeof(glm_ctx->state));
+        VertexArray *snapshotVAO = (VertexArray *)batch->vao_snapshot;
+        glm_ctx->trusted_replay_vao =
+            (snapshotVAO && glm_ctx->state.vao == snapshotVAO) ? snapshotVAO : NULL;
         MGL_PERF_INC(g_mglReplayMemcpyCountSinceSwap);
         /* The snapshot shallow-copies the 10 embedded HashTables in GLMState.
          * Each HashTable owns a dynamically-allocated keys/states array that
@@ -5170,6 +5173,7 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
         mglRestoreProgramPipelinePair(glm_ctx, glm_ctx->state.program_name,
                                      glm_ctx->state.var.program_pipeline_binding);
     } else {
+        glm_ctx->trusted_replay_vao = NULL;
         [self restoreStateFromKey:&batch->key context:glm_ctx];
     }
     /* Activate snapshot-based state access for sync functions.
@@ -5251,6 +5255,7 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
 {
     /* Deactivate snapshot-based state access — revert to live ctx->state. */
     _activeState = nil;
+    glm_ctx->trusted_replay_vao = NULL;
     mglResetCommandBufferForContext(glm_ctx, &glm_ctx->draw_command_buffer);
     /* Task 4: Reset the snapshot arena now that all batch replay is complete
      * and mglResetCommandBufferForContext has cleared all batch references.

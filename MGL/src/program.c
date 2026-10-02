@@ -468,14 +468,25 @@ void mglRetainProgramReference(GLMContext ctx, Program *program)
         return;
     }
 
-    GLuint programName = 0u;
-    if (mglObjectPointerLooksPlausible(program) &&
-        mglPointerRangeIsReadable(program, sizeof(*program))) {
-        programName = program->name;
+    if (!mglObjectPointerLooksPlausible(program)) {
+        return;
     }
 
-    if (programName == 0u ||
-        !mglProgramPointerUsableForName(ctx, program, programName)) {
+    if (mglHashTableContainsData(&ctx->state.program_table, program)) {
+        if (program->name != 0u) {
+            program->refcount++;
+        }
+        return;
+    }
+
+    /* Deleted-but-retained Programs are not table members. Keep the VM probe
+     * before reading their fields, then apply the same liveness conditions as
+     * mglProgramPointerUsableForName without probing the same memory twice. */
+    if (!mglPointerRangeIsReadable(program, sizeof(*program)) ||
+        program->name == 0u ||
+        !program->delete_status ||
+        program->refcount <= 0 ||
+        program->linked_glsl_program == NULL) {
         return;
     }
 
@@ -484,8 +495,13 @@ void mglRetainProgramReference(GLMContext ctx, Program *program)
 
 void mglReleaseProgramReference(GLMContext ctx, Program *program)
 {
-    if (!ctx || !program ||
-        !mglObjectPointerLooksPlausible(program) ||
+    if (!ctx || !program || !mglObjectPointerLooksPlausible(program)) {
+        return;
+    }
+
+    /* Table membership is enough to establish the allocation's identity and
+     * lifetime. Removed-but-retained Programs use the VM-checked slow path. */
+    if (!mglHashTableContainsData(&ctx->state.program_table, program) &&
         !mglPointerRangeIsReadable(program, sizeof(*program))) {
         return;
     }

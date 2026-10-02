@@ -1467,6 +1467,20 @@ VertexArray *mglRendererGetValidatedVAO(GLMContext ctx, const char *where)
         return NULL;
     }
 
+    /* Replay snapshots are allocated and owned by the active command batch.
+     * Equality is checked before touching the candidate; only this exact
+     * context-owned pointer may bypass table and VM-range validation. */
+    if (vao == ctx->trusted_replay_vao) {
+        if (vao->magic != MGL_VAO_MAGIC) {
+            NSLog(@"MGL VAO INVALID in %s: trusted replay vao=%p magic=0x%x",
+                  where ? where : "unknown", vao, vao->magic);
+            ctx->trusted_replay_vao = NULL;
+            mglRendererDropCurrentVAO(ctx);
+            return NULL;
+        }
+        return vao;
+    }
+
     if (!mglRendererObjectPointerLikelyValid(vao)) {
         NSLog(@"MGL VAO INVALID in %s: vao=%p (suspicious pseudo-pointer)",
               where ? where : "unknown", vao);

@@ -182,6 +182,10 @@ static void mglReleaseBatch(GLMContext ctx, MGLDrawBatch *batch)
 {
     if (!batch) return;
 
+    if (ctx && ctx->trusted_replay_vao == (VertexArray *)batch->vao_snapshot) {
+        ctx->trusted_replay_vao = NULL;
+    }
+
     /* Arena-managed allocations (commands, state_snapshot, vao_snapshot) are
      * freed collectively via arena reset (mglResetBatchArena), not
      * individually.  Only free them on the non-arena path. */
@@ -232,12 +236,17 @@ static Program *mglRetainBatchProgram(GLMContext ctx, MGLDrawBatch *batch, Progr
         return NULL;
     }
 
-    if (!mglObjectPointerLooksPlausible(program) ||
-        !mglPointerRangeIsReadable(program, sizeof(*program))) {
+    if (!mglObjectPointerLooksPlausible(program)) {
         return NULL;
     }
 
     if (expectedName == 0u) {
+        /* Membership proves a live object before reading its name; deleted
+         * retained programs use the guarded VM-range slow path. */
+        if (!mglHashTableContainsData(&ctx->state.program_table, program) &&
+            !mglPointerRangeIsReadable(program, sizeof(*program))) {
+            return NULL;
+        }
         expectedName = program->name;
     }
     if (!mglProgramPointerUsableForName(ctx, program, expectedName)) {
@@ -274,16 +283,12 @@ static void mglRetainBatchProgramReferences(GLMContext ctx, MGLDrawBatch *batch)
     (void)mglRetainBatchProgram(ctx,
                                 batch,
                                 pipeline->stage_programs[_VERTEX_SHADER],
-                                pipeline->stage_programs[_VERTEX_SHADER]
-                                    ? pipeline->stage_programs[_VERTEX_SHADER]->name
-                                    : 0u,
+                                0u,
                                 &batch->retained_vertex_program);
     (void)mglRetainBatchProgram(ctx,
                                 batch,
                                 pipeline->stage_programs[_FRAGMENT_SHADER],
-                                pipeline->stage_programs[_FRAGMENT_SHADER]
-                                    ? pipeline->stage_programs[_FRAGMENT_SHADER]->name
-                                    : 0u,
+                                0u,
                                 &batch->retained_fragment_program);
 }
 
@@ -334,6 +339,15 @@ static bool mglInitializeBatchStateSnapshot(GLMContext ctx, MGLDrawBatch *batch)
 void mglResetCommandBufferForContext(GLMContext ctx, MGLCommandBuffer *cb)
 {
     if (!cb) return;
+
+    if (ctx && ctx->trusted_replay_vao) {
+        for (uint32_t i = 0; i < cb->batch_count; i++) {
+            if (ctx->trusted_replay_vao == (VertexArray *)cb->batches[i].vao_snapshot) {
+                ctx->trusted_replay_vao = NULL;
+                break;
+            }
+        }
+    }
 
     for (uint32_t i = 0; i < cb->batch_count; i++) {
         mglReleaseBatch(ctx, &cb->batches[i]);
