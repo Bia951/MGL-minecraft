@@ -1006,7 +1006,10 @@ static GLsizei mglGetParameterCount(GLenum pname)
         case GL_SCISSOR_BOX:
         case GL_COLOR_CLEAR_VALUE:
         case GL_COLOR_WRITEMASK:
+        case GL_BLEND_COLOR:
+        case GL_PATCH_DEFAULT_OUTER_LEVEL:
             return 4;
+        case GL_PATCH_DEFAULT_INNER_LEVEL:
         case GL_DEPTH_RANGE:
         case GL_POLYGON_MODE:
         case GL_ALIASED_LINE_WIDTH_RANGE:
