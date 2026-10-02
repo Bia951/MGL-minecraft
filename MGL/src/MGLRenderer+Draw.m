@@ -1211,7 +1211,15 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
         int psStage = pointSizeStages[ps];
         Program *pointProgram = mglResolveProgramForStageFromState(ctx, psStage);
         const char *pointMsl = pointProgram ? pointProgram->spirv[psStage].msl_str : NULL;
-        if (pointMsl && strstr(pointMsl, "_mgl_point_size_params")) {
+        BOOL usesPointSizeParams;
+        if (_mslCacheEnabled && pointProgram && pointProgram->mslCacheValid) {
+            usesPointSizeParams =
+                (pointProgram->pointSizeStageUsageMask & (1u << psStage)) != 0u;
+        } else {
+            usesPointSizeParams =
+                pointMsl && strstr(pointMsl, "_mgl_point_size_params");
+        }
+        if (usesPointSizeParams) {
             /* Read the actual slot chosen by mglInjectMSLPointSizeParams.
              * It defaults to kMGLPointSizeBufferIndex (15) but may have been
              * reassigned when slot 15 was occupied by a user UBO.
@@ -2066,8 +2074,10 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
                           (unsigned long long)hit);
                 }
                 Program *dumpProgram = currentProgram;
-                mglWriteProgramMSLDump(dumpProgram,
-                                       [NSString stringWithFormat:@"tex-type-mismatch-vertex-binding-%u", spirvBinding]);
+                if (mglTraceLogIsEnabled()) {
+                    mglWriteProgramMSLDump(dumpProgram,
+                                           [NSString stringWithFormat:@"tex-type-mismatch-vertex-binding-%u", spirvBinding]);
+                }
                 texture = [self fallbackSampledTextureForExpectedType:expectedType dataKind:expectedKind];
                 usedTypeFallback = YES;
             }
@@ -2088,8 +2098,10 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
                           (unsigned long long)hit);
                 }
                 Program *dumpProgram = currentProgram;
-                mglWriteProgramMSLDump(dumpProgram,
-                                       [NSString stringWithFormat:@"tex-data-mismatch-vertex-binding-%u", spirvBinding]);
+                if (mglTraceLogIsEnabled()) {
+                    mglWriteProgramMSLDump(dumpProgram,
+                                           [NSString stringWithFormat:@"tex-data-mismatch-vertex-binding-%u", spirvBinding]);
+                }
                 texture = [self fallbackSampledTextureForExpectedType:expectedType dataKind:expectedKind];
                 usedTypeFallback = YES;
             }
@@ -2983,10 +2995,12 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
                                     (unsigned)ptr->params.max_level,
                                     (unsigned)ptr->mtl_gl_sampled_write_version);
                     }
-                    mglWriteProgramMSLDump(sampleProgram,
-                                           [NSString stringWithFormat:@"tex-rt-sample-copy-fragment-binding-%u-program-%u",
-                                                                      (unsigned)spirvBinding,
-                                                                      (unsigned)(sampleProgram ? sampleProgram->name : fragmentProgramName)]);
+                    if (mglTraceLogIsEnabled()) {
+                        mglWriteProgramMSLDump(sampleProgram,
+                                               [NSString stringWithFormat:@"tex-rt-sample-copy-fragment-binding-%u-program-%u",
+                                                                          (unsigned)spirvBinding,
+                                                                          (unsigned)(sampleProgram ? sampleProgram->name : fragmentProgramName)]);
+                    }
                     texture = mglSampledTextureViewForBaseLevel(ptr, sampledCopy);
                     usedSampledCopyForTrace = YES;
                     boundSampledCopy = YES;
@@ -3072,8 +3086,10 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
                   (unsigned long long)hit);
         }
         Program *dumpProgram = sampleProgram;
-        mglWriteProgramMSLDump(dumpProgram,
-                               [NSString stringWithFormat:@"tex-type-mismatch-fragment-binding-%u", spirvBinding]);
+        if (mglTraceLogIsEnabled()) {
+            mglWriteProgramMSLDump(dumpProgram,
+                                   [NSString stringWithFormat:@"tex-type-mismatch-fragment-binding-%u", spirvBinding]);
+        }
         texture = [self fallbackSampledTextureForExpectedType:expectedType dataKind:expectedKind];
         usedFallbackTexture = YES;
         usedSampledCopyForTrace = NO;
@@ -3095,8 +3111,10 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
                   (unsigned long long)hit);
         }
         Program *dumpProgram = sampleProgram;
-        mglWriteProgramMSLDump(dumpProgram,
-                               [NSString stringWithFormat:@"tex-data-mismatch-fragment-binding-%u", spirvBinding]);
+        if (mglTraceLogIsEnabled()) {
+            mglWriteProgramMSLDump(dumpProgram,
+                                   [NSString stringWithFormat:@"tex-data-mismatch-fragment-binding-%u", spirvBinding]);
+        }
 
         texture = [self fallbackSampledTextureForExpectedType:expectedType dataKind:expectedKind];
         usedFallbackTexture = YES;
@@ -4598,17 +4616,21 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
                     (unsigned long)fs3->pixel_format,
                     (unsigned long)fs3->texture_type);
         if ((fsSlotHasRT || fsSlotUsedCopy) && fragmentProgram) {
-            mglWriteProgramMSLDump(fragmentProgram,
-                                   [NSString stringWithFormat:@"texslot-submit-fs-%u-flush-%llu-cmd-%u",
-                                                              (unsigned)fragmentProgram->name,
-                                                              (unsigned long long)flushId,
-                                                              (unsigned)commandIndex]);
+            if (mglTraceLogIsEnabled()) {
+                mglWriteProgramMSLDump(fragmentProgram,
+                                       [NSString stringWithFormat:@"texslot-submit-fs-%u-flush-%llu-cmd-%u",
+                                                                  (unsigned)fragmentProgram->name,
+                                                                  (unsigned long long)flushId,
+                                                                  (unsigned)commandIndex]);
+            }
         } else if ((fsSlotHasRT || fsSlotUsedCopy) && drawProgram) {
-            mglWriteProgramMSLDump(drawProgram,
-                                   [NSString stringWithFormat:@"texslot-submit-program-%u-flush-%llu-cmd-%u",
-                                                              (unsigned)drawProgram->name,
-                                                              (unsigned long long)flushId,
-                                                              (unsigned)commandIndex]);
+            if (mglTraceLogIsEnabled()) {
+                mglWriteProgramMSLDump(drawProgram,
+                                       [NSString stringWithFormat:@"texslot-submit-program-%u-flush-%llu-cmd-%u",
+                                                                  (unsigned)drawProgram->name,
+                                                                  (unsigned long long)flushId,
+                                                                  (unsigned)commandIndex]);
+            }
         }
     }
 
@@ -8549,22 +8571,28 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
     if (mglShouldInspectDrawCall(drawCall, activeProgramName) || drawProgramUsesCloudFaces) {
         if (ctx && mglIsFocusedLoadingProgram(activeProgramName)) {
             if (drawVertexProgram) {
-                mglWriteProgramMSLDump(drawVertexProgram,
-                                       [NSString stringWithFormat:@"drawElements hot program %u call %llu",
-                                                                  (unsigned)activeProgramName,
-                                                                  (unsigned long long)drawCall]);
+                if (mglTraceLogIsEnabled()) {
+                    mglWriteProgramMSLDump(drawVertexProgram,
+                                           [NSString stringWithFormat:@"drawElements hot program %u call %llu",
+                                                                      (unsigned)activeProgramName,
+                                                                      (unsigned long long)drawCall]);
+                }
             }
             if (drawFragmentProgram && drawFragmentProgram != drawVertexProgram) {
-                mglWriteProgramMSLDump(drawFragmentProgram,
-                                       [NSString stringWithFormat:@"drawElements hot program %u call %llu",
-                                                                  (unsigned)activeProgramName,
-                                                                  (unsigned long long)drawCall]);
+                if (mglTraceLogIsEnabled()) {
+                    mglWriteProgramMSLDump(drawFragmentProgram,
+                                           [NSString stringWithFormat:@"drawElements hot program %u call %llu",
+                                                                      (unsigned)activeProgramName,
+                                                                      (unsigned long long)drawCall]);
+                }
             }
         }
         if (drawProgramUsesCloudFaces && drawProgram) {
-            mglWriteProgramMSLDump(drawProgram,
-                                   [NSString stringWithFormat:@"CloudFaces texel buffer drawElements call %llu",
-                                                              (unsigned long long)drawCall]);
+            if (mglTraceLogIsEnabled()) {
+                mglWriteProgramMSLDump(drawProgram,
+                                       [NSString stringWithFormat:@"CloudFaces texel buffer drawElements call %llu",
+                                                                  (unsigned long long)drawCall]);
+            }
         }
 
         if (ctx) {

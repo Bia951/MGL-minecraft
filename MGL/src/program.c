@@ -833,6 +833,7 @@ void mglLinkProgram(GLMContext ctx, GLuint program)
     pptr->mslCacheValid = GL_FALSE;
     pptr->usesFragCoordParams = GL_FALSE;
     pptr->vertexAttribUsageMask = 0u;
+    pptr->pointSizeStageUsageMask = 0u;
     memset(pptr->draw_buffer_slot_masks_valid, 0,
            sizeof(pptr->draw_buffer_slot_masks_valid));
     memset(pptr->msl_named_argument_cache, 0, sizeof(pptr->msl_named_argument_cache));
@@ -1133,6 +1134,15 @@ void mglLinkProgram(GLMContext ctx, GLuint program)
             }
         }
         pptr->vertexAttribUsageMask = attr_mask;
+
+        uint32_t point_size_stage_mask = 0u;
+        for (int stage = 0; stage < _MAX_SHADER_TYPES; stage++) {
+            const char *stage_msl = pptr->spirv[stage].msl_str;
+            if (stage_msl && strstr(stage_msl, "_mgl_point_size_params")) {
+                point_size_stage_mask |= (1u << stage);
+            }
+        }
+        pptr->pointSizeStageUsageMask = point_size_stage_mask;
         pptr->mslCacheValid = GL_TRUE;
     }
 

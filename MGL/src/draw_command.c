@@ -2557,8 +2557,6 @@ static void mglTrackPendingDrawBufferReads(GLMContext ctx,
             }
         }
     }
-
-    mglTrackPendingBaseBufferReads(ctx);
 }
 
 static void mglRecordDrawCommandCore(GLMContext ctx, const MGLDrawCommand *cmd,
@@ -2774,9 +2772,13 @@ static void mglRecordDrawCommandCore(GLMContext ctx, const MGLDrawCommand *cmd,
         cb->array_cmd_count++;
     }
 
-    if (can_stream_merge) {
+    /* Buffer-base bindings are part of the batch key, so one registration on
+     * the batch's first successfully appended command covers its fixed base
+     * reads. Per-draw vertex/index ranges remain separate for ordinary draws. */
+    if (batch->command_count == 1) {
         mglTrackPendingBaseBufferReads(ctx);
-    } else {
+    }
+    if (!can_stream_merge) {
         mglTrackPendingDrawBufferReads(ctx, cmd, cmd_uses_elements);
     }
     mglTrackPendingSampledTextureReads(ctx);

@@ -262,6 +262,7 @@ typedef struct Program_t {
     GLboolean mslCacheValid;
     GLboolean usesFragCoordParams;   /* FS: gl_FragCoord params present?  */
     uint32_t vertexAttribUsageMask;  /* VS: bit N set => [[attribute(N)]] */
+    uint32_t pointSizeStageUsageMask; /* Stage bit => MSL uses point-size params. */
     MGLMSLNamedArgumentCacheEntry
         msl_named_argument_cache[MGL_MSL_NAMED_ARGUMENT_CACHE_CAPACITY];
     uint8_t msl_named_argument_cache_next;
