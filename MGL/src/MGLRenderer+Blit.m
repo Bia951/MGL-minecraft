@@ -308,7 +308,7 @@ typedef struct MGLBlitColorState {
         return NO;
     }
 
-    id<MTLComputeCommandEncoder> encoder = [_currentCommandBuffer computeCommandEncoder];
+    id<MTLComputeCommandEncoder> encoder = mglProfileCompute(_currentCommandBuffer, __func__, __LINE__);
     if (!encoder) {
         NSLog(@"MGL WARN: failed to create MSAA integer resolve encoder for %s",
               reason ? reason : "unknown");
@@ -413,7 +413,7 @@ typedef struct MGLBlitColorState {
     }
 
     id<MTLRenderCommandEncoder> resolveEncoder =
-        [_currentCommandBuffer renderCommandEncoderWithDescriptor:resolvePass];
+        mglProfileRender(_currentCommandBuffer, resolvePass, __func__, __LINE__, ctx ? ctx->state.program_name : 0, ctx && ctx->state.framebuffer ? ctx->state.framebuffer->name : 0);
     if (!resolveEncoder) {
         NSLog(@"MGL WARNING: readPixels failed to create MSAA resolve encoder for %s",
               reason ? reason : "unknown");
@@ -475,7 +475,7 @@ typedef struct MGLBlitColorState {
     pass.depthAttachment.storeAction = MTLStoreActionStore;
 
     id<MTLRenderCommandEncoder> encoder =
-        [_currentCommandBuffer renderCommandEncoderWithDescriptor:pass];
+        mglProfileRender(_currentCommandBuffer, pass, __func__, __LINE__, ctx ? ctx->state.program_name : 0, ctx && ctx->state.framebuffer ? ctx->state.framebuffer->name : 0);
     if (!encoder) {
         mglDispatchError(ctx, __FUNCTION__, GL_INVALID_OPERATION);
         return nil;
@@ -972,7 +972,7 @@ typedef struct MGLBlitColorState {
             copyPass.renderTargetWidth = dstLvl.width;
             copyPass.renderTargetHeight = dstLvl.height;
 
-            id<MTLRenderCommandEncoder> copyEncoder = [_currentCommandBuffer renderCommandEncoderWithDescriptor:copyPass];
+            id<MTLRenderCommandEncoder> copyEncoder = mglProfileRender(_currentCommandBuffer, copyPass, __func__, __LINE__, ctx ? ctx->state.program_name : 0, ctx && ctx->state.framebuffer ? ctx->state.framebuffer->name : 0);
             if (!copyEncoder) {
                 static uint64_t s_copyEncoderFailCount = 0;
                 uint64_t hit = ++s_copyEncoderFailCount;
@@ -1260,7 +1260,7 @@ typedef struct MGLBlitColorState {
                 pass.depthAttachment.slice = slice;
                 pass.depthAttachment.loadAction = MTLLoadActionDontCare;
                 pass.depthAttachment.storeAction = MTLStoreActionStore;
-                encoder = [_currentCommandBuffer renderCommandEncoderWithDescriptor:pass];
+                encoder = mglProfileRender(_currentCommandBuffer, pass, __func__, __LINE__, ctx ? ctx->state.program_name : 0, ctx && ctx->state.framebuffer ? ctx->state.framebuffer->name : 0);
                 if (!encoder) {
                     return NO;
                 }
@@ -1378,7 +1378,7 @@ typedef struct MGLBlitColorState {
 
                     if (resolvedAny) {
                         id<MTLRenderCommandEncoder> resolveEncoder =
-                            [_currentCommandBuffer renderCommandEncoderWithDescriptor:resolvePass];
+                            mglProfileRender(_currentCommandBuffer, resolvePass, __func__, __LINE__, ctx ? ctx->state.program_name : 0, ctx && ctx->state.framebuffer ? ctx->state.framebuffer->name : 0);
                         if (resolveEncoder) {
                             [resolveEncoder endEncoding];
                             mglMarkTextureLevelRenderTargetWritten(depthDrawObject, depthDrawAttachment->level);
@@ -1441,7 +1441,7 @@ typedef struct MGLBlitColorState {
                                                                    textureObj:depthDrawObject
                                                                    mtlTexture:depthDrawTexture];
                             }
-                            id<MTLBlitCommandEncoder> depthBlit = [_currentCommandBuffer blitCommandEncoder];
+                            id<MTLBlitCommandEncoder> depthBlit = mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
                             if (depthBlit) {
                                 NSUInteger sourceMetalY =
                                     depthReadTexture.height - (NSUInteger)(copySrcY + copyHeight);
@@ -1522,7 +1522,7 @@ typedef struct MGLBlitColorState {
                                 }
 
                                 id<MTLRenderCommandEncoder> depthEncoder =
-                                    [_currentCommandBuffer renderCommandEncoderWithDescriptor:scaledDepthPass];
+                                    mglProfileRender(_currentCommandBuffer, scaledDepthPass, __func__, __LINE__, ctx ? ctx->state.program_name : 0, ctx && ctx->state.framebuffer ? ctx->state.framebuffer->name : 0);
                                 if (depthEncoder) {
                                     [depthEncoder setRenderPipelineState:depthPipeline];
                                     [depthEncoder setDepthStencilState:[self clearRectDepthState]];
@@ -1835,12 +1835,12 @@ typedef struct MGLBlitColorState {
         resolvePass.colorAttachments[0].resolveLevel = 0;
 
         id<MTLRenderCommandEncoder> resolveEncoder =
-            [_currentCommandBuffer renderCommandEncoderWithDescriptor:resolvePass];
+            mglProfileRender(_currentCommandBuffer, resolvePass, __func__, __LINE__, ctx ? ctx->state.program_name : 0, ctx && ctx->state.framebuffer ? ctx->state.framebuffer->name : 0);
         [resolveEncoder endEncoding];
 
         /* Synchronize the resolved texture so the subsequent blit/shader can
          * read it on a tile-based Apple GPU without stale tile memory. */
-        id<MTLBlitCommandEncoder> syncBlit = [_currentCommandBuffer blitCommandEncoder];
+        id<MTLBlitCommandEncoder> syncBlit = mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
         if (syncBlit) {
             [syncBlit synchronizeTexture:resolveTex slice:0 level:0];
             [syncBlit endEncoding];
@@ -1968,7 +1968,7 @@ typedef struct MGLBlitColorState {
             return YES;
         }
 
-        id<MTLBlitCommandEncoder> integerBlit = [_currentCommandBuffer blitCommandEncoder];
+        id<MTLBlitCommandEncoder> integerBlit = mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
         if (!integerBlit) {
             NSLog(@"MGL WARN: mtlBlitFramebuffer failed to create integer direct blit encoder");
             return YES;
@@ -2100,7 +2100,7 @@ typedef struct MGLBlitColorState {
         scaledPass.colorAttachments[0].loadAction = MTLLoadActionLoad;
         scaledPass.colorAttachments[0].storeAction = MTLStoreActionStore;
 
-        id<MTLRenderCommandEncoder> encoder = [_currentCommandBuffer renderCommandEncoderWithDescriptor:scaledPass];
+        id<MTLRenderCommandEncoder> encoder = mglProfileRender(_currentCommandBuffer, scaledPass, __func__, __LINE__, ctx ? ctx->state.program_name : 0, ctx && ctx->state.framebuffer ? ctx->state.framebuffer->name : 0);
         if (!encoder) {
             NSLog(@"MGL WARN: mtlBlitFramebuffer failed to create scaled render encoder");
             return YES;
@@ -2206,7 +2206,7 @@ typedef struct MGLBlitColorState {
     BOOL didMsaaResolve = st->didMsaaResolve;
     // start blit encoder
     id<MTLBlitCommandEncoder> blitCommandEncoder;
-    blitCommandEncoder = [_currentCommandBuffer blitCommandEncoder];
+    blitCommandEncoder = mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
     if (!blitCommandEncoder) {
         NSLog(@"MGL WARN: mtlBlitFramebuffer failed to create blit encoder");
         return;
@@ -2365,7 +2365,7 @@ typedef struct MGLBlitColorState {
                               readFBOAttachment->clear_color[2],
                               readFBOAttachment->clear_color[3]);
 
-        id<MTLRenderCommandEncoder> clearEncoder = [_currentCommandBuffer renderCommandEncoderWithDescriptor:clearPass];
+        id<MTLRenderCommandEncoder> clearEncoder = mglProfileRender(_currentCommandBuffer, clearPass, __func__, __LINE__, ctx ? ctx->state.program_name : 0, ctx && ctx->state.framebuffer ? ctx->state.framebuffer->name : 0);
         if (clearEncoder) {
             [clearEncoder endEncoding];
             readFBOAttachment->clear_bitmask &= ~GL_COLOR_BUFFER_BIT;
@@ -2403,7 +2403,7 @@ typedef struct MGLBlitColorState {
         NSUInteger captureRowBytes = (captureWidth * 4u + 255u) & ~255u;
         id<MTLBuffer> captureBuffer = [_device newBufferWithLength:captureRowBytes * captureHeight
                                                            options:MTLResourceStorageModeShared];
-        id<MTLBlitCommandEncoder> captureEncoder = [_currentCommandBuffer blitCommandEncoder];
+        id<MTLBlitCommandEncoder> captureEncoder = mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
         [captureEncoder copyFromTexture:readtexid sourceSlice:readSubresource.slice
                              sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
                               sourceSize:MTLSizeMake(captureWidth, captureHeight, 1)
@@ -2886,7 +2886,7 @@ typedef struct MGLBlitColorState {
             pass.depthAttachment.texture = destTexture;
             pass.depthAttachment.loadAction = MTLLoadActionLoad;
             pass.depthAttachment.storeAction = MTLStoreActionStore;
-            id<MTLRenderCommandEncoder> encoder = [_currentCommandBuffer renderCommandEncoderWithDescriptor:pass];
+            id<MTLRenderCommandEncoder> encoder = mglProfileRender(_currentCommandBuffer, pass, __func__, __LINE__, ctx ? ctx->state.program_name : 0, ctx && ctx->state.framebuffer ? ctx->state.framebuffer->name : 0);
             if (encoder) {
                 MGLScaledBlitParams params = {0};
                 params.uvRect = (vector_float4){
@@ -2911,7 +2911,7 @@ typedef struct MGLBlitColorState {
     }
 
     if (!copied) {
-        id<MTLBlitCommandEncoder> blitEncoder = [_currentCommandBuffer blitCommandEncoder];
+        id<MTLBlitCommandEncoder> blitEncoder = mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
         if (!blitEncoder) {
             mglDispatchError(glm_ctx, __FUNCTION__, GL_INVALID_OPERATION);
             return YES;
@@ -3375,7 +3375,7 @@ typedef struct MGLBlitColorState {
                                                                             length:srcImageBytes
                                                                            options:MTLResourceStorageModeShared];
                             if (stagingBuf) {
-                                id<MTLBlitCommandEncoder> uploadEncoder = [_currentCommandBuffer blitCommandEncoder];
+                                id<MTLBlitCommandEncoder> uploadEncoder = mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
                                 if (uploadEncoder) {
                                     [uploadEncoder copyFromBuffer:stagingBuf
                                                     sourceOffset:0
@@ -3826,7 +3826,7 @@ typedef struct MGLBlitColorState {
                         return YES;
                     }
                     id<MTLBlitCommandEncoder> readEncoder =
-                        [_currentCommandBuffer blitCommandEncoder];
+                        mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
                     if (!readEncoder) {
                         free(stagingBytes);
                         mglDispatchError(glm_ctx, __FUNCTION__, GL_OUT_OF_MEMORY);
@@ -3870,7 +3870,7 @@ typedef struct MGLBlitColorState {
                             return YES;
                         }
                         id<MTLBlitCommandEncoder> readEncoder =
-                            [_currentCommandBuffer blitCommandEncoder];
+                            mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
                         if (!readEncoder) {
                             free(stagingBytes);
                             mglDispatchError(glm_ctx, __FUNCTION__, GL_OUT_OF_MEMORY);
@@ -4537,7 +4537,7 @@ typedef struct MGLBlitColorState {
         }
     }
 
-    id<MTLBlitCommandEncoder> blitEncoder = [_currentCommandBuffer blitCommandEncoder];
+    id<MTLBlitCommandEncoder> blitEncoder = mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
     if (!blitEncoder) {
         NSLog(@"MGL ERROR: mtlCopyImageSubData failed to create blit encoder");
         mglDispatchError(glm_ctx, __FUNCTION__, GL_OUT_OF_MEMORY);

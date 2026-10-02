@@ -733,7 +733,7 @@ static bool mglGeometryShaderIsPassthrough(const Shader *shader)
                 // is_render_target transition.
                 [self endRenderEncodingLocked];
                 if ([self ensureWritableCommandBufferLocked:"is_render_target_blit"]) {
-                    id<MTLBlitCommandEncoder> blit = [_currentCommandBuffer blitCommandEncoder];
+                    id<MTLBlitCommandEncoder> blit = mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
                     if (blit) {
                         NSUInteger copySlices = MIN(oldTexture.arrayLength, newTexture.arrayLength);
                         NSUInteger copyLevels = MIN(oldTexture.mipmapLevelCount, newTexture.mipmapLevelCount);
@@ -916,7 +916,7 @@ static bool mglGeometryShaderIsPassthrough(const Shader *shader)
     }
 
     @try {
-        _currentRenderEncoder = [_currentCommandBuffer renderCommandEncoderWithDescriptor:_renderPassDescriptor];
+        _currentRenderEncoder = mglProfileRender(_currentCommandBuffer, _renderPassDescriptor, __func__, __LINE__, ctx ? ctx->state.program_name : 0, ctx && ctx->state.framebuffer ? ctx->state.framebuffer->name : 0);
     } @catch (NSException *exception) {
         NSLog(@"MGL ERROR: restoring render encoder after texture upload failed to create encoder: %@",
               exception.reason);
@@ -2939,7 +2939,7 @@ static bool mglGeometryShaderIsPassthrough(const Shader *shader)
             memset(_visibilityResultBuffer.contents, 0, _visibilityResultBuffer.length);
         }
         @try {
-            _currentRenderEncoder = [_currentCommandBuffer renderCommandEncoderWithDescriptor: _renderPassDescriptor];
+            _currentRenderEncoder = mglProfileRender(_currentCommandBuffer, _renderPassDescriptor, __func__, __LINE__, ctx ? ctx->state.program_name : 0, ctx && ctx->state.framebuffer ? ctx->state.framebuffer->name : 0);
             if (!_currentRenderEncoder) {
             NSLog(@"MGL ERROR: Failed to create render encoder - invalid render pass descriptor or command buffer");
             NSLog(@"MGL DEBUG: Command buffer: %@, Render pass descriptor: %@", _currentCommandBuffer, _renderPassDescriptor);
@@ -4306,7 +4306,7 @@ create_new_command_buffer:
                 NSUInteger width = source.width, height = source.height;
                 NSUInteger row = width * bpp, pitch = (row + 255u) & ~255u;
                 id<MTLBuffer> buffer = [_device newBufferWithLength:pitch * height options:MTLResourceStorageModeShared];
-                id<MTLBlitCommandEncoder> capture = [_currentCommandBuffer blitCommandEncoder];
+                id<MTLBlitCommandEncoder> capture = mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
                 [capture copyFromTexture:source sourceSlice:0 sourceLevel:0
                             sourceOrigin:MTLOriginMake(0, 0, 0) sourceSize:MTLSizeMake(width, height, 1)
                                 toBuffer:buffer destinationOffset:0 destinationBytesPerRow:pitch

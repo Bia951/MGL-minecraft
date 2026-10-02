@@ -2324,7 +2324,7 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
     if (![self ensureWritableCommandBuffer:"depth_read_copy_end_pass"]) {
         return NO;
     }
-    id<MTLComputeCommandEncoder> encoder = [_currentCommandBuffer computeCommandEncoder];
+    id<MTLComputeCommandEncoder> encoder = mglProfileCompute(_currentCommandBuffer, __func__, __LINE__);
     if (!encoder) {
         return NO;
     }
@@ -2385,7 +2385,7 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
             NSUInteger width=source.width,height=source.height,pitch=(width*sizeof(float)+255u)&~255u;
             id<MTLBuffer> original=[_device newBufferWithLength:pitch*height options:MTLResourceStorageModeShared];
             id<MTLBuffer> converted=[_device newBufferWithLength:pitch*height options:MTLResourceStorageModeShared];
-            id<MTLBlitCommandEncoder> capture=[_currentCommandBuffer blitCommandEncoder];
+            id<MTLBlitCommandEncoder> capture=mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
             for (unsigned i=0;i<2;i++) [capture copyFromTexture:i?sampled:source sourceSlice:0 sourceLevel:0
                 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(width,height,1) toBuffer:i?converted:original
                 destinationOffset:0 destinationBytesPerRow:pitch destinationBytesPerImage:pitch*height];
@@ -6521,7 +6521,7 @@ static BOOL mglSnapshotSharedBufferRange(id<MTLDevice> device,
     id<MTLBuffer> readback = [_device newBufferWithLength:byteCount
                                                   options:MTLResourceStorageModeShared];
     id<MTLCommandBuffer> cb = [_commandQueue commandBuffer];
-    id<MTLBlitCommandEncoder> blit = cb ? [cb blitCommandEncoder] : nil;
+    id<MTLBlitCommandEncoder> blit = cb ? mglProfileBlit(cb, __func__, __LINE__) : nil;
     if (!readback || !cb || !blit) {
         MGLTraceNSLog(@"MGL TRACE sampled.readback setup-fail program=%u binding=%u glTex=%u reason=%@ readback=%p cb=%p blit=%p hit=%llu",
               (unsigned)program,
@@ -8333,7 +8333,7 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
         }
     }
 
-    id <MTLComputeCommandEncoder> computeCommandEncoder = [_currentCommandBuffer computeCommandEncoder];
+    id <MTLComputeCommandEncoder> computeCommandEncoder = mglProfileCompute(_currentCommandBuffer, __func__, __LINE__);
     if (!computeCommandEncoder) {
         NSLog(@"MGL ERROR: Failed to create compute command encoder");
         return;
@@ -8463,7 +8463,7 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
         }
     }
 
-    id<MTLComputeCommandEncoder> computeCommandEncoder = [_currentCommandBuffer computeCommandEncoder];
+    id<MTLComputeCommandEncoder> computeCommandEncoder = mglProfileCompute(_currentCommandBuffer, __func__, __LINE__);
     if (!computeCommandEncoder) {
         NSLog(@"MGL ERROR: Failed to create compute command encoder for indirect dispatch");
         return;
@@ -8857,7 +8857,7 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
             NSUInteger rowBytes = (width * 4u + 255u) & ~255u;
             id<MTLBuffer> captureBuffer = [_device newBufferWithLength:rowBytes * height
                                                                options:MTLResourceStorageModeShared];
-            id<MTLBlitCommandEncoder> captureBlit = [_currentCommandBuffer blitCommandEncoder];
+            id<MTLBlitCommandEncoder> captureBlit = mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
             [captureBlit copyFromTexture:drawableTexture
                              sourceSlice:0 sourceLevel:0
                             sourceOrigin:MTLOriginMake(0, 0, 0)
@@ -9087,7 +9087,7 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
                     copyPass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
                     copyPass.colorAttachments[0].storeAction = MTLStoreActionStore;
 
-                    id<MTLRenderCommandEncoder> copyEncoder = [_currentCommandBuffer renderCommandEncoderWithDescriptor:copyPass];
+                    id<MTLRenderCommandEncoder> copyEncoder = mglProfileRender(_currentCommandBuffer, copyPass, __func__, __LINE__, ctx ? ctx->state.program_name : 0, ctx && ctx->state.framebuffer ? ctx->state.framebuffer->name : 0);
                     if (copyEncoder) {
                         [copyEncoder setRenderPipelineState:pipeline];
                         [copyEncoder setVertexBytes:&params length:sizeof(params) atIndex:0];
@@ -9213,7 +9213,7 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
                     return;
                 }
 
-                id<MTLBlitCommandEncoder> sampleEncoder = [_currentCommandBuffer blitCommandEncoder];
+                id<MTLBlitCommandEncoder> sampleEncoder = mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
                 if (!sampleEncoder) {
                     NSLog(@"MGL WARNING: swap.sample.%@ call=%llu failed(create blit encoder)",
                           sampleTag,
@@ -9600,7 +9600,7 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
         return;
     }
 
-    id<MTLRenderCommandEncoder> clearEncoder = [_currentCommandBuffer renderCommandEncoderWithDescriptor:clearPass];
+    id<MTLRenderCommandEncoder> clearEncoder = mglProfileRender(_currentCommandBuffer, clearPass, __func__, __LINE__, ctx ? ctx->state.program_name : 0, ctx && ctx->state.framebuffer ? ctx->state.framebuffer->name : 0);
     if (!clearEncoder) {
         NSLog(@"MGL ERROR: scissored clear failed to create render encoder");
         return;
@@ -10576,7 +10576,7 @@ Buffer *getIndirectBuffer(GLMContext ctx)
         }
     }
 
-    id<MTLComputeCommandEncoder> computeEncoder = [_currentCommandBuffer computeCommandEncoder];
+    id<MTLComputeCommandEncoder> computeEncoder = mglProfileCompute(_currentCommandBuffer, __func__, __LINE__);
     if (!computeEncoder) {
         NSLog(@"MGL TESS ERROR: failed to create compute encoder for TCS dispatch");
         return false;
@@ -10892,7 +10892,7 @@ Buffer *getIndirectBuffer(GLMContext ctx)
         }
     }
 
-    id<MTLComputeCommandEncoder> computeEncoder = [_currentCommandBuffer computeCommandEncoder];
+    id<MTLComputeCommandEncoder> computeEncoder = mglProfileCompute(_currentCommandBuffer, __func__, __LINE__);
     if (!computeEncoder) {
         NSLog(@"MGL TESS ERROR: failed to create compute encoder for TES dispatch");
         return false;

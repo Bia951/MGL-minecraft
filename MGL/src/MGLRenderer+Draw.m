@@ -4796,7 +4796,7 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
                     }
 
                     id<MTLParallelRenderCommandEncoder> parallelEncoder =
-                        [_currentCommandBuffer parallelRenderCommandEncoderWithDescriptor:parallelDesc];
+                        mglProfileParallelRender(_currentCommandBuffer, parallelDesc, __func__, __LINE__, glm_ctx->state.program_name, glm_ctx->state.framebuffer ? glm_ctx->state.framebuffer->name : 0);
                     if (!parallelEncoder) {
                         NSLog(@"MGL WARNING: parallelRenderCommandEncoder failed, "
                               "falling back to sequential for batches %u-%u", b, b + 1);

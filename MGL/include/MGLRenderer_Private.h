@@ -22,6 +22,7 @@
 #define MGLRenderer_Private_h
 
 #import "MGLRenderer.h"
+#import "mgl_gpu_profile.h"
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <AppKit/AppKit.h>
