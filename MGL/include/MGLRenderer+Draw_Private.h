@@ -213,7 +213,8 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
                                              offset:(NSUInteger *)offsetOut;
 
 // === Resource binding sync ===
-- (bool)syncResourceBindingsForContext:(GLMContext)glm_ctx;
+- (bool)syncResourceBindingsForContext:(GLMContext)glm_ctx
+       mappedCommandBufferForStateSync:(id<MTLCommandBuffer>)mappedCommandBufferForStateSync;
 - (bool)bindVertexBuffersToCurrentRenderEncoder;
 - (bool)bindFragmentBuffersToCurrentRenderEncoder;
 - (bool)bindActiveTexturesToMTL;

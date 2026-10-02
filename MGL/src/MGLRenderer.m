@@ -6860,21 +6860,12 @@ static BOOL mglSnapshotSharedBufferRange(id<MTLDevice> device,
     }
 
     SpirvResource *res = &ptr->spirv_resources_list[stage][type].list[index];
-    // Per-Program cache: the MSL string is immutable post-link, so the
-    // texture type for a given (program instance, generation, stage, binding)
-    // never changes.  The Program instance ID is never reused, even if malloc
-    // later reuses the Program's address.
-    NSString *mslTextureCacheKey = [NSString stringWithFormat:@"T_%llu_%llu_%d_%u",
-                                    (unsigned long long)ptr->msl_texture_cache_instance_id,
-                                    (unsigned long long)ptr->msl_texture_cache_generation,
-                                    stage, (unsigned)res->binding];
-    NSNumber *cachedMslType = [_mslTextureTypeCache objectForKey:mslTextureCacheKey];
-    MTLTextureType mslType;
-    if (cachedMslType != nil) {
-        mslType = (MTLTextureType)[cachedMslType unsignedIntegerValue];
-    } else {
-        mslType = mglExpectedTextureTypeFromMSL(ptr->spirv[stage].msl_str, res->binding);
-        [_mslTextureTypeCache setObject:@(mslType) forKey:mslTextureCacheKey];
+    if (res->msl_texture_expectation_cache_instance_id != ptr->msl_texture_cache_instance_id ||
+        res->msl_texture_expectation_cache_generation != ptr->msl_texture_cache_generation) {
+        res->msl_texture_expectation_cache_instance_id = ptr->msl_texture_cache_instance_id;
+        res->msl_texture_expectation_cache_generation = ptr->msl_texture_cache_generation;
+        res->msl_expected_texture_type_valid = 0;
+        res->msl_expected_texture_data_kind_valid = 0;
     }
 
     MTLTextureType spirvType = 0;
@@ -6903,21 +6894,35 @@ static BOOL mglSnapshotSharedBufferRange(id<MTLDevice> device,
             break;
     }
 
-    if (mslType != 0 && mslType != spirvType) {
-        static uint64_t s_mslTextureTypeOverrideCount = 0;
-        uint64_t hit = ++s_mslTextureTypeOverrideCount;
-        if (hit <= 32ull || (hit % 512ull) == 0ull) {
-            NSLog(@"MGL TEX EXPECT override from MSL stage=%d type=%d index=%d binding=%u name=%s spirvType=%lu mslType=%lu imageDim=%u hit=%llu",
-                  stage,
-                  type,
-                  index,
-                  (unsigned)res->binding,
-                  res->name ? res->name : "(null)",
-                  (unsigned long)spirvType,
-                  (unsigned long)mslType,
-                  (unsigned)res->image_dim,
-                  (unsigned long long)hit);
+    MTLTextureType mslType;
+    if (res->msl_expected_texture_type_valid) {
+        mslType = (MTLTextureType)res->msl_expected_texture_type;
+    } else {
+        mslType = mglExpectedTextureTypeFromMSL(ptr->spirv[stage].msl_str, res->binding);
+        res->msl_expected_texture_type = (uint32_t)mslType;
+        res->msl_expected_texture_type_valid = 1;
+
+        /* The override diagnostic describes the cached MSL expectation. Emit
+         * it only when that expectation is first computed for this generation. */
+        if (mslType != 0 && mslType != spirvType) {
+            static uint64_t s_mslTextureTypeOverrideCount = 0;
+            uint64_t hit = ++s_mslTextureTypeOverrideCount;
+            if (hit <= 32ull || (hit % 512ull) == 0ull) {
+                NSLog(@"MGL TEX EXPECT override from MSL stage=%d type=%d index=%d binding=%u name=%s spirvType=%lu mslType=%lu imageDim=%u hit=%llu",
+                      stage,
+                      type,
+                      index,
+                      (unsigned)res->binding,
+                      res->name ? res->name : "(null)",
+                      (unsigned long)spirvType,
+                      (unsigned long)mslType,
+                      (unsigned)res->image_dim,
+                      (unsigned long long)hit);
+            }
         }
+    }
+
+    if (mslType != 0 && mslType != spirvType) {
         return mslType;
     }
 
@@ -6942,20 +6947,24 @@ static BOOL mglSnapshotSharedBufferRange(id<MTLDevice> device,
     }
 
     SpirvResource *res = &ptr->spirv_resources_list[stage][type].list[index];
-    NSString *mslDataKindCacheKey = [NSString stringWithFormat:@"K_%llu_%llu_%d_%u",
-                                      (unsigned long long)ptr->msl_texture_cache_instance_id,
-                                      (unsigned long long)ptr->msl_texture_cache_generation,
-                                      stage, (unsigned)res->binding];
-    NSNumber *cachedMslKind = [_mslTextureTypeCache objectForKey:mslDataKindCacheKey];
-    if (cachedMslKind != nil) {
-        return (MGLTextureDataKind)[cachedMslKind unsignedIntegerValue];
+    if (res->msl_texture_expectation_cache_instance_id != ptr->msl_texture_cache_instance_id ||
+        res->msl_texture_expectation_cache_generation != ptr->msl_texture_cache_generation) {
+        res->msl_texture_expectation_cache_instance_id = ptr->msl_texture_cache_instance_id;
+        res->msl_texture_expectation_cache_generation = ptr->msl_texture_cache_generation;
+        res->msl_expected_texture_type_valid = 0;
+        res->msl_expected_texture_data_kind_valid = 0;
+    }
+
+    if (res->msl_expected_texture_data_kind_valid) {
+        return (MGLTextureDataKind)res->msl_expected_texture_data_kind;
     }
 
     MGLTextureDataKind mslKind =
         mglExpectedTextureDataKindFromMSL(ptr->spirv[stage].msl_str, res->binding);
     MGLTextureDataKind resolvedKind =
         mslKind != MGLTextureDataKindUnknown ? mslKind : MGLTextureDataKindFloat;
-    [_mslTextureTypeCache setObject:@(resolvedKind) forKey:mslDataKindCacheKey];
+    res->msl_expected_texture_data_kind = (uint32_t)resolvedKind;
+    res->msl_expected_texture_data_kind_valid = 1;
     return resolvedKind;
 }
 

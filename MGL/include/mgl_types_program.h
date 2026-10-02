@@ -190,6 +190,15 @@ typedef struct SpirvResource_t {
     GLuint  image_multisampled;
     /* 0 unknown, 1 present, 2 absent in this stage's generated MSL. */
     uint8_t msl_texture_argument_state;
+    /* Cached MSL texture expectations for this reflected resource. The
+     * instance/generation pair invalidates both values when Program MSL is
+     * relinked or a Program allocation is reused. */
+    uint64_t msl_texture_expectation_cache_instance_id;
+    uint64_t msl_texture_expectation_cache_generation;
+    uint32_t msl_expected_texture_type;
+    uint32_t msl_expected_texture_data_kind;
+    uint8_t msl_expected_texture_type_valid;
+    uint8_t msl_expected_texture_data_kind_valid;
     /* True for tessellation patch variables (SpvDecorationPatch). */
     GLboolean is_per_patch;
     /* UBO member uniforms (only valid for SPVC_RESOURCE_TYPE_UNIFORM_BUFFER). */

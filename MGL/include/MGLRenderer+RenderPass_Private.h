@@ -91,7 +91,10 @@ void mglEnableIndirectCommandBuffersForPipeline(MTLRenderPipelineDescriptor *pip
 // === Render pass state sync ===
 - (bool)syncRenderPassStateForContext:(GLMContext)glm_ctx;
 - (bool)rotateRenderEncoderForCurrentFramebufferLocked;
-- (bool)syncPipelineStateWithDeferredBufferMap:(bool)deferredBufferMapForPipelineBuild;
+- (bool)syncPipelineStateWithDeferredBufferMap:(bool)deferredBufferMapForPipelineBuild
+                       mappedCommandBuffer:(id<MTLCommandBuffer> *)mappedCommandBuffer;
+- (bool)processDirtyStateDomainsLocked:(bool)draw_command
+                   mappedCommandBuffer:(id<MTLCommandBuffer> *)mappedCommandBuffer;
 - (BOOL)shouldUseDontCareLoadForColorTexture:(Texture *)tex
                              firstUseThisFrame:(BOOL)firstUseThisFrame;
 - (BOOL)prepareRenderPassIfFBOChanged:(MGLDrawBatch *)batch

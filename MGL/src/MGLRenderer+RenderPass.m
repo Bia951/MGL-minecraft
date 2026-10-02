@@ -4787,7 +4787,9 @@ create_new_command_buffer:
         }
     }
 
-    RETURN_FALSE_ON_FAILURE([self processDirtyStateDomainsLocked:draw_command]);
+    id<MTLCommandBuffer> mappedCommandBufferForThisStateSync = nil;
+    RETURN_FALSE_ON_FAILURE([self processDirtyStateDomainsLocked:draw_command
+                                               mappedCommandBuffer:&mappedCommandBufferForThisStateSync]);
 
     // Ensure a render encoder exists for draw commands.
     // Stage 5.3 Step 5: skip nil-encoder recovery in parallel-encode mode —
@@ -4811,6 +4813,9 @@ create_new_command_buffer:
                                       _renderPassDrawBufferCount);
         }
         RETURN_FALSE_ON_FAILURE([self newRenderEncoderLocked]);
+        /* Encoder recovery can create a command buffer if the previous one
+         * disappeared. Do not trust a map produced before that recovery. */
+        mappedCommandBufferForThisStateSync = nil;
         if (nilHit <= 128ull || (nilHit % 512ull) == 0ull) {
             mglLogRenderPassLifecycle("nil-encoder-after-recovery",
                                       nilHit,
@@ -4832,7 +4837,13 @@ create_new_command_buffer:
          * _renderPassFramebuffer* ivars and clears DIRTY_FBO, so a mismatch
          * here would be a false positive that destroys the sub-encoder. */
         if (!_parallelEncodeActive) {
+            id<MTLRenderCommandEncoder> encoderBeforeFramebufferCheck = _currentRenderEncoder;
             RETURN_FALSE_ON_FAILURE([self ensureCurrentRenderPassMatchesFramebufferForDraw]);
+            if (_currentRenderEncoder != encoderBeforeFramebufferCheck) {
+                /* A pass/FBO rebuild also replays program/VAO state. Re-map
+                 * against the final draw state before binding its resources. */
+                mappedCommandBufferForThisStateSync = nil;
+            }
         }
         [self updateCurrentRenderEncoder];
     }
@@ -4915,7 +4926,8 @@ create_new_command_buffer:
 
     // Resource Sync domain (Stage 3.4): stability rebind before draw. The logic was moved to
     // syncResourceBindingsForContext:, only the dispatch remains here.
-    RETURN_FALSE_ON_FAILURE([self syncResourceBindingsForContext:ctx]);
+    RETURN_FALSE_ON_FAILURE([self syncResourceBindingsForContext:ctx
+                                                mappedCommandBufferForStateSync:mappedCommandBufferForThisStateSync]);
 
     Program *fragmentProgram = mglResolveProgramForStageFromState(ctx, _FRAGMENT_SHADER);
     BOOL useFragCoordParams;
@@ -4981,8 +4993,9 @@ create_new_command_buffer:
  * pipeline sync call. Returns false on failure (caller should skip this
  * draw), true on success.
  */
-- (bool)processDirtyStateDomainsLocked:(bool)draw_command
+- (bool)processDirtyStateDomainsLocked:(bool)draw_command mappedCommandBuffer:(id<MTLCommandBuffer> *)mappedCommandBuffer
 {
+    if (mappedCommandBuffer) *mappedCommandBuffer = nil;
     bool deferredBufferMapForPipelineBuild = false;
     if (ctx->state.dirty_bits)
     {
@@ -5050,6 +5063,7 @@ create_new_command_buffer:
 
                 // figure out vertex shader uniforms / buffer mappings
                 RETURN_FALSE_ON_FAILURE([self mapBuffersToMTL]);
+                if (mappedCommandBuffer) *mappedCommandBuffer = _currentCommandBuffer;
             }
 
             ctx->state.dirty_bits &= ~DIRTY_BUFFER_BASE_STATE;
@@ -5114,7 +5128,8 @@ create_new_command_buffer:
         // only the dispatch remains here; deferredBufferMap is passed as a value parameter (not read after the block).
         if (ctx->state.dirty_bits & (DIRTY_PROGRAM | DIRTY_VAO | DIRTY_FBO | DIRTY_ALPHA_STATE | DIRTY_RENDER_STATE))
         {
-            RETURN_FALSE_ON_FAILURE([self syncPipelineStateWithDeferredBufferMap:deferredBufferMapForPipelineBuild]);
+            RETURN_FALSE_ON_FAILURE([self syncPipelineStateWithDeferredBufferMap:deferredBufferMapForPipelineBuild
+                                                             mappedCommandBuffer:mappedCommandBuffer]);
         }
 
         //if (ctx->state.dirty_bits)
@@ -5286,6 +5301,7 @@ stencil_format_ok:;
  * Returns false to indicate this draw should be skipped (equivalent to the original inline return false semantics).
  */
 - (bool)syncPipelineStateWithDeferredBufferMap:(bool)deferredBufferMapForPipelineBuild
+                             mappedCommandBuffer:(id<MTLCommandBuffer> *)mappedCommandBuffer
 {
             GLMState *state = MGL_STATE(ctx);
             /* Force a rebind of the pipeline state on the next setRenderPipelineState
@@ -5795,6 +5811,7 @@ stencil_format_ok:;
 
                 if (deferredBufferMapForPipelineBuild && _pipelineState != nil) {
                     RETURN_FALSE_ON_FAILURE([self mapBuffersToMTL]);
+                    if (mappedCommandBuffer) *mappedCommandBuffer = _currentCommandBuffer;
                     deferredBufferMapForPipelineBuild = false;
                 }
 

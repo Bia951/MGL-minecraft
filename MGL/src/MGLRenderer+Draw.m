@@ -4141,10 +4141,15 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
     return true;
 }
 
-- (bool)syncResourceBindingsForContext:(GLMContext)glm_ctx
+- (bool)syncResourceBindingsForContext:(GLMContext)glm_ctx mappedCommandBufferForStateSync:(id<MTLCommandBuffer>)mappedCommandBufferForStateSync
 {
     GLMState *state = MGL_STATE(glm_ctx);
-    RETURN_FALSE_ON_FAILURE([self mapBuffersToMTL]);
+    /* Dirty-state processing may already have built these maps for this draw.
+     * Packed uniforms belong to its command buffer arena, so reuse them only
+     * while that same command buffer remains active. */
+    if (!mappedCommandBufferForStateSync || mappedCommandBufferForStateSync != _currentCommandBuffer) {
+        RETURN_FALSE_ON_FAILURE([self mapBuffersToMTL]);
+    }
     RETURN_FALSE_ON_FAILURE([self updateDirtyBaseBufferList:&state->vertex_buffer_map_list]);
     RETURN_FALSE_ON_FAILURE([self updateDirtyBaseBufferList:&state->fragment_buffer_map_list]);
     RETURN_FALSE_ON_FAILURE([self bindVertexBuffersToCurrentRenderEncoder]);
