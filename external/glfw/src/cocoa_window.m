@@ -247,7 +247,9 @@ static const NSRange kEmptyRange = { NSNotFound, 0 };
     if (window->context.source == GLFW_NATIVE_CONTEXT_API)
         [window->context.mgl.object update];
 
-    if (_glfw.ns.disabledCursorWindow == window)
+    // Warping the pointer during a border drag moves the resize handle too.
+    if (_glfw.ns.disabledCursorWindow == window &&
+        ![window->ns.view inLiveResize])
         _glfwCenterCursorInContentArea(window);
 
     const int maximized = [window->ns.object isZoomed];
@@ -277,12 +279,19 @@ static const NSRange kEmptyRange = { NSNotFound, 0 };
     }
 }
 
+- (void)windowDidEndLiveResize:(NSNotification *)notification
+{
+    if (_glfw.ns.disabledCursorWindow == window)
+        _glfwCenterCursorInContentArea(window);
+}
+
 - (void)windowDidMove:(NSNotification *)notification
 {
     if (window->context.source == GLFW_NATIVE_CONTEXT_API)
         [window->context.mgl.object update];
 
-    if (_glfw.ns.disabledCursorWindow == window)
+    if (_glfw.ns.disabledCursorWindow == window &&
+        ![window->ns.view inLiveResize])
         _glfwCenterCursorInContentArea(window);
 
     int x, y;
