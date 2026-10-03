@@ -69,6 +69,18 @@ An unlocked, visible 90-second Minecraft run measured 48.67 FPS versus
 30.36 FPS in the adjacent eager-acquisition comparison; this is workload evidence, not a guarantee
 of the same gain in every application.
 
+### Vertex conversion resource lifetime
+
+The shared cache for double, integer-to-float and integer-width vertex
+conversions uses `NSCache` with a 128-entry count policy and a 64 MiB cost
+policy. These are eviction policies, not hard allocation limits. Content hashes
+still distinguish changed source data. Encoded command buffers retain their
+resources independently of cache eviction.
+
+C-to-Objective-C Metal bridge dispatches drain their own autorelease pools,
+including calls made by render loops that do not provide a per-frame pool.
+Persistent resources remain owned by renderer fields or retained C slots.
+
 ### Descriptor reuse experiment
 
 `MGL_REUSE_PIPELINE_DESCRIPTORS=1` reuses a renderer-owned pipeline/vertex

@@ -312,7 +312,7 @@ typedef struct MGLPlainUniformArenaCacheEntry_t {
     GLuint _tcsOutVertices;             /* TCS output vertices per patch */
     id<MTLTexture> _fallbackSintTextureBuffer;
     NSMutableDictionary<NSNumber *, id<MTLTexture>> *_fallbackSampledTextureCache;
-    NSMutableDictionary<NSString *, id<MTLBuffer>> *_doubleVertexAttribBufferCache;
+    NSCache<NSString *, id<MTLBuffer>> *_doubleVertexAttribBufferCache;
     id<MTLSamplerState> _fallbackSamplerState;
     MGLFragmentTextureTraceBinding _fragmentTextureTraceBindings[TEXTURE_UNITS];
     NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *_scaledBlitPipelineCache;

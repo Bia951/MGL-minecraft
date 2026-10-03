@@ -3059,9 +3059,12 @@ void logDirtyBits(GLMContext ctx)
                           copyLength,
                           (unsigned long long)sourceHash];
     if (!_doubleVertexAttribBufferCache) {
-        _doubleVertexAttribBufferCache = [NSMutableDictionary dictionary];
+        _doubleVertexAttribBufferCache = [[NSCache alloc] init];
+        _doubleVertexAttribBufferCache.name = @"MGL double vertex attrib conversion";
+        _doubleVertexAttribBufferCache.countLimit = 128;
+        _doubleVertexAttribBufferCache.totalCostLimit = 64u * 1024u * 1024u;
     }
-    id<MTLBuffer> cached = _doubleVertexAttribBufferCache[cacheKey];
+    id<MTLBuffer> cached = [_doubleVertexAttribBufferCache objectForKey:cacheKey];
     if (cached) {
         if (outStride) {
             *outStride = convertedStride;
@@ -3117,7 +3120,7 @@ void logDirtyBits(GLMContext ctx)
     if (!converted) {
         return nil;
     }
-    _doubleVertexAttribBufferCache[cacheKey] = converted;
+    [_doubleVertexAttribBufferCache setObject:converted forKey:cacheKey cost:converted.length];
     if (outStride) {
         *outStride = convertedStride;
     }
@@ -3186,9 +3189,12 @@ void logDirtyBits(GLMContext ctx)
                           copyLength,
                           (unsigned long long)sourceHash];
     if (!_doubleVertexAttribBufferCache) {
-        _doubleVertexAttribBufferCache = [NSMutableDictionary dictionary];
+        _doubleVertexAttribBufferCache = [[NSCache alloc] init];
+        _doubleVertexAttribBufferCache.name = @"MGL double vertex attrib conversion";
+        _doubleVertexAttribBufferCache.countLimit = 128;
+        _doubleVertexAttribBufferCache.totalCostLimit = 64u * 1024u * 1024u;
     }
-    id<MTLBuffer> cached = _doubleVertexAttribBufferCache[cacheKey];
+    id<MTLBuffer> cached = [_doubleVertexAttribBufferCache objectForKey:cacheKey];
     if (cached) {
         if (outStride) {
             *outStride = convertedStride;
@@ -3261,7 +3267,7 @@ void logDirtyBits(GLMContext ctx)
     if (!converted) {
         return nil;
     }
-    _doubleVertexAttribBufferCache[cacheKey] = converted;
+    [_doubleVertexAttribBufferCache setObject:converted forKey:cacheKey cost:converted.length];
     if (outStride) {
         *outStride = convertedStride;
     }
@@ -3331,9 +3337,12 @@ void logDirtyBits(GLMContext ctx)
                           copyLength,
                           (unsigned long long)sourceHash];
     if (!_doubleVertexAttribBufferCache) {
-        _doubleVertexAttribBufferCache = [NSMutableDictionary dictionary];
+        _doubleVertexAttribBufferCache = [[NSCache alloc] init];
+        _doubleVertexAttribBufferCache.name = @"MGL double vertex attrib conversion";
+        _doubleVertexAttribBufferCache.countLimit = 128;
+        _doubleVertexAttribBufferCache.totalCostLimit = 64u * 1024u * 1024u;
     }
-    id<MTLBuffer> cached = _doubleVertexAttribBufferCache[cacheKey];
+    id<MTLBuffer> cached = [_doubleVertexAttribBufferCache objectForKey:cacheKey];
     if (cached) {
         if (outStride) {
             *outStride = convertedStride;
@@ -3431,7 +3440,7 @@ void logDirtyBits(GLMContext ctx)
     if (!converted) {
         return nil;
     }
-    _doubleVertexAttribBufferCache[cacheKey] = converted;
+    [_doubleVertexAttribBufferCache setObject:converted forKey:cacheKey cost:converted.length];
     if (outStride) {
         *outStride = convertedStride;
     }
