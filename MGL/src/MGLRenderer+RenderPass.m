@@ -3,6 +3,10 @@
 
 #import "MGLRenderer_Private.h"
 #import "MGLRenderer+RenderPass_Private.h"
+#import "MGLRenderer+PipelineCache_Private.h"
+
+@implementation MGLEarlyPipelineCacheEntry
+@end
 
 extern void mglBeginProgramResolveScope(GLMContext ctx);
 extern void mglEndProgramResolveScope(GLMContext ctx);
@@ -5399,7 +5403,48 @@ stencil_format_ok:;
 	                }
 	            }
 
+            NSData *earlyInputKey = nil;
+            MGLEarlyPipelineCacheEntry *earlyEntry = nil;
+            if (!skipPipelineBuild && _earlyPipelineCacheEnabled) {
+                earlyInputKey = [self earlyPipelineInputKeyForVertexProgram:currentVertexProgram
+                    fragmentProgram:currentFragmentProgram vao:currentVAO];
+                earlyEntry = earlyInputKey ? [_earlyPipelineStateCache objectForKey:earlyInputKey] : nil;
+            }
+            if (earlyEntry && !_earlyPipelineCacheVerify) {
+                _pipelineState = earlyEntry.pipeline;
+                _pipelineColor0Format = earlyEntry.color0Format;
+                _pipelineDepthFormat = earlyEntry.depthFormat;
+                _pipelineStencilFormat = earlyEntry.stencilFormat;
+                _pipelineProgramName = currentProgramName;
+                currentVAO->dirty_bits = 0u;
+                s_interfaceMismatchStreak = 0u;
+                s_interfaceMismatchProgramName = 0u;
+                s_interfaceMismatchRetryAfter = 0.0;
+                if (s_programMismatchProgramName == currentProgramName) {
+                    s_programMismatchProgramName = 0u;
+                    s_programMismatchRetryAfter = 0.0;
+                    s_programMismatchStreak = 0u;
+                }
+                if (_interfaceMismatchBlockedProgram == currentProgramName) {
+                    _interfaceMismatchBlockedProgram = 0u;
+                    _interfaceMismatchBlockedUntil = 0.0;
+                    _interfaceMismatchBlockedStreak = 0u;
+                }
+                MGL_PERF_INC(g_mglPipelineCacheHitsSinceSwap);
+                _earlyPipelineCacheHits++;
+                if (_earlyPipelineCacheHits <= 4u || (_earlyPipelineCacheHits % 65536u) == 0u) {
+                    NSLog(@"MGL EARLY PIPELINE hit count=%llu", (unsigned long long)_earlyPipelineCacheHits);
+                }
+                if (deferredBufferMapForPipelineBuild) {
+                    RETURN_FALSE_ON_FAILURE([self mapBuffersToMTL]);
+                    if (mappedCommandBuffer) *mappedCommandBuffer = _currentCommandBuffer;
+                }
+                state->dirty_bits &= ~(DIRTY_PROGRAM | DIRTY_VAO | DIRTY_FBO | DIRTY_ALPHA_STATE);
+                return true;
+            }
+
             if (!skipPipelineBuild) {
+            bool exactPipelineCompiled = false;
             // create pipeline descriptor
             MTLRenderPipelineDescriptor *pipelineStateDescriptor;
 
@@ -5467,15 +5512,33 @@ stencil_format_ok:;
                     ? mglVertexDescriptorSignatureForMasks(vertexDescriptor,
                         _vertexDescriptorAttributeMask, _vertexDescriptorLayoutMask)
                     : mglVertexDescriptorSignature(vertexDescriptor);
-	                const uint64_t pipelineCacheKeyWords[5] = {
+	                const uint64_t pipelineCacheKeyWords[11] = {
 	                    (uint64_t)currentProgramName,
 	                    (uint64_t)(unsigned)state->var.clip_origin,
 	                    (uint64_t)(unsigned)state->var.clip_depth_mode,
 	                    pipelineSig,
-	                    vertexSig
+                    vertexSig,
+                    currentVertexProgram ? currentVertexProgram->msl_texture_cache_instance_id : 0u,
+                    currentVertexProgram ? currentVertexProgram->msl_texture_cache_generation : 0u,
+                    currentFragmentProgram ? currentFragmentProgram->msl_texture_cache_instance_id : 0u,
+                    currentFragmentProgram ? currentFragmentProgram->msl_texture_cache_generation : 0u,
+                    (uint64_t)(uintptr_t)(__bridge void *)pipelineStateDescriptor.vertexFunction,
+                    (uint64_t)(uintptr_t)(__bridge void *)pipelineStateDescriptor.fragmentFunction
 	                };
 	                pipelineCacheKey = [NSData dataWithBytes:pipelineCacheKeyWords
 	                                                  length:sizeof(pipelineCacheKeyWords)];
+                if (earlyEntry && _earlyPipelineCacheVerify) {
+                    if (![earlyEntry.descriptorKey isEqualToData:pipelineCacheKey]) {
+                        NSLog(@"MGL EARLY PIPELINE verify mismatch; disabling early cache");
+                        _earlyPipelineCacheEnabled = NO;
+                        [_earlyPipelineStateCache removeAllObjects];
+                    } else {
+                        _earlyPipelineCacheChecks++;
+                        if (_earlyPipelineCacheChecks <= 4u || (_earlyPipelineCacheChecks % 65536u) == 0u) {
+                            NSLog(@"MGL EARLY PIPELINE verify match count=%llu", (unsigned long long)_earlyPipelineCacheChecks);
+                        }
+                    }
+                }
 	                id<MTLRenderPipelineState> cachedPipeline = [_pipelineStateCache objectForKey:pipelineCacheKey];
 	                if (cachedPipeline) {
 	                    static uint64_t s_pipelineCacheHitCount = 0;
@@ -5547,6 +5610,7 @@ stencil_format_ok:;
                 }
 
                 _pipelineState = [_device newRenderPipelineStateWithDescriptor:pipelineStateDescriptor error:&error];
+                exactPipelineCompiled = (_pipelineState != nil);
 
                 if (!_pipelineState) {
                     NSLog(@"MGL PIPELINE CREATE fail program=%u error=%@", (unsigned)currentProgramName, error);
@@ -5821,6 +5885,22 @@ stencil_format_ok:;
                 [self insertPipelineIntoCacheWithKey:pipelineCacheKey];
 	            }
 	            }
+
+                if (exactPipelineCompiled && _earlyPipelineCacheEnabled && pipelineCacheKey) {
+                    // Descriptor generation can bind shader/attachment resources and
+                    // repair blend state. Snapshot the resulting inputs, not stale inputs.
+                    NSData *builtInputKey = [self earlyPipelineInputKeyForVertexProgram:currentVertexProgram
+                        fragmentProgram:currentFragmentProgram vao:currentVAO];
+                    if (builtInputKey) {
+                        MGLEarlyPipelineCacheEntry *entry = [MGLEarlyPipelineCacheEntry new];
+                        entry.pipeline = _pipelineState;
+                        entry.descriptorKey = pipelineCacheKey;
+                        entry.color0Format = _pipelineColor0Format;
+                        entry.depthFormat = _pipelineDepthFormat;
+                        entry.stencilFormat = _pipelineStencilFormat;
+                        [_earlyPipelineStateCache setObject:entry forKey:builtInputKey];
+                    }
+                }
 
                 if (deferredBufferMapForPipelineBuild && _pipelineState != nil) {
                     RETURN_FALSE_ON_FAILURE([self mapBuffersToMTL]);

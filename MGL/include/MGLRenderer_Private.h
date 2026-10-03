@@ -240,6 +240,11 @@ typedef struct MGLPlainUniformArenaCacheEntry_t {
     MTLPixelFormat _pipelineStencilFormat;
     GLuint _pipelineProgramName;
     NSMutableDictionary<NSData *, id<MTLRenderPipelineState>> *_pipelineStateCache;
+    NSCache *_earlyPipelineStateCache;
+    BOOL _earlyPipelineCacheEnabled;
+    BOOL _earlyPipelineCacheVerify;
+    uint64_t _earlyPipelineCacheHits;
+    uint64_t _earlyPipelineCacheChecks;
     MTLRenderPipelineDescriptor *_scratchPipelineDescriptor;
     MTLVertexDescriptor *_scratchVertexDescriptor;
     uint32_t _vertexDescriptorAttributeMask;

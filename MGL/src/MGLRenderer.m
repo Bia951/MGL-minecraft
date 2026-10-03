@@ -11822,6 +11822,12 @@ void* CppCreateMGLRendererAndBindToContext (void *glm_ctx)
     _pipelineStencilFormat = MTLPixelFormatInvalid;
     _pipelineProgramName = 0;
     _pipelineStateCache = [[NSMutableDictionary alloc] initWithCapacity:64];
+    _earlyPipelineCacheEnabled = mglEnvFlagEnabled("MGL_EARLY_PIPELINE_CACHE");
+    _earlyPipelineCacheVerify = mglEnvFlagEnabled("MGL_EARLY_PIPELINE_CACHE_VERIFY");
+    if (_earlyPipelineCacheEnabled) {
+        _earlyPipelineStateCache = [NSCache new];
+        _earlyPipelineStateCache.countLimit = 256u;
+    }
     _dsCacheEnabled = mglEnvFlagEnabledDefaultOn("MGL_DS_CACHE");
     if (_dsCacheEnabled) {
         _depthStencilStateCache = [NSMutableDictionary new];
@@ -12149,6 +12155,8 @@ void* CppCreateMGLRendererAndBindToContext (void *glm_ctx)
             [_pipelineStateCache removeAllObjects];
             _pipelineStateCache = nil;
         }
+        [_earlyPipelineStateCache removeAllObjects];
+        _earlyPipelineStateCache = nil;
 
         // Cleanup drawable and layer
         if (_drawable) {
@@ -12372,6 +12380,7 @@ void* CppCreateMGLRendererAndBindToContext (void *glm_ctx)
     // Reset pipeline state
     _pipelineState = nil;
     [_pipelineStateCache removeAllObjects];
+    [_earlyPipelineStateCache removeAllObjects];
     // Note: _depthStencilState would be an instance variable if it exists
 
     // Clear all cached objects

@@ -81,6 +81,39 @@ C-to-Objective-C Metal bridge dispatches drain their own autorelease pools,
 including calls made by render loops that do not provide a per-frame pool.
 Persistent resources remain owned by renderer fields or retained C slots.
 
+### Pipeline lookup before descriptor construction
+
+`MGL_EARLY_PIPELINE_CACHE=1` enables a renderer-local `NSCache` with a
+256-entry eviction policy. Its key compares complete input bytes: VS/FS
+lifetime and link generations, Metal functions, clip and raster state,
+attachment formats and samples, blend and draw-buffer state, and resolved
+vertex stream layout. Buffer contents are excluded; transient buffers with the
+same stream grouping can reuse a pipeline. Pending program/attachment updates
+use the existing descriptor construction path.
+
+Only successful compilation of the requested descriptor populates this cache;
+fallback pipelines do not. Hits skip both pipeline and vertex descriptor
+construction and preserve the deferred buffer mapping and state binding path.
+The experiment defaults off.
+
+`MGL_EARLY_PIPELINE_CACHE_VERIFY=1` keeps descriptor construction on cache
+hits and compares the canonical descriptor key. A mismatch reports an error
+and disables the early cache for that renderer. This checks the input key in
+the actual application and must be disabled for performance measurements.
+
+The canonical PSO cache key also includes both stages' lifetime/link
+generations and Metal function identities, preventing reuse of an old linked
+executable when the descriptor layout is unchanged.
+
+In the Minecraft workload, verification reported 786432 matching cache-hit
+keys without a mismatch. An adjacent pair of visible, unlocked 90-second
+measurements at 1708x960 with Complementary and fixed noon measured 49.93 FPS
+with the early cache and 49.81 FPS without it. This did not establish a
+frame-rate benefit, so the experiment remains disabled by default. A separate
+five-second CPU sample saw neither descriptor construction method on the
+early-cache path; this confirms the path change, not a frame-rate gain or
+coverage of other applications.
+
 ### Descriptor reuse experiment
 
 `MGL_REUSE_PIPELINE_DESCRIPTORS=1` reuses a renderer-owned pipeline/vertex
