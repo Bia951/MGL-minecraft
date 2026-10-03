@@ -1719,7 +1719,12 @@ mglMetalCopyTextureBytesToBGRA8((const uint8_t *)readBuffer.contents,
 
     if (mgl_drawbuffer == _FRONT)
     {
-        if (!_drawable) {
+        if (_deferDrawableAcquireEnabled) {
+            if (![self ensureDrawableAvailableLocked:"readPixels.defaultFramebuffer"]) {
+                mglDispatchError(glm_ctx, __FUNCTION__, GL_INVALID_OPERATION);
+                return;
+            }
+        } else if (!_drawable) {
             [self mglSyncLayerDrawableSizeFromView:"readPixels.default"];
             _drawable = [_layer nextDrawable];
         }

@@ -27,6 +27,8 @@ Arena storage is reused only after command-buffer completion. The pool holds at 
 
 `MGL_CAPTURE_SWAP_FRAME=N` captures only swap N using the existing drawable readback path. It takes precedence over the repeated capture schedule when both capture options are set. Exclude the capture interval from performance measurements.
 
+When `MGL_CAPTURE_SWAP_FRAME=N` is set together with `MGL_CAPTURE_SWAP_FRAMES=1`, the default-blit source capture targets the corresponding default-blit call once, rather than following the repeated 300-call schedule. This assumes the application's default-blit sequence tracks swap numbers; if it does not, the requested call may not occur and no source file is captured.
+
 ## Sampled render-target copy experiment
 
 `MGL_RT_SAMPLE_COMPUTE=1` replaces nearest raster row-flip copies with compute for eligible unpacked, single-sample 2D float/normalized color textures. It is disabled by default. Unsupported formats retain raster copies. Dirty mip levels share a compute encoder, with level-zero views to support Mac GPUs that cannot write nonzero mip LODs directly. `MGL_RT_SAMPLE_COMPUTE_UNORM=0` keeps normalized formats on the raster path for format-specific comparisons.
@@ -55,6 +57,18 @@ drawable. The submitted command buffer still owns the presentation resource.
 This defaults off until a fixed-scene comparison establishes whether the extra
 reference contributes to drawable-pool waits.
 
+### Deferred drawable acquisition
+
+Drawable acquisition is deferred by default; `MGL_DEFER_DRAWABLE_ACQUIRE=0`
+restores eager acquisition for comparison. This delays `CAMetalLayer` acquisition until
+the default framebuffer is used or a swap must present. User-FBO work can run
+before that acquisition. The drawable is released after presentation, and the
+next frame does not prefetch another one. Default framebuffer draw, clear,
+readback, blit, CopyTex readback, and swap still acquire a drawable when needed.
+An unlocked, visible 90-second Minecraft run measured 48.67 FPS versus
+30.36 FPS in the adjacent eager-acquisition comparison; this is workload evidence, not a guarantee
+of the same gain in every application.
+
 ### Descriptor reuse experiment
 
 `MGL_REUSE_PIPELINE_DESCRIPTORS=1` reuses a renderer-owned pipeline/vertex
@@ -81,3 +95,10 @@ standalone translation. Names are retained and SPIR-V validation remains
 enabled. Stage/word-count messages confirm the experimental path ran. This
 defaults off pending shader resource mapping, actual-game visual checks and
 fixed-scene performance measurements.
+
+`MGL_SPIRV_OPTIMIZE=2` starts with unoptimized glslang IR and applies
+SPIRV-Tools' performance passes before reflection. The pass sequence preserves
+entry-point interfaces, resource bindings and specialization constants. Both
+input and optimized output are validated before reflection. Failure
+reports a shader compile error. This mode is also opt-in pending actual-game
+correctness and performance checks.

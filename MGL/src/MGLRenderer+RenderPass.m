@@ -3079,31 +3079,41 @@ static bool mglGeometryShaderIsPassthrough(const Shader *shader)
     // end encoding on current render encoder
     [self endRenderEncodingLocked];
 
-    // grab the next drawable from CAMetalLayer
-    if (_drawable == NULL)
-    {
-        if (!_layer) {
-            NSLog(@"MGL ERROR: Cannot get drawable - no CAMetalLayer available");
+    /* User FBO passes get their dimensions and formats from their attachments.
+     * In deferred mode they must not consume a CAMetalLayer drawable. Default
+     * framebuffer aliases backed by offscreen drawbuffers also need no drawable. */
+    if (!_deferDrawableAcquireEnabled) {
+        if (_drawable == NULL)
+        {
+            if (!_layer) {
+                NSLog(@"MGL ERROR: Cannot get drawable - no CAMetalLayer available");
+                return false;
+            }
+
+            CGSize expectedDrawableSize = [self mglSyncLayerDrawableSizeFromView:"newRenderEncoder.nextDrawable"];
+            _drawable = [_layer nextDrawable];
+
+            // Preserve legacy initial default scissor sizing when the experiment is off.
+            NSUInteger drawableWidth = (NSUInteger)MAX(1.0, expectedDrawableSize.width);
+            NSUInteger drawableHeight = (NSUInteger)MAX(1.0, expectedDrawableSize.height);
+            if (_drawable && _drawable.texture) {
+                drawableWidth = (NSUInteger)_drawable.texture.width;
+                drawableHeight = (NSUInteger)_drawable.texture.height;
+            }
+
+            if (!ctx->state.caps.scissor_test) {
+                ctx->state.var.scissor_box[0] = 0;
+                ctx->state.var.scissor_box[1] = 0;
+            }
+            ctx->state.var.scissor_box[2] = (GLint)drawableWidth;
+            ctx->state.var.scissor_box[3] = (GLint)drawableHeight;
+        }
+    } else if (!ctx->state.framebuffer &&
+               mglDefaultDrawBufferIndexForGL(ctx->state.draw_buffer) == _FRONT) {
+        if (![self ensureDrawableAvailableLocked:"newRenderEncoder.defaultFramebuffer"]) {
+            NSLog(@"MGL ERROR: Cannot get drawable for default framebuffer render pass");
             return false;
         }
-
-        CGSize expectedDrawableSize = [self mglSyncLayerDrawableSizeFromView:"newRenderEncoder.nextDrawable"];
-        _drawable = [_layer nextDrawable];
-
-        // late init of gl scissor box on attachment to window system
-        NSUInteger drawableWidth = (NSUInteger)MAX(1.0, expectedDrawableSize.width);
-        NSUInteger drawableHeight = (NSUInteger)MAX(1.0, expectedDrawableSize.height);
-        if (_drawable && _drawable.texture) {
-            drawableWidth = (NSUInteger)_drawable.texture.width;
-            drawableHeight = (NSUInteger)_drawable.texture.height;
-        }
-
-        if (!ctx->state.caps.scissor_test) {
-            ctx->state.var.scissor_box[0] = 0;
-            ctx->state.var.scissor_box[1] = 0;
-        }
-        ctx->state.var.scissor_box[2] = (GLint)drawableWidth;
-        ctx->state.var.scissor_box[3] = (GLint)drawableHeight;
     }
 
     _renderPassDescriptor = [MTLRenderPassDescriptor renderPassDescriptor];

@@ -7736,6 +7736,24 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
     return newDrawableSize;
 }
 
+- (BOOL)ensureDrawableAvailableLocked:(const char *)reason
+{
+    if (_drawable && _drawable.texture) {
+        return YES;
+    }
+    if (!_layer) {
+        return NO;
+    }
+
+    /* A previous drawable with a nil texture is unusable; drop it before
+     * asking the layer for a fresh one. Do not touch GL scissor state here:
+     * callers may have explicitly set it before the first drawable use. */
+    _drawable = nil;
+    [self mglSyncLayerDrawableSizeFromView:reason ? reason : "ensureDrawable"];
+    _drawable = [_layer nextDrawable];
+    return (_drawable != nil && _drawable.texture != nil);
+}
+
 - (BOOL)mglEnsureLayerDrawableSizeAtLeastWidth:(NSUInteger)requiredWidth
                                         height:(NSUInteger)requiredHeight
                                         reason:(const char *)reason
@@ -9100,8 +9118,12 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
             return;
         }
 
-        if (_drawable == NULL)
-        {
+        if (_deferDrawableAcquireEnabled) {
+            if (![self ensureDrawableAvailableLocked:"swap.present"]) {
+                NSLog(@"MGL ERROR: Failed to obtain drawable for presentation");
+                return;
+            }
+        } else if (_drawable == NULL) {
             if (traceSwap) {
                 MGLTraceNSLog(@"MGL TRACE swap.nextDrawable.begin call=%llu stage=pre_present", (unsigned long long)swapCall);
             }
@@ -9118,7 +9140,7 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
             }
         }
 
-        if (_drawable == NULL) {
+        if (!_deferDrawableAcquireEnabled && _drawable == NULL) {
             NSLog(@"MGL WARNING: Drawable is NULL in mtlSwapBuffers, getting new drawable");
             if (traceSwap) {
                 MGLTraceNSLog(@"MGL TRACE swap.nextDrawable.begin call=%llu stage=pre_present_retry", (unsigned long long)swapCall);
@@ -9285,32 +9307,38 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
             [self recordGPUError];
         }
 
-        /* The submitted command buffer owns its presentation resource.
-         * Drop our extra ownership before requesting another pool entry. */
-        if (mglEnvFlagEnabled("MGL_RELEASE_PRESENTED_DRAWABLE")) _drawable = nil;
+        if (_deferDrawableAcquireEnabled) {
+            /* Never carry a submitted drawable into the next frame. The next
+             * default-framebuffer operation will acquire one on demand. */
+            _drawable = nil;
+        } else {
+            /* The submitted command buffer owns its presentation resource.
+             * Preserve the legacy eager prefetch when the experiment is off. */
+            if (mglEnvFlagEnabled("MGL_RELEASE_PRESENTED_DRAWABLE")) _drawable = nil;
 
-        if (traceSwap) {
-            MGLTraceNSLog(@"MGL TRACE swap.nextDrawable.begin call=%llu stage=post_commit", (unsigned long long)swapCall);
-        }
-        static uint32_t s_postCommitNextDrawableLogBudget = 4;
-        if (s_postCommitNextDrawableLogBudget > 0) {
-            s_postCommitNextDrawableLogBudget--;
-            NSLog(@"MGL VIEW: postCommitNextDrawable layer=%p superlayer=%p view=%p view.layer=%p view.window=%p",
-                  _layer, _layer.superlayer, _view, _view.layer, _view.window);
-        }
-        _drawable = [_layer nextDrawable];
-        if (traceSwap) {
-            id<MTLTexture> tex = _drawable ? _drawable.texture : nil;
-            MGLTraceNSLog(@"MGL TRACE swap.nextDrawable.end call=%llu stage=post_commit drawable=%p tex=%p size=%lux%lu",
-                  (unsigned long long)swapCall,
-                  _drawable,
-                  tex,
-                  (unsigned long)(tex ? tex.width : 0),
-                  (unsigned long)(tex ? tex.height : 0));
-        }
-        if (_drawable == NULL) {
-            NSLog(@"MGL WARNING: Failed to get next drawable in mtlSwapBuffers");
-            return;
+            if (traceSwap) {
+                MGLTraceNSLog(@"MGL TRACE swap.nextDrawable.begin call=%llu stage=post_commit", (unsigned long long)swapCall);
+            }
+            static uint32_t s_postCommitNextDrawableLogBudget = 4;
+            if (s_postCommitNextDrawableLogBudget > 0) {
+                s_postCommitNextDrawableLogBudget--;
+                NSLog(@"MGL VIEW: postCommitNextDrawable layer=%p superlayer=%p view=%p view.layer=%p view.window=%p",
+                      _layer, _layer.superlayer, _view, _view.layer, _view.window);
+            }
+            _drawable = [_layer nextDrawable];
+            if (traceSwap) {
+                id<MTLTexture> tex = _drawable ? _drawable.texture : nil;
+                MGLTraceNSLog(@"MGL TRACE swap.nextDrawable.end call=%llu stage=post_commit drawable=%p tex=%p size=%lux%lu",
+                      (unsigned long long)swapCall,
+                      _drawable,
+                      tex,
+                      (unsigned long)(tex ? tex.width : 0),
+                      (unsigned long)(tex ? tex.height : 0));
+            }
+            if (_drawable == NULL) {
+                NSLog(@"MGL WARNING: Failed to get next drawable in mtlSwapBuffers");
+                return;
+            }
         }
 
         if (![self newCommandBufferLocked]) {
@@ -9820,11 +9848,15 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
         GLuint drawBufferIndex = mglDefaultDrawBufferIndexForGL(glm_ctx->state.draw_buffer);
         if (wantsColor) {
             if (drawBufferIndex == _FRONT) {
-                if (!_drawable && _layer) {
+                if (_deferDrawableAcquireEnabled) {
+                    if (![self ensureDrawableAvailableLocked:"scissored-clear.defaultFramebuffer"]) {
+                        wantsColor = NO;
+                    }
+                } else if (!_drawable && _layer) {
                     [self mglSyncLayerDrawableSizeFromView:"scissored-clear.nextDrawable"];
                     _drawable = [_layer nextDrawable];
                 }
-                colorTexture = _drawable ? _drawable.texture : nil;
+                if (wantsColor) colorTexture = _drawable ? _drawable.texture : nil;
             } else if (drawBufferIndex < _MAX_DRAW_BUFFERS) {
                 colorTexture = _drawBuffers[drawBufferIndex].drawbuffer;
                 if (!colorTexture) {
@@ -11886,6 +11918,7 @@ void* CppCreateMGLRendererAndBindToContext (void *glm_ctx)
     _layer = [[CAMetalLayer alloc] init];
     _swapInterval = 1;
     _earlySamplePreflightEnabled = mglEnvFlagEnabled("MGL_EARLY_SAMPLE_PREFLIGHT");
+    _deferDrawableAcquireEnabled = mglEnvFlagEnabledDefaultOn("MGL_DEFER_DRAWABLE_ACQUIRE");
     _layer.displaySyncEnabled = YES;
     if (!_layer) {
         NSLog(@"MGL ERROR: Failed to create Metal layer");

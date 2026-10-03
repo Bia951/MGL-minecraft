@@ -88,6 +88,9 @@ void mglEnableIndirectCommandBuffersForPipeline(MTLRenderPipelineDescriptor *pip
 
 @interface MGLRenderer ()
 
+/* Caller holds the renderer's Metal state lock. Does not alter GL scissor state. */
+- (BOOL)ensureDrawableAvailableLocked:(const char *)reason;
+
 // === Render pass state sync ===
 - (bool)syncRenderPassStateForContext:(GLMContext)glm_ctx;
 - (bool)rotateRenderEncoderForCurrentFramebufferLocked;

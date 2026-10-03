@@ -205,6 +205,8 @@ typedef struct MGLPlainUniformArenaCacheEntry_t {
     NSView *_view;
     CAMetalLayer *_layer;
     int _swapInterval;
+    /* Default-on scheduling optimization, latched at renderer initialization. */
+    BOOL _deferDrawableAcquireEnabled;
     id<CAMetalDrawable> _drawable;
     GLMContext  ctx;    // context macros need this exact name
     GLMState *_activeState;  // NULL = use live ctx->state (normal path)

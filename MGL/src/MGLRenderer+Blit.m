@@ -3,6 +3,8 @@
 
 #import "MGLRenderer_Private.h"
 #import "MGLRenderer+Blit_Private.h"
+#include <errno.h>
+#include <stdlib.h>
 
 /* Shared state for mtlBlitFramebuffer color blit helpers.
  * Filled after attachment resolution and clip computation, then
@@ -2092,11 +2094,31 @@ static void mglVerifySampledCopyIfSelected(id<MTLDevice> device,
     if (drawfbo == NULL) {
         NSUInteger requestedDrawableWidth = (NSUInteger)MAX(0, MAX(dstX0, dstX1));
         NSUInteger requestedDrawableHeight = (NSUInteger)MAX(0, MAX(dstY0, dstY1));
-        if ([self mglEnsureLayerDrawableSizeAtLeastWidth:requestedDrawableWidth
-                                                  height:requestedDrawableHeight
-                                                  reason:"blitFramebuffer.defaultDraw"]) {
+        BOOL resized = [self mglEnsureLayerDrawableSizeAtLeastWidth:requestedDrawableWidth
+                                                              height:requestedDrawableHeight
+                                                              reason:"blitFramebuffer.defaultDraw"];
+        if (_deferDrawableAcquireEnabled) {
+            if (resized) {
+                /* mglEnsureLayerDrawableSizeAtLeastWidth has already synced the
+                 * view and applied the larger requested size. Do not call the
+                 * ordinary ensure helper here: it would sync back to view size. */
+                _drawable = [_layer nextDrawable];
+            } else if (!_drawable || !_drawable.texture) {
+                if (![self ensureDrawableAvailableLocked:"blitFramebuffer.defaultDraw"]) {
+                    return NO;
+                }
+            }
+        } else if (resized) {
             _drawable = [_layer nextDrawable];
         }
+    }
+
+    /* The default read buffer is also a drawable-backed texture. This branch
+     * matters when blitting from the default framebuffer into a user FBO. */
+    if (readfbo == NULL && _deferDrawableAcquireEnabled &&
+        (!_drawable || !_drawable.texture) &&
+        ![self ensureDrawableAvailableLocked:"blitFramebuffer.defaultRead"]) {
+        return NO;
     }
 
     id<MTLTexture> readtexid;
@@ -2787,8 +2809,33 @@ static void mglVerifySampledCopyIfSelected(id<MTLDevice> device,
     // Read back the source of the final framebuffer blit alongside the
     // drawable capture, so a frozen source can be distinguished from a bad copy.
     static uint64_t s_captureDefaultBlit = 0;
-    if (getenv("MGL_CAPTURE_SWAP_FRAMES") && drawfbo == NULL &&
-        (++s_captureDefaultBlit % 300ull) == 0ull && s_captureDefaultBlit <= 9000ull &&
+    static uint64_t s_captureSwapFrameTarget = 0;
+    static dispatch_once_t s_captureSwapFrameTargetOnce;
+    BOOL captureSwapSourceThisCall = NO;
+    BOOL logDefaultBlitThisCall = NO;
+    if (getenv("MGL_CAPTURE_SWAP_FRAMES") && drawfbo == NULL) {
+        uint64_t captureCall = ++s_captureDefaultBlit;
+        dispatch_once(&s_captureSwapFrameTargetOnce, ^{
+            const char *targetText = getenv("MGL_CAPTURE_SWAP_FRAME");
+            if (targetText && targetText[0] != '-') {
+                char *end = NULL;
+                errno = 0;
+                unsigned long long parsed = strtoull(targetText, &end, 10);
+                if (errno == 0 && end != targetText && *end == '\0' && parsed > 0ull) {
+                    s_captureSwapFrameTarget = (uint64_t)parsed;
+                }
+            }
+        });
+
+        if (s_captureSwapFrameTarget > 0ull) {
+            captureSwapSourceThisCall = (captureCall == s_captureSwapFrameTarget);
+            logDefaultBlitThisCall = captureSwapSourceThisCall;
+        } else {
+            captureSwapSourceThisCall = (captureCall % 300ull) == 0ull && captureCall <= 9000ull;
+            logDefaultBlitThisCall = captureCall <= 5ull || (captureCall <= 9000ull && captureCall % 300ull <= 2ull);
+        }
+    }
+    if (captureSwapSourceThisCall &&
         readtexid.pixelFormat == MTLPixelFormatRGBA8Unorm && readSubresource.level == 0 &&
         readtexid.textureType == MTLTextureType2D) {
         NSUInteger captureWidth = readtexid.width;
@@ -2820,9 +2867,7 @@ static void mglVerifySampledCopyIfSelected(id<MTLDevice> device,
             NSLog(@"MGL captured blit source call=%llu path=%@", (unsigned long long)captureCall, path);
         }];
     }
-    if (getenv("MGL_CAPTURE_SWAP_FRAMES") && drawfbo == NULL &&
-        s_captureDefaultBlit <= 9000ull &&
-        (s_captureDefaultBlit <= 5ull || s_captureDefaultBlit % 300ull <= 2ull)) {
+    if (logDefaultBlitThisCall) {
         NSLog(@"MGL default blit call=%llu self=%p drawable=%p source=%p destination=%p commandBuffer=%p",
               (unsigned long long)s_captureDefaultBlit, self, _drawable,
               readtexid, drawtexid, _currentCommandBuffer);
