@@ -26,3 +26,58 @@ Arena storage is reused only after command-buffer completion. The pool holds at 
 ## Single-frame capture
 
 `MGL_CAPTURE_SWAP_FRAME=N` captures only swap N using the existing drawable readback path. It takes precedence over the repeated capture schedule when both capture options are set. Exclude the capture interval from performance measurements.
+
+## Sampled render-target copy experiment
+
+`MGL_RT_SAMPLE_COMPUTE=1` replaces nearest raster row-flip copies with compute for eligible unpacked, single-sample 2D float/normalized color textures. It is disabled by default. Unsupported formats retain raster copies. Dirty mip levels share a compute encoder, with level-zero views to support Mac GPUs that cannot write nonzero mip LODs directly. `MGL_RT_SAMPLE_COMPUTE_UNORM=0` keeps normalized formats on the raster path for format-specific comparisons.
+
+`MGL_RT_SAMPLE_COMPUTE_VERIFY=1` asynchronously compares raw source rows against reversed destination rows for up to eight format/size combinations, including newly copied mip levels. It inserts readback blits and retains their buffers until completion; it does not wait on the CPU. Leave verification disabled for performance comparisons.
+
+### Direct destination mip attachment experiment
+
+`MGL_RT_SAMPLE_DIRECT_MIP=1` removes the destination single-level texture view
+from the raster sampled-copy path. The render attachment addresses the original
+destination texture at the copied mip level, with viewport and scissor dimensions
+for that level. Source sampling keeps its single-level view, and compute copies
+keep both views. The flag defaults off pending real-game correctness and FPS
+comparison at fixed scene, resolution and shader settings.
+
+`MGL_RT_SAMPLE_COPY_VERIFY=1` applies the same asynchronous raw-byte mip
+verification to sampled copies made by either the raster or compute path.
+`MGL_RT_SAMPLE_COMPUTE_VERIFY` remains accepted for existing diagnostic launches.
+Both flags default off.
+
+### Presented drawable ownership experiment
+
+`MGL_RELEASE_PRESENTED_DRAWABLE=1` drops the renderer's strong reference to its
+submitted drawable after command buffer submission, before requesting the next
+drawable. The submitted command buffer still owns the presentation resource.
+This defaults off until a fixed-scene comparison establishes whether the extra
+reference contributes to drawable-pool waits.
+
+### Descriptor reuse experiment
+
+`MGL_REUSE_PIPELINE_DESCRIPTORS=1` reuses a renderer-owned pipeline/vertex
+descriptor pair. Each generation resets the descriptor to its defaults and
+executes the existing state translation, signature calculation and PSO lookup.
+The pair is used only by synchronous pipeline creation under the renderer lock.
+This defaults off pending actual-game correctness and performance comparison;
+Metal does not guarantee that reset preserves internal descriptor allocations.
+
+### Sampling preparation before FBO rotation
+
+`MGL_EARLY_SAMPLE_PREFLIGHT=1` prepares sampled color/depth copies before
+opening the incoming draw's framebuffer encoder. The previous encoder is ended
+before a stale source is copied, preserving draw ordering and stored contents.
+Final resource synchronization retains its normal freshness checks and binds.
+Parallel workers keep their existing path. This defaults off pending actual
+game correctness and frame-rate measurements.
+
+### SPIR-V optimization experiment
+
+`MGL_SPIRV_OPTIMIZE=1` enables the bundled glslang's GLSL optimization passes
+before SPIRV-Cross reflection and MSL translation, for both linked programs and
+standalone translation. Names are retained and SPIR-V validation remains
+enabled. Stage/word-count messages confirm the experimental path ran. This
+defaults off pending shader resource mapping, actual-game visual checks and
+fixed-scene performance measurements.

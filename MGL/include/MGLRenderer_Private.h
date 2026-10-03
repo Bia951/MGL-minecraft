@@ -238,6 +238,9 @@ typedef struct MGLPlainUniformArenaCacheEntry_t {
     MTLPixelFormat _pipelineStencilFormat;
     GLuint _pipelineProgramName;
     NSMutableDictionary<NSData *, id<MTLRenderPipelineState>> *_pipelineStateCache;
+    MTLRenderPipelineDescriptor *_scratchPipelineDescriptor;
+    MTLVertexDescriptor *_scratchVertexDescriptor;
+    BOOL _earlySamplePreflightEnabled;
     /* Gated by MGL_DS_CACHE (default ON; =0 disables).  Maps cache key →
      * id<MTLDepthStencilState> with simple LRU eviction at 64 entries. */
     NSMutableDictionary *_depthStencilStateCache;
@@ -317,6 +320,7 @@ typedef struct MGLPlainUniformArenaCacheEntry_t {
     id<MTLComputePipelineState> _depthReadCopyPipeline;
     id<MTLComputePipelineState> _depthReadArrayCopyPipeline;
     id<MTLComputePipelineState> _copyImageRowFlipPipeline;
+    id<MTLComputePipelineState> _sampledCopyComputePipeline;
     id<MTLBuffer> _copyImageRowFlipSourceBuffer;
     id<MTLBuffer> _copyImageRowFlipDestinationBuffer;
     MGLPlainUniformVersion *_replayUniformVersions[_MAX_SHADER_TYPES];

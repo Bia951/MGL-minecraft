@@ -297,27 +297,6 @@ static void mglRendererDiagnosticBuildMarker(void)
                 __TIME__);
 }
 
-// CRITICAL SECURITY: Safe Metal object validation helper
-static inline id<NSObject> SafeMetalBridge(void *ptr, Class expectedClass, const char *objectName) {
-    if (!ptr) {
-        NSLog(@"MGL SECURITY ERROR: NULL pointer for %s", objectName);
-        return nil;
-    }
-
-    id<NSObject> obj = (__bridge id<NSObject>)(ptr);
-    if (!obj) {
-        NSLog(@"MGL SECURITY ERROR: Metal bridge cast returned nil for %s", objectName);
-        return nil;
-    }
-
-    if (expectedClass && [obj isKindOfClass:expectedClass] == NO) {
-        NSLog(@"MGL SECURITY ERROR: Metal object is not valid %s (got %@)", objectName, NSStringFromClass([obj class]));
-        return nil;
-    }
-
-    return obj;
-}
-
 NSRange mglRendererFindMSLEntryParameterClose(NSString *msl, const char *entryPoint)
 {
     if (!msl || !entryPoint || entryPoint[0] == '\0') {
@@ -4709,7 +4688,7 @@ static BOOL mglSnapshotSharedBufferRange(id<MTLDevice> device,
                 RETURN_FALSE_ON_NULL(ptr->data.mtl_data);
             }
 
-            id<MTLBuffer> buffer = (id<MTLBuffer>)SafeMetalBridge(ptr->data.mtl_data, objc_getClass("MTLBuffer"), "MTLBuffer");
+            id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)(ptr->data.mtl_data);
             if (!buffer) {
                 NSLog(@"MGL SECURITY ERROR: Failed to validate small Metal buffer (buffer %u)", ptr->name);
                 return false;
@@ -4853,8 +4832,7 @@ static BOOL mglSnapshotSharedBufferRange(id<MTLDevice> device,
             RETURN_FALSE_ON_NULL(ptr->data.mtl_data);
         }
 
-        // CRITICAL SECURITY FIX: Safe Metal buffer validation
-        id<MTLBuffer> buffer = (id<MTLBuffer>)SafeMetalBridge(ptr->data.mtl_data, objc_getClass("MTLBuffer"), "MTLBuffer");
+        id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)(ptr->data.mtl_data);
         if (!buffer) {
             NSLog(@"MGL SECURITY ERROR: Failed to validate Metal buffer (buffer %u)", ptr->name);
             return false;
@@ -8957,6 +8935,15 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
     static volatile double s_mainThreadHeartbeatSeconds = 0.0;
     static volatile uint64_t s_mainThreadPingCount = 0;
     uint64_t swapCall = ++s_swapCallCount;
+    if (mglPerfSummaryEnabled() && (swapCall == 1u || swapCall == 60u || swapCall % 300u == 0u)) {
+        NSWindow *window = _view.window;
+        NSLog(@"MGL PRESENT STATE call=%llu active=%d visible=%d occlusionVisible=%d refresh=%ld drawableCount=%lu",
+              (unsigned long long)swapCall, (int)NSApp.isActive,
+              (int)window.isVisible,
+              (int)((window.occlusionState & NSWindowOcclusionStateVisible) != 0),
+              (long)window.screen.maximumFramesPerSecond,
+              (unsigned long)_layer.maximumDrawableCount);
+    }
     double swapStartSeconds = mglNowSeconds();
     bool traceSwap = mglShouldTraceCall(swapCall);
     MGL_FRAME_STORE(g_mglSwapCallCount, swapCall);
@@ -9297,6 +9284,10 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
             NSLog(@"MGL ERROR: Failed to commit command buffer: %@", exception);
             [self recordGPUError];
         }
+
+        /* The submitted command buffer owns its presentation resource.
+         * Drop our extra ownership before requesting another pool entry. */
+        if (mglEnvFlagEnabled("MGL_RELEASE_PRESENTED_DRAWABLE")) _drawable = nil;
 
         if (traceSwap) {
             MGLTraceNSLog(@"MGL TRACE swap.nextDrawable.begin call=%llu stage=post_commit", (unsigned long long)swapCall);
@@ -11894,6 +11885,7 @@ void* CppCreateMGLRendererAndBindToContext (void *glm_ctx)
 
     _layer = [[CAMetalLayer alloc] init];
     _swapInterval = 1;
+    _earlySamplePreflightEnabled = mglEnvFlagEnabled("MGL_EARLY_SAMPLE_PREFLIGHT");
     _layer.displaySyncEnabled = YES;
     if (!_layer) {
         NSLog(@"MGL ERROR: Failed to create Metal layer");

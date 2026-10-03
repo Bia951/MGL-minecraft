@@ -3604,7 +3604,18 @@ create_new_command_buffer:
 	        return nil;
 	    }
 
-	    MTLRenderPipelineDescriptor *pipelineStateDescriptor = [[MTLRenderPipelineDescriptor alloc] init];
+    // Generation and synchronous compilation run under METAL_LOCK. Reset
+    // restores every default, including attachments absent in the next pass.
+    MTLRenderPipelineDescriptor *pipelineStateDescriptor;
+    if (mglEnvFlagEnabled("MGL_REUSE_PIPELINE_DESCRIPTORS")) {
+        if (!_scratchPipelineDescriptor) {
+            _scratchPipelineDescriptor = [[MTLRenderPipelineDescriptor alloc] init];
+        }
+        pipelineStateDescriptor = _scratchPipelineDescriptor;
+        [pipelineStateDescriptor reset];
+    } else {
+        pipelineStateDescriptor = [[MTLRenderPipelineDescriptor alloc] init];
+    }
     if (!pipelineStateDescriptor) {
         NSLog(@"MGL PIPELINE DESC fail: descriptor allocation failed for key=%u",
               (unsigned)renderProgramKey);
@@ -3813,7 +3824,15 @@ create_new_command_buffer:
 #pragma mark vertex descriptor
 - (MTLVertexDescriptor *)generateVertexDescriptor
 {
-    MTLVertexDescriptor *vertexDescriptor = [[MTLVertexDescriptor alloc] init];
+    MTLVertexDescriptor *vertexDescriptor;
+    if (mglEnvFlagEnabled("MGL_REUSE_PIPELINE_DESCRIPTORS")) {
+        if (!_scratchVertexDescriptor) {
+            _scratchVertexDescriptor = [[MTLVertexDescriptor alloc] init];
+        }
+        vertexDescriptor = _scratchVertexDescriptor;
+    } else {
+        vertexDescriptor = [[MTLVertexDescriptor alloc] init];
+    }
     if (!vertexDescriptor) {
         NSLog(@"MGL VERTEX ERROR: failed to allocate MTLVertexDescriptor");
         return nil;
@@ -3833,7 +3852,7 @@ create_new_command_buffer:
               (unsigned)activeProgramName, vao, vao->enabled_attribs);
     }
 
-    [vertexDescriptor reset]; // ??? debug
+    [vertexDescriptor reset];
     maxAttribs = MAX_ATTRIBS;
 
     // Get the vertex shader MSL source to check which attributes are actually used.
@@ -6000,6 +6019,16 @@ stencil_format_ok:;
         if (framebuffer) {
             framebuffer->dirty_bits &= ~DIRTY_FBO_BINDING;
         }
+    }
+
+    /* Sampling preparation uses the incoming draw's GL state/reflection.
+     * Complete uploads/copies before opening its render encoder, so copies
+     * do not immediately close an otherwise empty target pass. The existing
+     * final resource sync still validates freshness and binds every resource.
+     * Parallel workers retain their existing encoder ownership. */
+    if (_earlySamplePreflightEnabled && !_parallelEncodeActive) {
+        RETURN_FALSE_ON_FAILURE([self bindActiveTexturesToMTL]);
+        RETURN_FALSE_ON_FAILURE([self prepareSampledCopiesForDraw]);
     }
 
     /* Stage 4 instrumentation: an FBO change forced a real encoder rotation

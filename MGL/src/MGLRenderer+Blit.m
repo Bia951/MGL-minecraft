@@ -67,7 +67,296 @@ static NSUInteger mglCopyImageRawPixelSize(MTLPixelFormat format)
     }
 }
 
+typedef struct MGLSampledCopyVerifyLevel {
+    NSUInteger level;
+    NSUInteger width;
+    NSUInteger height;
+    NSUInteger activeBytes;
+    NSUInteger rowBytes;
+    NSUInteger bytesPerImage;
+    NSUInteger sourceOffset;
+    NSUInteger destinationOffset;
+} MGLSampledCopyVerifyLevel;
+
+static void mglVerifySampledCopyIfSelected(id<MTLDevice> device,
+                                                   id<MTLCommandBuffer> commandBuffer,
+                                                   id<MTLTexture> source,
+                                                   id<MTLTexture> destination,
+                                                   NSUInteger mipLevels,
+                                                   uint32_t copiedMask)
+{
+    if ((!mglEnvFlagEnabled("MGL_RT_SAMPLE_COMPUTE_VERIFY") &&
+         !mglEnvFlagEnabled("MGL_RT_SAMPLE_COPY_VERIFY")) ||
+        !device || !commandBuffer || !source || !destination || copiedMask == 0u) {
+        return;
+    }
+
+    static struct {
+        MTLPixelFormat format;
+        NSUInteger width;
+        NSUInteger height;
+        uint32_t verifiedMask;
+    } selected[8];
+    static NSUInteger selectedCount = 0u;
+    BOOL shouldVerify = NO;
+    NSUInteger selectedIndex = NSUIntegerMax;
+    uint32_t verifyMask = 0u;
+    @synchronized ([MGLRenderer class]) {
+        BOOL known = NO;
+        for (NSUInteger i = 0; i < selectedCount; i++) {
+            if (selected[i].format == source.pixelFormat &&
+                selected[i].width == source.width &&
+                selected[i].height == source.height) {
+                known = YES;
+                selectedIndex = i;
+                verifyMask = copiedMask & ~selected[i].verifiedMask;
+                break;
+            }
+        }
+        if (!known && selectedCount < (sizeof(selected) / sizeof(selected[0]))) {
+            selectedIndex = selectedCount;
+            selected[selectedCount].format = source.pixelFormat;
+            selected[selectedCount].width = source.width;
+            selected[selectedCount].height = source.height;
+            selected[selectedCount].verifiedMask = 0u;
+            selectedCount++;
+            verifyMask = copiedMask;
+            shouldVerify = YES;
+        }
+        if (known && verifyMask != 0u) shouldVerify = YES;
+    }
+    if (!shouldVerify) return;
+
+    NSUInteger bytesPerPixel = mglCopyImageRawPixelSize(source.pixelFormat);
+    MGLSampledCopyVerifyLevel levels[32];
+    NSUInteger levelCount = 0u;
+    NSUInteger totalBytesPerHalf = 0u;
+    NSUInteger limit = MIN(mipLevels, 32u);
+    for (NSUInteger level = 0; level < limit; level++) {
+        if ((verifyMask & ((uint32_t)1u << level)) == 0u) continue;
+        NSUInteger width = MAX((NSUInteger)1u, source.width >> level);
+        NSUInteger height = MAX((NSUInteger)1u, source.height >> level);
+        NSUInteger destinationWidth = MAX((NSUInteger)1u, destination.width >> level);
+        NSUInteger destinationHeight = MAX((NSUInteger)1u, destination.height >> level);
+        if (width != destinationWidth || height != destinationHeight ||
+            level >= source.mipmapLevelCount || level >= destination.mipmapLevelCount ||
+            bytesPerPixel == 0u || width > NSUIntegerMax / bytesPerPixel) {
+            NSLog(@"MGL RT-SAMPLE COPY VERIFY skipped fmt=%lu size=%lux%lu reason=unsupported-level-%lu",
+                  (unsigned long)source.pixelFormat,
+                  (unsigned long)source.width, (unsigned long)source.height,
+                  (unsigned long)level);
+            return;
+        }
+        NSUInteger activeBytes = width * bytesPerPixel;
+        if (activeBytes > NSUIntegerMax - 255u) {
+            NSLog(@"MGL RT-SAMPLE COPY VERIFY skipped fmt=%lu size=%lux%lu reason=row-overflow",
+                  (unsigned long)source.pixelFormat,
+                  (unsigned long)source.width, (unsigned long)source.height);
+            return;
+        }
+        NSUInteger rowBytes = (activeBytes + 255u) & ~(NSUInteger)255u;
+        if (height == 0u || rowBytes > NSUIntegerMax / height) {
+            NSLog(@"MGL RT-SAMPLE COPY VERIFY skipped fmt=%lu size=%lux%lu reason=image-overflow",
+                  (unsigned long)source.pixelFormat,
+                  (unsigned long)source.width, (unsigned long)source.height);
+            return;
+        }
+        NSUInteger bytesPerImage = rowBytes * height;
+        if (totalBytesPerHalf > NSUIntegerMax - bytesPerImage) {
+            NSLog(@"MGL RT-SAMPLE COPY VERIFY skipped fmt=%lu size=%lux%lu reason=buffer-overflow",
+                  (unsigned long)source.pixelFormat,
+                  (unsigned long)source.width, (unsigned long)source.height);
+            return;
+        }
+        MGLSampledCopyVerifyLevel *record = &levels[levelCount++];
+        record->level = level;
+        record->width = width;
+        record->height = height;
+        record->activeBytes = activeBytes;
+        record->rowBytes = rowBytes;
+        record->bytesPerImage = bytesPerImage;
+        record->sourceOffset = totalBytesPerHalf;
+        record->destinationOffset = 0u;
+        totalBytesPerHalf += bytesPerImage;
+    }
+    if (levelCount == 0u || totalBytesPerHalf > NSUIntegerMax / 2u ||
+        totalBytesPerHalf * 2u > device.maxBufferLength) {
+        NSLog(@"MGL RT-SAMPLE COPY VERIFY skipped fmt=%lu size=%lux%lu reason=buffer-limit",
+              (unsigned long)source.pixelFormat,
+              (unsigned long)source.width, (unsigned long)source.height);
+        return;
+    }
+    for (NSUInteger i = 0; i < levelCount; i++) {
+        levels[i].destinationOffset = totalBytesPerHalf + levels[i].sourceOffset;
+    }
+
+    id<MTLBuffer> verification = [device newBufferWithLength:totalBytesPerHalf * 2u
+                                                      options:MTLResourceStorageModeShared];
+    if (!verification || !verification.contents) {
+        NSLog(@"MGL RT-SAMPLE COPY VERIFY skipped fmt=%lu size=%lux%lu reason=buffer-allocation",
+              (unsigned long)source.pixelFormat,
+              (unsigned long)source.width, (unsigned long)source.height);
+        return;
+    }
+    id<MTLBlitCommandEncoder> blit = mglProfileBlit(commandBuffer, __func__, __LINE__);
+    if (!blit) {
+        NSLog(@"MGL RT-SAMPLE COPY VERIFY skipped fmt=%lu size=%lux%lu reason=blit-encoder",
+              (unsigned long)source.pixelFormat,
+              (unsigned long)source.width, (unsigned long)source.height);
+        return;
+    }
+    for (NSUInteger i = 0; i < levelCount; i++) {
+        const MGLSampledCopyVerifyLevel *record = &levels[i];
+        MTLSize size = MTLSizeMake(record->width, record->height, 1u);
+        MTLOrigin origin = MTLOriginMake(0u, 0u, 0u);
+        [blit copyFromTexture:source sourceSlice:0 sourceLevel:record->level
+                 sourceOrigin:origin sourceSize:size toBuffer:verification
+            destinationOffset:record->sourceOffset
+       destinationBytesPerRow:record->rowBytes
+     destinationBytesPerImage:record->bytesPerImage];
+        [blit copyFromTexture:destination sourceSlice:0 sourceLevel:record->level
+                 sourceOrigin:origin sourceSize:size toBuffer:verification
+            destinationOffset:record->destinationOffset
+       destinationBytesPerRow:record->rowBytes
+     destinationBytesPerImage:record->bytesPerImage];
+    }
+    [blit endEncoding];
+
+    NSData *levelData = [NSData dataWithBytes:levels
+                                      length:levelCount * sizeof(levels[0])];
+    NSUInteger verifyWidth = source.width;
+    NSUInteger verifyHeight = source.height;
+    MTLPixelFormat verifyFormat = source.pixelFormat;
+    [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+        if (completed.status != MTLCommandBufferStatusCompleted || !verification.contents) {
+            NSLog(@"MGL WARNING: RT sampled compute verify readback unavailable fmt=%lu size=%lux%lu status=%ld",
+                  (unsigned long)verifyFormat,
+                  (unsigned long)verifyWidth, (unsigned long)verifyHeight,
+                  (long)completed.status);
+            return;
+        }
+        const uint8_t *bytes = verification.contents;
+        const MGLSampledCopyVerifyLevel *records = levelData.bytes;
+        NSUInteger recordsCount = levelData.length / sizeof(records[0]);
+        for (NSUInteger i = 0; i < recordsCount; i++) {
+            const MGLSampledCopyVerifyLevel *record = &records[i];
+            BOOL matched = YES;
+            NSUInteger mismatchRow = 0u;
+            for (NSUInteger row = 0; row < record->height; row++) {
+                const uint8_t *sourceRow = bytes + record->sourceOffset +
+                    (record->height - 1u - row) * record->rowBytes;
+                const uint8_t *destinationRow = bytes + record->destinationOffset +
+                    row * record->rowBytes;
+                if (memcmp(sourceRow, destinationRow, record->activeBytes) != 0) {
+                    matched = NO;
+                    mismatchRow = row;
+                    break;
+                }
+            }
+            if (matched) {
+                NSLog(@"MGL RT-SAMPLE COPY VERIFY bit-exact fmt=%lu size=%lux%lu level=%lu",
+                      (unsigned long)verifyFormat,
+                      (unsigned long)record->width, (unsigned long)record->height,
+                      (unsigned long)record->level);
+            } else {
+                NSLog(@"MGL ERROR: RT-SAMPLE COPY VERIFY mismatch fmt=%lu size=%lux%lu level=%lu row=%lu",
+                      (unsigned long)verifyFormat,
+                      (unsigned long)record->width, (unsigned long)record->height,
+                      (unsigned long)record->level, (unsigned long)mismatchRow);
+            }
+        }
+    }];
+    @synchronized ([MGLRenderer class]) {
+        if (selectedIndex < selectedCount &&
+            selected[selectedIndex].format == verifyFormat &&
+            selected[selectedIndex].width == verifyWidth &&
+            selected[selectedIndex].height == verifyHeight) {
+            selected[selectedIndex].verifiedMask |= verifyMask;
+        }
+    }
+}
+
 @implementation MGLRenderer (Blit)
+- (BOOL)canComputeSampledCopyForTexture:(id<MTLTexture>)source
+{
+    if (!mglEnvFlagEnabled("MGL_RT_SAMPLE_COMPUTE") ||
+        source.sampleCount != 1 || !(source.usage & MTLTextureUsageShaderRead)) return NO;
+    /* Writable, unpacked float/normalized color formats. sRGB, packed color,
+     * depth/stencil and integer resources retain their existing paths. */
+    switch (source.pixelFormat) {
+        case MTLPixelFormatR8Unorm: case MTLPixelFormatRG8Unorm:
+        case MTLPixelFormatRGBA8Unorm:
+        case MTLPixelFormatR16Unorm: case MTLPixelFormatRG16Unorm:
+        case MTLPixelFormatRGBA16Unorm:
+            return mglEnvFlagEnabledDefaultOn("MGL_RT_SAMPLE_COMPUTE_UNORM");
+        case MTLPixelFormatR16Float: case MTLPixelFormatRG16Float:
+        case MTLPixelFormatRGBA16Float:
+        case MTLPixelFormatR32Float: case MTLPixelFormatRG32Float:
+        case MTLPixelFormatRGBA32Float: return YES;
+        default: return NO;
+    }
+}
+
+- (uint32_t)computeSampledCopyFromTexture:(id<MTLTexture>)source
+                              toTexture:(id<MTLTexture>)destination
+                              mipLevels:(NSUInteger)mipLevels
+                                   mask:(uint32_t)mask
+{
+    if (!_sampledCopyComputePipeline) {
+        NSString *code = @"#include <metal_stdlib>\nusing namespace metal;\n"
+            "kernel void mgl_sampled_copy_flip(texture2d<float, access::read> src [[texture(0)]], "
+            "texture2d<float, access::write> dst [[texture(1)]], "
+            "uint2 p [[thread_position_in_grid]]) { "
+            "uint w = dst.get_width(), h = dst.get_height(); "
+            "if (p.x >= w || p.y >= h) return; "
+            "dst.write(src.read(uint2(p.x, h - 1u - p.y)), p); }";
+        NSError *error = nil;
+        id<MTLLibrary> library = [self newMetalLibraryWithSource:code options:nil
+            label:@"sampled_copy_compute_flip" error:&error];
+        id<MTLFunction> function = [library newFunctionWithName:@"mgl_sampled_copy_flip"];
+        if (function) _sampledCopyComputePipeline = [_device newComputePipelineStateWithFunction:function error:&error];
+        if (!_sampledCopyComputePipeline) {
+            NSLog(@"MGL ERROR: sampled-copy compute pipeline: %@", error);
+            return 0u;
+        }
+    }
+    id<MTLComputeCommandEncoder> encoder = mglProfileCompute(_currentCommandBuffer, __func__, __LINE__);
+    if (!encoder) return 0u;
+    [encoder setComputePipelineState:_sampledCopyComputePipeline];
+    NSUInteger columns = _sampledCopyComputePipeline.threadExecutionWidth;
+    NSUInteger rows = MIN((NSUInteger)8u, _sampledCopyComputePipeline.maxTotalThreadsPerThreadgroup / columns);
+    uint32_t copiedMask = 0u;
+    for (NSUInteger level = 0; level < mipLevels; level++) {
+        if (!(mask & ((uint32_t)1u << level))) continue;
+        /* Level-zero views also work on Mac GPUs which cannot write a
+         * nonzero mip LOD directly from a compute shader. */
+        id<MTLTexture> srcLevel = source, dstLevel = destination;
+        if (mipLevels > 1u) {
+            srcLevel = [source newTextureViewWithPixelFormat:source.pixelFormat
+                textureType:MTLTextureType2D levels:NSMakeRange(level, 1u) slices:NSMakeRange(0u, 1u)];
+            dstLevel = [destination newTextureViewWithPixelFormat:destination.pixelFormat
+                textureType:MTLTextureType2D levels:NSMakeRange(level, 1u) slices:NSMakeRange(0u, 1u)];
+            if (!srcLevel || !dstLevel) continue;
+        }
+        NSUInteger width = dstLevel.width, height = dstLevel.height;
+        [encoder setTexture:srcLevel atIndex:0];
+        [encoder setTexture:dstLevel atIndex:1];
+        [encoder dispatchThreadgroups:MTLSizeMake((width + columns - 1u) / columns,
+                                                  (height + rows - 1u) / rows, 1)
+            threadsPerThreadgroup:MTLSizeMake(columns, rows, 1)];
+        copiedMask |= (uint32_t)1u << level;
+    }
+    [encoder endEncoding];
+    static uint64_t calls = 0;
+    if (mglPerfSummaryEnabled() && (++calls <= 8u || calls % 4096u == 0u)) {
+        NSLog(@"MGL PERF: sampled_copy_compute call=%llu fmt=%lu size=%lux%lu levels=%lu mask=0x%x",
+              (unsigned long long)calls, (unsigned long)source.pixelFormat,
+              (unsigned long)source.width, (unsigned long)source.height,
+              (unsigned long)mipLevels, copiedMask);
+    }
+    return copiedMask;
+}
+
 /* Reverse physical rows without interpreting texels: NaN payloads, integer
  * values, sRGB bytes and depth bits all pass through unchanged. The two
  * private buffers are reused on our serial queue with tracked GPU hazards. */
@@ -947,6 +1236,7 @@ static NSUInteger mglCopyImageRawPixelSize(MTLPixelFormat format)
             desc.mipmapLevelCount = copyLevelCount;
         }
         desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+        if ([self canComputeSampledCopyForTexture:source]) desc.usage |= MTLTextureUsageShaderWrite;
         desc.storageMode = MTLStorageModePrivate;
 
         id<MTLTexture> copy = [_device newTextureWithDescriptor:desc];
@@ -1062,22 +1352,36 @@ static NSUInteger mglCopyImageRawPixelSize(MTLPixelFormat format)
         copyMask = mipMask;
     }
     uint32_t copiedMask = 0u;
+    if ([self canComputeSampledCopyForTexture:source] &&
+        (destination.usage & MTLTextureUsageShaderWrite)) {
+        copiedMask = [self computeSampledCopyFromTexture:source toTexture:destination
+                                             mipLevels:mipLevels mask:copyMask];
+    }
     for (NSUInteger lvl = 0u; lvl < mipLevels; lvl++) {
+        if (copiedMask & ((uint32_t)1u << lvl)) continue;
         if ((copyMask & ((uint32_t)1u << lvl)) == 0u) {
             continue;
         }
         @autoreleasepool {
             id<MTLTexture> srcLvl = source;
             id<MTLTexture> dstLvl = destination;
+            BOOL directDestinationMip = mglEnvFlagEnabled("MGL_RT_SAMPLE_DIRECT_MIP");
+            NSUInteger destinationLevel = directDestinationMip ? lvl : 0u;
+            NSUInteger levelWidth = MAX((NSUInteger)1u, destination.width >> lvl);
+            NSUInteger levelHeight = MAX((NSUInteger)1u, destination.height >> lvl);
             if (mipLevels > 1u) {
                 srcLvl = [source newTextureViewWithPixelFormat:source.pixelFormat
                                                    textureType:MTLTextureType2D
 	                                                    levels:NSMakeRange(lvl, 1u)
 	                                                    slices:NSMakeRange(0, 1u)];
-                dstLvl = [destination newTextureViewWithPixelFormat:destination.pixelFormat
-                                                        textureType:MTLTextureType2D
-                                                             levels:NSMakeRange(lvl, 1u)
-                                                             slices:NSMakeRange(0, 1u)];
+                /* A render attachment can address its mip directly;
+                 * source sampling still needs a single-level view. */
+                if (!directDestinationMip) {
+                    dstLvl = [destination newTextureViewWithPixelFormat:destination.pixelFormat
+                                                            textureType:MTLTextureType2D
+                                                                 levels:NSMakeRange(lvl, 1u)
+                                                                 slices:NSMakeRange(0, 1u)];
+                }
                 if (!srcLvl || !dstLvl) {
                     static uint64_t s_levelViewFailCount = 0;
                     uint64_t hit = ++s_levelViewFailCount;
@@ -1093,11 +1397,11 @@ static NSUInteger mglCopyImageRawPixelSize(MTLPixelFormat format)
 
             MTLRenderPassDescriptor *copyPass = [MTLRenderPassDescriptor renderPassDescriptor];
             copyPass.colorAttachments[0].texture = dstLvl;
-            copyPass.colorAttachments[0].level = 0u;
+            copyPass.colorAttachments[0].level = destinationLevel;
             copyPass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
             copyPass.colorAttachments[0].storeAction = MTLStoreActionStore;
-            copyPass.renderTargetWidth = dstLvl.width;
-            copyPass.renderTargetHeight = dstLvl.height;
+            copyPass.renderTargetWidth = levelWidth;
+            copyPass.renderTargetHeight = levelHeight;
 
             id<MTLRenderCommandEncoder> copyEncoder = mglProfileRender(_currentCommandBuffer, copyPass, __func__, __LINE__, ctx ? ctx->state.program_name : 0, ctx && ctx->state.framebuffer ? ctx->state.framebuffer->name : 0);
             if (!copyEncoder) {
@@ -1121,16 +1425,16 @@ static NSUInteger mglCopyImageRawPixelSize(MTLPixelFormat format)
             [copyEncoder setViewport:(MTLViewport){
                 .originX = 0.0,
                 .originY = 0.0,
-                .width = (double)dstLvl.width,
-                .height = (double)dstLvl.height,
+                .width = (double)levelWidth,
+                .height = (double)levelHeight,
                 .znear = 0.0,
                 .zfar = 1.0
             }];
             [copyEncoder setScissorRect:(MTLScissorRect){
                 .x = 0,
                 .y = 0,
-                .width = dstLvl.width,
-                .height = dstLvl.height
+                .width = levelWidth,
+                .height = levelHeight
             }];
             [copyEncoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
             [copyEncoder endEncoding];
@@ -1138,6 +1442,8 @@ static NSUInteger mglCopyImageRawPixelSize(MTLPixelFormat format)
         }
     }
 
+    mglVerifySampledCopyIfSelected(_device, _currentCommandBuffer,
+                                  source, destination, mipLevels, copiedMask);
     tex->mtl_gl_sampled_dirty_mip_mask &= ~copiedMask;
     if ((tex->mtl_gl_sampled_dirty_mip_mask & mipMask) == 0u) {
         tex->mtl_gl_sampled_write_version = tex->mtl_render_target_write_version;

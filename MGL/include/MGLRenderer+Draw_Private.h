@@ -218,6 +218,7 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
 - (bool)bindVertexBuffersToCurrentRenderEncoder;
 - (bool)bindFragmentBuffersToCurrentRenderEncoder;
 - (bool)bindActiveTexturesToMTL;
+- (bool)prepareSampledCopiesForDraw;
 
 // === Stage 5.3: Parallel command recording infrastructure ===
 - (void)saveDedupStateToWorker:(MGLWorkerContext *)worker;

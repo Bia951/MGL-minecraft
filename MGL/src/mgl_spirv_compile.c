@@ -49,6 +49,7 @@
 #include "mgl_metal_ref.h"
 #include "mgl_uniform_reflection.h"
 #include "mgl_spirv_compile.h"
+#include "mgl_spirv_generate.h"
 
 bool mglMSLIdentifierChar(char c)
 {
@@ -6464,7 +6465,7 @@ bool compileStageFromLinkedProgram(GLMContext ctx, Program *pptr, glslang_progra
     if (MGL_VERBOSE_PROGRAM_LOGS) {
         fprintf(stderr, "MGL DEBUG: Generating SPIRV for stage %d\n", stage);
     }
-    glslang_program_SPIRV_generate(glsl_program, stage);
+    mglGenerateProgramSPIRV(glsl_program, stage);
     if (MGL_VERBOSE_PROGRAM_LOGS) {
         fprintf(stderr, "MGL DEBUG: SPIRV generated\n");
     }

@@ -29,6 +29,7 @@
 #endif
 
 #if MGL_TOOLCHAIN_HAS_GLSLANG
+#include "mgl_spirv_generate.h"
 const glslang_resource_t* glslang_default_resource(void);
 #endif
 
@@ -327,7 +328,7 @@ int mgl_toolchain_glsl_to_msl(
         return 1;
     }
 
-    glslang_program_SPIRV_generate(program, input.stage);
+    mglGenerateProgramSPIRV(program, input.stage);
     size_t word_count = glslang_program_SPIRV_get_size(program);
     if (word_count == 0) {
         mgl_set_error(out_error, "glslang SPIR-V generation produced empty module");
