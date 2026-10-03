@@ -242,6 +242,8 @@ typedef struct MGLPlainUniformArenaCacheEntry_t {
     NSMutableDictionary<NSData *, id<MTLRenderPipelineState>> *_pipelineStateCache;
     MTLRenderPipelineDescriptor *_scratchPipelineDescriptor;
     MTLVertexDescriptor *_scratchVertexDescriptor;
+    uint32_t _vertexDescriptorAttributeMask;
+    uint32_t _vertexDescriptorLayoutMask;
     BOOL _earlySamplePreflightEnabled;
     /* Gated by MGL_DS_CACHE (default ON; =0 disables).  Maps cache key →
      * id<MTLDepthStencilState> with simple LRU eviction at 64 entries. */

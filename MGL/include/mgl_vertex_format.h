@@ -200,6 +200,12 @@ double mglDecodeVertexAttribComponent(const uint8_t *src,
 /* FNV-1a hash of a MTLVertexDescriptor for pipeline cache keys. */
 uint64_t mglVertexDescriptorSignature(MTLVertexDescriptor *vertexDescriptor);
 
+/* FNV-1a hash of only the selected descriptor entries. Attribute bits are
+ * limited to MAX_ATTRIBS and layout bits to Metal slots 0..30. */
+uint64_t mglVertexDescriptorSignatureForMasks(MTLVertexDescriptor *vertexDescriptor,
+                                              uint32_t attributeMask,
+                                              uint32_t layoutMask);
+
 /* FNV-1a hash of a MTLRenderPipelineDescriptor for pipeline cache keys. */
 uint64_t mglPipelineDescriptorSignature(MTLRenderPipelineDescriptor *pipelineStateDescriptor);
 

@@ -203,6 +203,51 @@ uint64_t mglVertexDescriptorSignature(MTLVertexDescriptor *vertexDescriptor)
     return hash;
 }
 
+uint64_t mglVertexDescriptorSignatureForMasks(MTLVertexDescriptor *vertexDescriptor,
+                                              uint32_t attributeMask,
+                                              uint32_t layoutMask)
+{
+    const uint32_t validAttributeMask = (1u << MAX_ATTRIBS) - 1u;
+    const uint32_t validLayoutMask = (1u << 31u) - 1u;
+    attributeMask &= validAttributeMask;
+    layoutMask &= validLayoutMask;
+
+    uint64_t hash = 1469598103934665603ull;
+    hash = mglHashStepU64(hash, (uint64_t)attributeMask);
+    hash = mglHashStepU64(hash, (uint64_t)layoutMask);
+    if (!vertexDescriptor) {
+        return hash;
+    }
+
+    for (NSUInteger i = 0; i < MAX_ATTRIBS; i++) {
+        if ((attributeMask & (1u << i)) == 0u) {
+            continue;
+        }
+        MTLVertexAttributeDescriptor *attrib = vertexDescriptor.attributes[i];
+        if (!attrib) {
+            continue;
+        }
+        hash = mglHashStepU64(hash, (uint64_t)attrib.format);
+        hash = mglHashStepU64(hash, (uint64_t)attrib.offset);
+        hash = mglHashStepU64(hash, (uint64_t)attrib.bufferIndex);
+    }
+
+    for (NSUInteger i = 0; i < 31u; i++) {
+        if ((layoutMask & (1u << i)) == 0u) {
+            continue;
+        }
+        MTLVertexBufferLayoutDescriptor *layout = vertexDescriptor.layouts[i];
+        if (!layout) {
+            continue;
+        }
+        hash = mglHashStepU64(hash, (uint64_t)layout.stride);
+        hash = mglHashStepU64(hash, (uint64_t)layout.stepFunction);
+        hash = mglHashStepU64(hash, (uint64_t)layout.stepRate);
+    }
+
+    return hash;
+}
+
 uint64_t mglPipelineDescriptorSignature(MTLRenderPipelineDescriptor *pipelineStateDescriptor)
 {
     uint64_t hash = 1469598103934665603ull;

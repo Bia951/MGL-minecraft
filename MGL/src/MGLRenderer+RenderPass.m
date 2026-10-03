@@ -3863,6 +3863,8 @@ create_new_command_buffer:
     }
 
     [vertexDescriptor reset];
+    _vertexDescriptorAttributeMask = 0u;
+    _vertexDescriptorLayoutMask = 0u;
     maxAttribs = MAX_ATTRIBS;
 
     // Get the vertex shader MSL source to check which attributes are actually used.
@@ -3941,7 +3943,11 @@ create_new_command_buffer:
                 return NULL;
             }
 
-            vertexDescriptor.attributes[i].bufferIndex = mapped_buffer_index;
+            MTLVertexAttributeDescriptor *metalAttribute = vertexDescriptor.attributes[i];
+            MTLVertexBufferLayoutDescriptor *metalLayout = vertexDescriptor.layouts[mapped_buffer_index];
+            _vertexDescriptorAttributeMask |= 1u << i;
+            _vertexDescriptorLayoutMask |= 1u << mapped_buffer_index;
+            metalAttribute.bufferIndex = mapped_buffer_index;
             /* When multiple attributes share a Metal buffer slot (because they
              * use the same VBO/stride/divisor), the per-attribute binding_offset
              * must be folded into the vertex descriptor's attribute offset.
@@ -3954,28 +3960,28 @@ create_new_command_buffer:
              * just relativeoffset, otherwise the shader would read past the
              * start of the converted data. */
             if (usesCurrentValue) {
-                vertexDescriptor.attributes[i].offset = 0u;
+                metalAttribute.offset = 0u;
             } else if (needsConversion) {
-                vertexDescriptor.attributes[i].offset = (NSUInteger)resolved.relativeoffset;
+                metalAttribute.offset = (NSUInteger)resolved.relativeoffset;
             } else {
-                vertexDescriptor.attributes[i].offset = (NSUInteger)(resolved.binding_offset + resolved.relativeoffset);
+                metalAttribute.offset = (NSUInteger)(resolved.binding_offset + resolved.relativeoffset);
             }
-            vertexDescriptor.attributes[i].format = format;
+            metalAttribute.format = format;
 
             if (usesCurrentValue) {
-                vertexDescriptor.layouts[mapped_buffer_index].stride = 16u;
+                metalLayout.stride = 16u;
             } else if (vao->attrib[i].type == GL_DOUBLE) {
                 NSUInteger doubleStride = resolved.stride > 0
                     ? (NSUInteger)resolved.stride
                     : (NSUInteger)(vao->attrib[i].size * sizeof(GLdouble));
-                vertexDescriptor.layouts[mapped_buffer_index].stride = mglAlignVertexStrideForMetal(doubleStride);
+                metalLayout.stride = mglAlignVertexStrideForMetal(doubleStride);
             } else if (vao->attrib[i].integer == 0 &&
                        (vao->attrib[i].type == GL_INT ||
                         vao->attrib[i].type == GL_UNSIGNED_INT)) {
                 NSUInteger intStride = resolved.stride > 0
                     ? (NSUInteger)resolved.stride
                     : (NSUInteger)(vao->attrib[i].size * sizeof(GLint));
-                vertexDescriptor.layouts[mapped_buffer_index].stride = mglAlignVertexStrideForMetal(intStride);
+                metalLayout.stride = mglAlignVertexStrideForMetal(intStride);
             } else if (vao->attrib[i].integer == 1) {
                 /* Integer attribs that need CPU conversion (unsigned source
                  * feeding int shader input, or signed source feeding uint
@@ -3992,28 +3998,28 @@ create_new_command_buffer:
                     convertedFormat != MTLVertexFormatInvalid) {
                     NSUInteger convStride = mglAlignVertexStrideForMetal(
                         (NSUInteger)vao->attrib[i].size * sizeof(GLint));
-                    vertexDescriptor.layouts[mapped_buffer_index].stride = convStride;
-                } else if (vertexDescriptor.layouts[mapped_buffer_index].stride == 0) {
-                    vertexDescriptor.layouts[mapped_buffer_index].stride = resolved.stride;
+                    metalLayout.stride = convStride;
+                } else if (metalLayout.stride == 0) {
+                    metalLayout.stride = resolved.stride;
                 }
-            } else if (vertexDescriptor.layouts[mapped_buffer_index].stride == 0) {
-                vertexDescriptor.layouts[mapped_buffer_index].stride = resolved.stride;
+            } else if (metalLayout.stride == 0) {
+                metalLayout.stride = resolved.stride;
             }
 
             if (usesCurrentValue)
             {
-                vertexDescriptor.layouts[mapped_buffer_index].stepRate = 0;
-                vertexDescriptor.layouts[mapped_buffer_index].stepFunction = MTLVertexStepFunctionConstant;
+                metalLayout.stepRate = 0;
+                metalLayout.stepFunction = MTLVertexStepFunctionConstant;
             }
             else if (resolved.divisor)
             {
-                vertexDescriptor.layouts[mapped_buffer_index].stepRate = resolved.divisor;
-                vertexDescriptor.layouts[mapped_buffer_index].stepFunction = MTLVertexStepFunctionPerInstance;
+                metalLayout.stepRate = resolved.divisor;
+                metalLayout.stepFunction = MTLVertexStepFunctionPerInstance;
             }
             else
             {
-	            vertexDescriptor.layouts[mapped_buffer_index].stepRate = 1;
-	            vertexDescriptor.layouts[mapped_buffer_index].stepFunction = MTLVertexStepFunctionPerVertex;
+	            metalLayout.stepRate = 1;
+	            metalLayout.stepFunction = MTLVertexStepFunctionPerVertex;
 	        }
 
             static uint64_t s_traceFileVertexDescriptorAttribLogs = 0;
@@ -5457,7 +5463,10 @@ stencil_format_ok:;
 
 	            if (!pipelineResolvedFromCache && _pipelineStateCache && currentProgramName != 0) {
 	                uint64_t pipelineSig = mglPipelineDescriptorSignature(pipelineStateDescriptor);
-                uint64_t vertexSig = mglVertexDescriptorSignature(vertexDescriptor);
+                uint64_t vertexSig = mglEnvFlagEnabled("MGL_SPARSE_VERTEX_SIGNATURE")
+                    ? mglVertexDescriptorSignatureForMasks(vertexDescriptor,
+                        _vertexDescriptorAttributeMask, _vertexDescriptorLayoutMask)
+                    : mglVertexDescriptorSignature(vertexDescriptor);
 	                const uint64_t pipelineCacheKeyWords[5] = {
 	                    (uint64_t)currentProgramName,
 	                    (uint64_t)(unsigned)state->var.clip_origin,

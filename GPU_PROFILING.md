@@ -90,6 +90,19 @@ The pair is used only by synchronous pipeline creation under the renderer lock.
 This defaults off pending actual-game correctness and performance comparison;
 Metal does not guarantee that reset preserves internal descriptor allocations.
 
+`MGL_SPARSE_VERTEX_SIGNATURE=1` hashes only the attributes and buffer layouts
+configured during vertex descriptor generation. Both slot masks are part of the
+key, and selected slots retain their final format, offset, buffer index, stride
+and instance stepping fields. This avoids accessing untouched descriptor slots,
+which can allocate otherwise unused Metal descriptor objects. The experiment
+defaults off and can be measured independently of descriptor reuse.
+
+After bounding the vertex conversion cache, adjacent visible, unlocked
+90-second Minecraft runs at 1708x960 with Complementary and the world clock
+fixed at noon measured 49.74 FPS for the baseline, 50.07 FPS with descriptor
+reuse, and 49.43 FPS with sparse vertex signatures alone. Neither experiment
+demonstrated a material frame-rate gain; both remain disabled by default.
+
 ### Sampling preparation before FBO rotation
 
 `MGL_EARLY_SAMPLE_PREFLIGHT=1` prepares sampled color/depth copies before
