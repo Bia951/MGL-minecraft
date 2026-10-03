@@ -361,6 +361,15 @@ int mgl_toolchain_glsl_to_msl(
     }
 
     glslang_program_SPIRV_get(program, words);
+    if (!mglOptimizeGeneratedSPIRV(&words, &word_count, input.stage)) {
+        mgl_set_error(out_error, "SPIRV-Tools performance optimization failed");
+        free(words);
+        glslang_program_delete(program);
+        glslang_shader_delete(shader);
+        free(modified_src);
+        free(src);
+        return 1;
+    }
 
     spvc_context context = NULL;
     spvc_parsed_ir ir = NULL;

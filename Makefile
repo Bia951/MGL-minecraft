@@ -56,6 +56,12 @@ CFLAGS += -IMGL/src        # "mgl_safety.h" lives in MGL/src/, used by MGLRender
 CFLAGS += -IMGL/SPIRV/SPIRV-Cross
 CFLAGS += -DENABLE_OPT=0 -DSPIRV_CROSS_C_API_MSL=1 -DSPIRV_CROSS_C_API_GLSL=1 -DSPIRV_CROSS_C_API_CPP=1 -DSPIRV_CROSS_C_API_REFLECT=1
 
+# MGL's SPIRV-Tools optimizer helper is C++17 (the bundled SPIRV-Tools
+# requires C++17). Keep its include path and deployment target aligned with
+# the C compilation above.
+CXXFLAGS += -Wall -gfull -O2 -arch $(shell uname -m) -std=c++17
+CXXFLAGS += -I$(spirv_tools_include_path) -IMGL/include
+
 # GLFW configuration for shared library build
 CFLAGS += -I./external/glfw/include -I./external/glfw/src
 CXXFLAGS += -I./external/glfw/include -I./external/glfw/src
@@ -152,6 +158,7 @@ brew_prefix := $(shell brew --prefix)
 # mgl
 #mgl_srcs_c := $(wildcard MGL/src/*.c)
 mgl_srcs_c := $(filter-out %/gl_core.c  %/gl_es.c, $(wildcard MGL/src/*.c))
+mgl_srcs_cpp := $(wildcard MGL/src/*.cpp)
 
 mgl_srcs_objc := $(wildcard MGL/src/*.m)
 
@@ -248,7 +255,8 @@ deps += $(glfw_objs:.o=.d)
 mgl_lib := $(build_dir)/libmgl.dylib
 mgl_es_lib := $(build_dir)/libmgl_es.dylib
 
-mgl_toolchain_obj := $(build_dir)/MGL/src/mgl_toolchain.o
+mgl_toolchain_obj := $(build_core_dir)/MGL/src/mgl_toolchain.o
+mgl_toolchain_optimizer_obj := $(build_core_dir)/MGL/src/mgl_spirv_optimize.o
 mgl_toolchain_lib := $(build_dir)/libmgl_toolchain.a
 
 $(mgl_lib): $(mgl_core_objs) $(mgl_core_arc_objs) $(mgl_core_obj)
@@ -264,7 +272,7 @@ $(mgl_es_lib): $(mgl_es_objs) $(mgl_es_arc_objs) $(mgl_es_obj)
 	ln -fs $(mgl_es_lib) .
 
 
-$(mgl_toolchain_lib): $(mgl_toolchain_obj)
+$(mgl_toolchain_lib): $(mgl_toolchain_obj) $(mgl_toolchain_optimizer_obj)
 	@mkdir -p $(dir $@)
 	ar rcs $@ $^
 
@@ -316,7 +324,7 @@ $(build_core_dir)/%.o: %.c
 #-std=gnu17 
 $(build_core_dir)/%.o: %.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) -MMD $(CXXFLAGS_GL_CORE) -c $< -o $@
+	$(APPLE_CLANGXX) -MMD $(CXXFLAGS_GL_CORE) -isysroot $(SDK_ROOT) -c $< -o $@
 
 #-std=c++14
 $(build_core_dir)/arc/%.o: %.m
@@ -342,7 +350,7 @@ $(build_es_dir)/%.o: %.c
 #-std=gnu17
 $(build_es_dir)/%.o: %.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) -MMD $(CXXFLAGS_GL_ES) -c $< -o $@
+	$(APPLE_CLANGXX) -MMD $(CXXFLAGS_GL_ES) -isysroot $(SDK_ROOT) -c $< -o $@
 
 #-std=c++14
 $(build_es_dir)/arc/%.o: %.m

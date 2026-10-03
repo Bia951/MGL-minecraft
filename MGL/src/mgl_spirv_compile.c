@@ -6506,6 +6506,11 @@ bool compileStageFromLinkedProgram(GLMContext ctx, Program *pptr, glslang_progra
         fprintf(stderr, "MGL DEBUG: Getting SPIRV IR\n");
     }
     glslang_program_SPIRV_get(glsl_program, pptr->spirv[stage].ir);
+    if (!mglOptimizeGeneratedSPIRV(&pptr->spirv[stage].ir,
+                                  &pptr->spirv[stage].size, stage)) {
+        ERROR_RETURN(GL_INVALID_OPERATION);
+        return false;
+    }
     if (MGL_VERBOSE_PROGRAM_LOGS) {
         fprintf(stderr, "MGL DEBUG: SPIRV IR obtained\n");
     }
