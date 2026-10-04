@@ -28,6 +28,10 @@
 #define MGL_TOOLCHAIN_HAS_SPVC 0
 #endif
 
+#if MGL_TOOLCHAIN_HAS_SPVC
+#include "mgl_texel_buffer.h"
+#endif
+
 #if MGL_TOOLCHAIN_HAS_GLSLANG
 #include "mgl_spirv_generate.h"
 const glslang_resource_t* glslang_default_resource(void);
@@ -409,10 +413,49 @@ int mgl_toolchain_glsl_to_msl(
         return 1;
     }
 
-    if (spvc_compiler_create_compiler_options(compiler, &options) == SPVC_SUCCESS) {
+    if (mglNativeTexelBufferEnabled()) {
+        spvc_bool hasStorageTexelBuffer = SPVC_FALSE;
+        spvc_result scanResult = mglSPVCFindStorageTexelBufferImage(compiler,
+                                                                     &hasStorageTexelBuffer);
+        if (scanResult != SPVC_SUCCESS || hasStorageTexelBuffer) {
+            mgl_set_error(out_error,
+                "native texel-buffer MSL does not support storage image buffers");
+            spvc_context_destroy(context);
+            free(words);
+            glslang_program_delete(program);
+            glslang_shader_delete(shader);
+            free(modified_src);
+            free(src);
+            return 1;
+        }
+    }
+
+    spvc_result optionsResult = spvc_compiler_create_compiler_options(compiler, &options);
+    if (optionsResult == SPVC_SUCCESS) {
         /* Try to target Metal 2.1 by default (macOS 10.14+). */
-        spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_MSL_VERSION, 20100);
-        spvc_compiler_install_compiler_options(compiler, options);
+        if (spvc_compiler_options_set_uint(options, SPVC_COMPILER_OPTION_MSL_VERSION, 20100) != SPVC_SUCCESS ||
+            (mglNativeTexelBufferEnabled() &&
+             spvc_compiler_options_set_bool(options,
+                 SPVC_COMPILER_OPTION_MSL_TEXTURE_BUFFER_NATIVE, SPVC_TRUE) != SPVC_SUCCESS) ||
+            spvc_compiler_install_compiler_options(compiler, options) != SPVC_SUCCESS) {
+            mgl_set_error(out_error, "SPIRV-Cross: install MSL options failed");
+            spvc_context_destroy(context);
+            free(words);
+            glslang_program_delete(program);
+            glslang_shader_delete(shader);
+            free(modified_src);
+            free(src);
+            return 1;
+        }
+    } else if (mglNativeTexelBufferEnabled()) {
+        mgl_set_error(out_error, "SPIRV-Cross: create MSL options failed");
+        spvc_context_destroy(context);
+        free(words);
+        glslang_program_delete(program);
+        glslang_shader_delete(shader);
+        free(modified_src);
+        free(src);
+        return 1;
     }
 
     if (spvc_compiler_compile(compiler, &msl) != SPVC_SUCCESS || !msl) {

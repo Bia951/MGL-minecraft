@@ -171,6 +171,41 @@ Normal scissor coordinate conversion and legal depth/stencil tests without
 the respective framebuffer attachment now report through the opt-in trace
 logger. Their GL state translation is unchanged.
 
+### Native texel-buffer experiment
+
+`MGL_NATIVE_TEXEL_BUFFER=1` enables native Metal `texture_buffer` declarations
+and storage in the linked-shader, capture-variant and standalone toolchain
+paths. The environment setting is fixed once, after loading the MGL environment
+file, so shader and renderer choices agree. This currently defaults off.
+
+Compatible aligned GL ranges use a view of the current Metal buffer. The view
+is reused only when buffer identity, offset, texel count and format match.
+Buffer replacement therefore invalidates it, while GPU writes remain visible
+through the shared storage. Ranges that cannot directly satisfy Metal alignment
+use an ordered GPU buffer copy. RGB32 formats expand on the GPU with alpha one.
+The native path uses the GL format's normal Metal mapping, including normalized
+RGBA8. It does not read CPU shadow data or construct a content-based cache key.
+
+`MGL_NATIVE_TEXEL_FORCE_STAGE=1` forces the GPU copy path for actual application
+buffers. `MGL_NATIVE_TEXEL_VERIFY=1` compares up to three copied ranges with
+GPU readback, including RGB/alpha bytes when expansion is needed. Both are
+diagnostics and must be disabled for frame-rate measurements.
+
+The experiment supports sampled texel buffers. Native mode explicitly rejects
+shaders containing storage `imageBuffer` resources: staged images still need
+writeback to the GL buffer before this mode can cover that API. Ordinary SSBOs
+and storage images with other dimensions are unaffected by this restriction.
+
+At 1708x960 with Complementary and fixed noon, visible, unlocked 90-second
+windows measured 54.82 FPS with native buffers and 53.25 FPS in the adjacent
+disabled run. The initial native run preceded the final diagnostic/rejection
+changes, so these are not identical-build comparisons. A final-build native
+repeat measured 52.71 FPS; part of that window preceded visibility polling.
+These results do not establish a repeatable performance gain; leave the flag off.
+The actual game exercised a 57,344-texel R32Sint buffer. Forced GPU staging
+reported zero mismatches in three byte comparisons. RGB32 expansion and storage
+image writeback have not been validated in this game.
+
 ### SPIR-V optimization experiment
 
 `MGL_SPIRV_OPTIMIZE=1` enables the bundled glslang's GLSL optimization passes

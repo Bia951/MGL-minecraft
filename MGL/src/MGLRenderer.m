@@ -42,6 +42,7 @@
 #include <dispatch/dispatch.h>
 
 #import "MGLRenderer_Private.h"
+#include "mgl_texel_buffer.h"
 #import "MGLRenderer+ArgumentBuffer_Private.h"
 #import "mgl.h"
 #import "mgl_sampler_compat.h"
@@ -5492,6 +5493,120 @@ static BOOL mglSnapshotSharedBufferRange(id<MTLDevice> device,
     return texture;
 }
 
+/* Native views alias the current GL buffer storage. Misaligned ranges and
+ * RGB32 formats use ordered GPU copies, never CPU shadow data. */
+- (id<MTLTexture>)nativeTexelBufferForTexture:(Texture *)tex
+                                     buffer:(id<MTLBuffer>)source
+                                     format:(MTLPixelFormat)format
+                                      count:(NSUInteger)count
+                              bytesPerTexel:(NSUInteger)sourceBytes
+{
+    BOOL expand = mglTextureNeedsChannelExpansion(tex->internalformat, format);
+    NSUInteger destinationBytes = expand ? 16u : sourceBytes;
+    uint32_t alpha = 1u;
+    if (expand) {
+        if (sourceBytes != 12u ||
+            (format != MTLPixelFormatRGBA32Float && format != MTLPixelFormatRGBA32Sint &&
+             format != MTLPixelFormatRGBA32Uint)) return nil;
+        if (format == MTLPixelFormatRGBA32Float) alpha = 0x3f800000u;
+    }
+    NSUInteger alignment = [_device minimumTextureBufferAlignmentForPixelFormat:format];
+    NSUInteger activeBytes = count * destinationBytes;
+    NSUInteger rowBytes = ((activeBytes + alignment - 1u) / alignment) * alignment;
+    NSUInteger offset = (NSUInteger)tex->texture_buffer_offset;
+    BOOL direct = !mglEnvFlagEnabled("MGL_NATIVE_TEXEL_FORCE_STAGE") &&
+        !expand && offset % alignment == 0u &&
+        offset <= source.length && rowBytes <= source.length - offset;
+    id<MTLTexture> existing = (__bridge id<MTLTexture>)tex->mtl_data;
+    if (direct && existing.textureType == MTLTextureTypeTextureBuffer &&
+        existing.buffer == source && existing.bufferOffset == offset &&
+        existing.width == count && existing.pixelFormat == format) return existing;
+
+    id<MTLBuffer> backing = source;
+    NSUInteger viewOffset = offset;
+    if (!direct) {
+        backing = [_device newBufferWithLength:rowBytes options:MTLResourceStorageModePrivate];
+        if (!backing) return nil;
+        viewOffset = 0u;
+        [self endRenderEncoding];
+        if (![self ensureWritableCommandBuffer:"native_texel_buffer_stage"]) return nil;
+        if (expand) {
+            if (!_nativeTexelExpandPipeline) {
+                NSString *code = @"#include <metal_stdlib>\nusing namespace metal;\n"
+                    "kernel void expand_rgb32(device const uchar *s [[buffer(0)]], "
+                    "device uchar *d [[buffer(1)]], constant uint2 &p [[buffer(2)]], "
+                    "uint i [[thread_position_in_grid]]) { if(i>=p.x)return; "
+                    "for(uint b=0;b<12;b++)d[16*i+b]=s[12*i+b]; "
+                    "for(uint b=0;b<4;b++)d[16*i+12+b]=uchar(p.y>>(8*b)); }";
+                NSError *error = nil;
+                id<MTLLibrary> library = [self newMetalLibraryWithSource:code options:nil
+                    label:@"MGL native texel RGB32 expansion" error:&error];
+                id<MTLFunction> function = [library newFunctionWithName:@"expand_rgb32"];
+                if (function) _nativeTexelExpandPipeline = [_device newComputePipelineStateWithFunction:function error:&error];
+                if (!_nativeTexelExpandPipeline) { NSLog(@"MGL native texel expansion failed: %@", error); return nil; }
+            }
+            id<MTLComputeCommandEncoder> encoder = mglProfileCompute(_currentCommandBuffer, __func__, __LINE__);
+            if (!encoder) return nil;
+            uint32_t params[2] = {(uint32_t)count, alpha};
+            [encoder setComputePipelineState:_nativeTexelExpandPipeline];
+            [encoder setBuffer:source offset:offset atIndex:0];
+            [encoder setBuffer:backing offset:0 atIndex:1];
+            [encoder setBytes:params length:sizeof(params) atIndex:2];
+            [encoder dispatchThreads:MTLSizeMake(count,1,1) threadsPerThreadgroup:MTLSizeMake(
+                MIN((NSUInteger)64,_nativeTexelExpandPipeline.maxTotalThreadsPerThreadgroup),1,1)];
+            [encoder endEncoding];
+        } else {
+            id<MTLBlitCommandEncoder> encoder = mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
+            if (!encoder) return nil;
+            [encoder copyFromBuffer:source sourceOffset:offset toBuffer:backing destinationOffset:0 size:activeBytes];
+            [encoder endEncoding];
+        }
+    }
+    if (!direct && mglEnvFlagEnabled("MGL_NATIVE_TEXEL_VERIFY")) {
+        static unsigned verifyCount;
+        BOOL verify = NO;
+        @synchronized ([MGLRenderer class]) { if (verifyCount < 3u) { verifyCount++; verify = YES; } }
+        if (verify) {
+            NSUInteger sourceSize = count * sourceBytes;
+            NSUInteger destinationOffset = (sourceSize + 3u) & ~(NSUInteger)3u;
+            id<MTLBuffer> readback = [_device newBufferWithLength:destinationOffset + activeBytes
+                options:MTLResourceStorageModeShared];
+            if (!readback) return nil;
+            id<MTLBlitCommandEncoder> encoder = mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
+            if (!encoder) return nil;
+            [encoder copyFromBuffer:source sourceOffset:offset toBuffer:readback destinationOffset:0 size:sourceSize];
+            [encoder copyFromBuffer:backing sourceOffset:0 toBuffer:readback destinationOffset:destinationOffset size:activeBytes];
+            [encoder endEncoding];
+            [_currentCommandBuffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+                if (completed.status != MTLCommandBufferStatusCompleted) return;
+                const uint8_t *a = readback.contents;
+                const uint8_t *b = a + destinationOffset;
+                NSUInteger mismatches = 0;
+                for (NSUInteger i=0;i<count;i++) {
+                    mismatches += memcmp(a+i*sourceBytes,b+i*destinationBytes,sourceBytes) != 0;
+                    if (expand) mismatches += memcmp(b+i*destinationBytes+12u,&alpha,4u) != 0;
+                }
+                NSLog(@"MGL NATIVE TEXEL VERIFY format=%lu texels=%lu expand=%d mismatches=%lu",
+                    (unsigned long)format,(unsigned long)count,expand,(unsigned long)mismatches);
+            }];
+        }
+    }
+    MTLTextureDescriptor *descriptor = [MTLTextureDescriptor new];
+    descriptor.textureType = MTLTextureTypeTextureBuffer;
+    descriptor.pixelFormat = format;
+    descriptor.width = count;
+    descriptor.usage = MTLTextureUsageShaderRead;
+    descriptor.storageMode = backing.storageMode;
+    id<MTLTexture> result = [backing newTextureWithDescriptor:descriptor offset:viewOffset bytesPerRow:rowBytes];
+    if (result && mglEnvFlagEnabled("MGL_TEXBUFFER_DIAGNOSTICS")) {
+        static unsigned logCount;
+        if (logCount++ < 24u) NSLog(@"MGL NATIVE TEXBUFFER tex=%u buffer=%u format=%lu texels=%lu offset=%lu direct=%d expand=%d",
+            tex->name,tex->texture_buffer->name,(unsigned long)format,(unsigned long)count,
+            (unsigned long)offset,direct,expand);
+    }
+    return result;
+}
+
 - (id<MTLTexture>)createMTLTexelBufferTexture:(Texture *)tex
 {
     Buffer *sourceBuffer = tex->texture_buffer;
@@ -5534,7 +5649,7 @@ static BOOL mglSnapshotSharedBufferRange(id<MTLDevice> device,
         return nil;
     }
 
-    MTLPixelFormat bufferPixelFormat = (tex->internalformat == GL_RGBA8)
+    MTLPixelFormat bufferPixelFormat = (!mglNativeTexelBufferEnabled() && tex->internalformat == GL_RGBA8)
         ? MTLPixelFormatRGBA8Uint
         : mtlPixelFormatForGLTex(tex);
     if (bufferPixelFormat == MTLPixelFormatInvalid || bufferPixelFormat == 0) {
@@ -5549,6 +5664,14 @@ static BOOL mglSnapshotSharedBufferRange(id<MTLDevice> device,
               tex->name,
               sourceBuffer->name);
         return nil;
+    }
+
+    if (mglNativeTexelBufferEnabled()) {
+        id<MTLBuffer> source = (__bridge id<MTLBuffer>)sourceBuffer->data.mtl_data;
+        id<MTLTexture> native = [self nativeTexelBufferForTexture:tex buffer:source
+            format:bufferPixelFormat count:texelCount bytesPerTexel:bytesPerTexel];
+        if (native) tex->dirty_bits = 0;
+        return native;
     }
 
     const uint8_t *sourceBytes = NULL;

@@ -326,6 +326,7 @@ typedef struct MGLPlainUniformArenaCacheEntry_t {
     id<MTLSamplerState> _scaledBlitNearestSampler;
     id<MTLSamplerState> _scaledBlitLinearSampler;
     NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *_scaledDepthBlitPipelineCache;
+    id<MTLComputePipelineState> _nativeTexelExpandPipeline;
     id<MTLComputePipelineState> _depthReadCopyPipeline;
     id<MTLComputePipelineState> _depthReadArrayCopyPipeline;
     id<MTLComputePipelineState> _copyImageRowFlipPipeline;

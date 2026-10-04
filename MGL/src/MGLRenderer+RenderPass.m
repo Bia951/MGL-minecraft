@@ -1,3 +1,4 @@
+#include "mgl_texel_buffer.h"
 // MGLRenderer+RenderPass.m
 // Render pass lifecycle methods extracted from MGLRenderer.m
 
@@ -689,6 +690,19 @@ static bool mglGeometryShaderIsPassthrough(const Shader *shader)
 
 - (bool)bindMTLTextureLocked:(Texture *)tex
 {
+    if (tex && tex->target == GL_TEXTURE_BUFFER && mglNativeTexelBufferEnabled()) {
+        /* Buffer storage can change independently of texture dirty bits.
+         * Resolve it at each bind; stable native views are reused by identity. */
+        id<MTLTexture> native = [self createMTLTextureFromGLTexture:tex];
+        if (!native) return false;
+        if ((__bridge id<MTLTexture>)tex->mtl_data != native) {
+            mglSafeReleaseMetalObj(&tex->mtl_data);
+            tex->mtl_data = (void *)CFBridgingRetain(native);
+        }
+        tex->dirty_bits = 0;
+        return true;
+    }
+
     if (tex && tex->target == GL_TEXTURE_BUFFER && tex->texture_buffer &&
         tex->texture_buffer->data.dirty_bits) {
         tex->dirty_bits |= DIRTY_TEXTURE_DATA;

@@ -30,6 +30,7 @@
 #include <string.h>
 #include <strings.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <ctype.h>
 #include <malloc/malloc.h>
 #include <CoreFoundation/CoreFoundation.h>
@@ -50,6 +51,24 @@
 #include "mgl_uniform_reflection.h"
 #include "mgl_spirv_compile.h"
 #include "mgl_spirv_generate.h"
+#include "mgl_texel_buffer.h"
+
+int mglNativeTexelBufferEnabled(void)
+{
+    static atomic_int cached = ATOMIC_VAR_INIT(-1);
+    int enabled = atomic_load_explicit(&cached, memory_order_acquire);
+    if (enabled < 0) {
+        mglLoadEnvFileNextToDylibOnce();
+        const char *value = getenv("MGL_NATIVE_TEXEL_BUFFER");
+        int requested = value && strcmp(value, "1") == 0;
+        int unset = -1;
+        atomic_compare_exchange_strong_explicit(&cached, &unset, requested,
+                                                memory_order_release,
+                                                memory_order_relaxed);
+        enabled = atomic_load_explicit(&cached, memory_order_acquire);
+    }
+    return enabled;
+}
 
 bool mglMSLIdentifierChar(char c)
 {
@@ -4349,6 +4368,21 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
         ERROR_RETURN_VALUE(GL_INVALID_OPERATION, NULL);
     }
 
+    if (mglNativeTexelBufferEnabled()) {
+        spvc_bool hasStorageTexelBuffer = SPVC_FALSE;
+        spvc_result scanResult = mglSPVCFindStorageTexelBufferImage(compiler_msl,
+                                                                     &hasStorageTexelBuffer);
+        if (scanResult != SPVC_SUCCESS || hasStorageTexelBuffer) {
+            fprintf(stderr,
+                    "MGL ERROR: native texel-buffer MSL does not support storage image buffers (program=%u stage=%d scan=%d)\n",
+                    ptr->name,
+                    stage,
+                    scanResult);
+            spvc_context_destroy(context);
+            ERROR_RETURN_VALUE(GL_INVALID_OPERATION, NULL);
+        }
+    }
+
     // Start discrete; auto/forced argument-buffer mode is selected after reflection.
     if (spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS, SPVC_FALSE) != SPVC_SUCCESS) {
         fprintf(stderr, "MGL Error: spvc_compiler_options_set_bool(SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS) failed\n");
@@ -4373,6 +4407,14 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
                                        SPVC_COMPILER_OPTION_MSL_TEXEL_BUFFER_TEXTURE_WIDTH,
                                        MGL_TEXEL_BUFFER_TEXTURE_WIDTH) != SPVC_SUCCESS) {
         fprintf(stderr, "MGL Error: spvc_compiler_options_set_uint(SPVC_COMPILER_OPTION_MSL_TEXEL_BUFFER_TEXTURE_WIDTH) failed\n");
+        spvc_context_destroy(context);
+        ERROR_RETURN_VALUE(GL_INVALID_OPERATION, NULL);
+    }
+
+    if (spvc_compiler_options_set_bool(options,
+                                       SPVC_COMPILER_OPTION_MSL_TEXTURE_BUFFER_NATIVE,
+                                       mglNativeTexelBufferEnabled() ? SPVC_TRUE : SPVC_FALSE) != SPVC_SUCCESS) {
+        fprintf(stderr, "MGL Error: spvc_compiler_options_set_bool(SPVC_COMPILER_OPTION_MSL_TEXTURE_BUFFER_NATIVE) failed\n");
         spvc_context_destroy(context);
         ERROR_RETURN_VALUE(GL_INVALID_OPERATION, NULL);
     }
@@ -5649,11 +5691,33 @@ char *mglCompileMSLCaptureVariant(GLMContext ctx, Program *ptr, int stage)
         return NULL;
     }
 
+    if (mglNativeTexelBufferEnabled()) {
+        spvc_bool hasStorageTexelBuffer = SPVC_FALSE;
+        spvc_result scanResult = mglSPVCFindStorageTexelBufferImage(compiler_msl,
+                                                                     &hasStorageTexelBuffer);
+        if (scanResult != SPVC_SUCCESS || hasStorageTexelBuffer) {
+            fprintf(stderr,
+                    "MGL ERROR: mglCompileMSLCaptureVariant: native texel-buffer MSL does not support storage image buffers (program=%u stage=%d scan=%d)\n",
+                    ptr ? ptr->name : 0u,
+                    stage,
+                    scanResult);
+            spvc_context_destroy(context);
+            return NULL;
+        }
+    }
+
     /* Mirror the base MSL options set in parseSPIRVShaderToMetal so the
      * capture variant is otherwise consistent with the render variant. */
     (void)spvc_compiler_options_set_bool(options,
                                          SPVC_COMPILER_OPTION_MSL_TEXTURE_1D_AS_2D,
                                          SPVC_TRUE);
+    if (spvc_compiler_options_set_bool(options,
+                                       SPVC_COMPILER_OPTION_MSL_TEXTURE_BUFFER_NATIVE,
+                                       mglNativeTexelBufferEnabled() ? SPVC_TRUE : SPVC_FALSE) != SPVC_SUCCESS) {
+        fprintf(stderr, "MGL Error: mglCompileMSLCaptureVariant: set TEXTURE_BUFFER_NATIVE failed\n");
+        spvc_context_destroy(context);
+        return NULL;
+    }
     (void)spvc_compiler_options_set_uint(options,
                                          SPVC_COMPILER_OPTION_MSL_VERSION,
                                          SPVC_MAKE_MSL_VERSION(3,1,0));
