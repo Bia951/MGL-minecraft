@@ -186,3 +186,12 @@ entry-point interfaces, resource bindings and specialization constants. Both
 input and optimized output are validated before reflection. Failure
 reports a shader compile error. This mode is also opt-in pending actual-game
 correctness and performance checks.
+
+After the depth-copy and trace changes, adjacent visible, unlocked 90-second
+runs at fixed noon, 1708x960 and Complementary measured 48.53 FPS with mode 0
+and 48.08 FPS with mode 2. Both runs enabled sampled GPU timing. Median stage
+interval unions were 18.04 ms and 18.77 ms respectively; command-buffer
+interval unions were 19.28 ms and 20.28 ms. These intervals include scheduling
+and dependency waits and are not measurements of ALU utilization. The mode-2
+drawable was checked and the optimizer reported transformed SPIR-V, but no
+performance benefit was established. Mode 2 remains disabled by default.
