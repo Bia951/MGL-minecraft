@@ -245,6 +245,11 @@ typedef struct MGLPlainUniformArenaCacheEntry_t {
     BOOL _earlyPipelineCacheVerify;
     uint64_t _earlyPipelineCacheHits;
     uint64_t _earlyPipelineCacheChecks;
+    NSCache<NSData *, id<MTLFunction>> *_sampleFlipFunctionCache;
+    NSCache<NSData *, NSArray<id<MTLTexture>> *> *_sampleFlipTextureViewCache;
+    uint64_t _pipelineSampleFlipMask;
+    uint64_t _pipelineSampleFlipProgramInstance;
+    uint64_t _pipelineSampleFlipProgramGeneration;
     MTLRenderPipelineDescriptor *_scratchPipelineDescriptor;
     MTLVertexDescriptor *_scratchVertexDescriptor;
     uint32_t _vertexDescriptorAttributeMask;

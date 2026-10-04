@@ -26,6 +26,7 @@
 #include <glslang_c_shader_types.h>
 #include "mgl_types_buffer.h"
 #include "mgl_types_texture.h"
+#include "mgl_spirv_sample_flip.h"
 
 typedef struct GLMContextRec_t *GLMContext;
 
@@ -108,6 +109,9 @@ typedef struct Spirv_t {
     GLboolean mgl_injected_framebuffer_yflip; /* true if MGL injected a
                                                * texCoord Y-flip for sampled
                                                * framebuffer in this shader */
+    GLboolean sample_flip_attempted;
+    GLuint sample_flip_resource_count;
+    MGLSpirvSampleFlipResource sample_flip_resources[MGL_SPIRV_SAMPLE_FLIP_MAX_RESOURCES];
     GLboolean needs_buffer_size_buffer; /* true if SPIRV-Cross MSL uses
                                          * spvBufferSizeConstants for
                                          * runtime-sized SSBO arrays */

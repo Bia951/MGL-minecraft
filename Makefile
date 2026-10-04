@@ -61,6 +61,7 @@ CFLAGS += -DENABLE_OPT=0 -DSPIRV_CROSS_C_API_MSL=1 -DSPIRV_CROSS_C_API_GLSL=1 -D
 # the C compilation above.
 CXXFLAGS += -Wall -gfull -O2 -arch $(shell uname -m) -std=c++17
 CXXFLAGS += -I$(spirv_tools_include_path) -IMGL/include
+CXXFLAGS += -I./external/SPIRV-Tools/external/SPIRV-Headers/include
 
 # GLFW configuration for shared library build
 CFLAGS += -I./external/glfw/include -I./external/glfw/src

@@ -254,3 +254,65 @@ interval unions were 19.28 ms and 20.28 ms. These intervals include scheduling
 and dependency waits and are not measurements of ALU utilization. The mode-2
 drawable was checked and the optimizer reported transformed SPIR-V, but no
 performance benefit was established. Mode 2 remains disabled by default.
+
+
+### Resource sampling coordinate flip experiment
+
+`MGL_RT_SAMPLE_FLIP=1` transforms supported fragment-stage SPIR-V sampled
+resources before MSL compilation. A boolean Metal function constant per
+resource selects original coordinates or Y-flipped coordinates. It does not
+add GL uniforms or select resources by application names. Every function with
+these constants is specialized, including the all-false variant. The pipeline
+key includes specialized function identity; binding changes reselect the final
+mask after uploads and pass completion. Functions and mip-window views use
+bounded caches with program lifetime/link generation and backing identity.
+
+The supported subset is single-sample, non-array 2D resources with regular
+sampling, Bias/Lod/Grad, signed integer texelFetch, nonprojected comparison
+sampling, and vec3 noncomparison projective sampling without Grad. Grad flips
+both derivative Y components; projective sampling uses q-y; texelFetch uses
+height(lod)-1-y. Unsupported operations on a resource reject that entire
+resource, retaining the existing copy path. This includes gathers, offsets,
+projected comparison/Grad operations and ambiguous opaque resource flows.
+Input and transformed modules are validated. Only helper functions with opaque
+image/sampler parameter or return types are inlined to expose uses; unsupported
+surviving opaque calls also retain the copy path.
+
+At binding time only eligible color render targets and Depth32Float comparison
+textures use this path. Swizzled textures, integer formats, array/MS textures,
+current framebuffer attachments and ordinary depth-to-float sampling remain
+on existing paths. Direct views preserve the GL base/max mip window.
+Vertex-stage sampling remains unchanged. `MGL_SAMPLE_FLIP_TRACE=1` reports
+accepted resources, specialized masks and direct texture bindings; disable it
+for performance measurements. The experiment defaults off.
+
+Actual-game direct bindings and a 1708x960 drawable capture were checked with
+Complementary. The image showed water, terrain and sky without an obvious
+artifact; this is not exhaustive verification of every admitted sampling op.
+The first run exposed an unspecialized all-false function, and the next run
+exposed capability declaration ordering. Both were fixed before the final
+performance run; the final run reported neither failure.
+
+
+Initial noon-only 90-second windows measured 54.03 FPS disabled, 59.09 enabled,
+48.50 disabled and 58.19 enabled. Weather changed to a thunderstorm during
+these runs; they are not controlled evidence of the optimization's gain.
+After pinning both noon and clear weather, the exhaustive-inlining prototype
+measured 51.24 enabled and 41.70 disabled. The final opaque-only inlining build
+measured 42.54 enabled, with bounded trace diagnostics and a capture during
+warmup. Overall performance drifted during the sequence, so these numbers do
+not establish a stable percentage gain or achievement of 60 FPS. Keep the
+experiment disabled by default. Opaque-only inlining reduced the summed IR
+word count across 180 fragment compilations from 3,417,530 to 2,659,324.
+The final drawable showed the expected clear-weather scene. Traced direct
+bindings covered color formats; native comparison-depth direct bindings have
+not been demonstrated by those bounded logs.
+
+For subsequent renderer comparisons, use `/tick freeze` in both arms, a fixed
+camera, noon and clear weather, identical resolution/shader settings, and
+completed chunk/shader warmup. Verify the freeze command before starting the
+measurement window. This controls simulation changes, not shader wall-clock
+animation, chunk worker completion, GPU scheduling or background system load.
+Frozen measurements isolate the renderer workload and must be reported apart
+from ordinary unfrozen gameplay. Finish with `/tick unfreeze` and restore the
+original time/weather rules.

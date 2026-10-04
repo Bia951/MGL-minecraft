@@ -4293,6 +4293,38 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
         ERROR_RETURN_VALUE(GL_INVALID_OPERATION, NULL);
     }
 
+    /* Private specialization constants preserve the public GL uniform ABI.
+     * Only publish a transformed module after its complete validation; an
+     * unsupported resource continues to use the existing sampled mirror. */
+    mglLoadEnvFileNextToDylibOnce();
+    Spirv *stageState = &ptr->spirv[stage];
+    if (stage == _FRAGMENT_SHADER && !stageState->sample_flip_attempted &&
+        mglTraceEnvFlagEnabled("MGL_RT_SAMPLE_FLIP")) {
+        stageState->sample_flip_attempted = GL_TRUE;
+        uint32_t *replacement = NULL;
+        size_t replacementCount = 0u;
+        size_t resourceCount = 0u;
+        MGLSpirvSampleFlipStats stats = {0};
+        if (mglTransformSPIRVSampleFlip(spirv, word_count, &replacement, &replacementCount,
+                                      stageState->sample_flip_resources,
+                                      MGL_SPIRV_SAMPLE_FLIP_MAX_RESOURCES,
+                                      &resourceCount, &stats) && resourceCount) {
+            free(stageState->ir);
+            stageState->ir = replacement;
+            stageState->size = replacementCount;
+            stageState->sample_flip_resource_count = (GLuint)resourceCount;
+            spirv = replacement;
+            word_count = replacementCount;
+        } else {
+            free(replacement);
+            memset(stageState->sample_flip_resources, 0, sizeof(stageState->sample_flip_resources));
+        }
+        if (mglTraceEnvFlagEnabled("MGL_SAMPLE_FLIP_TRACE")) {
+            fprintf(stderr, "MGL SAMPLE FLIP IR program=%u stage=%d accepted=%u words=%zu\n",
+                    ptr->name, stage, stageState->sample_flip_resource_count, word_count);
+        }
+    }
+
     /* SPIRV-Cross throws "Metal does not support isoline tessellation" for
      * TES with SpvExecutionModeIsolines.  Patch the SPIR-V to replace
      * Isolines with Triangles so SPIRV-Cross can generate MSL.  The original
@@ -5774,6 +5806,10 @@ char *mglCompileMSLCaptureVariant(GLMContext ctx, Program *ptr, int stage)
 }
 void clearStageCompileState(Program *pptr, int stage)
 {
+    pptr->spirv[stage].sample_flip_attempted = GL_FALSE;
+    pptr->spirv[stage].sample_flip_resource_count = 0u;
+    memset(pptr->spirv[stage].sample_flip_resources, 0,
+           sizeof(pptr->spirv[stage].sample_flip_resources));
     if (pptr->spirv[stage].ir) {
         free(pptr->spirv[stage].ir);
         pptr->spirv[stage].ir = NULL;

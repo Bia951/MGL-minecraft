@@ -5,6 +5,7 @@
 #import "MGLRenderer_Private.h"
 #import "MGLRenderer+RenderPass_Private.h"
 #import "MGLRenderer+PipelineCache_Private.h"
+#import "mgl_spirv_sample_flip.h"
 
 @implementation MGLEarlyPipelineCacheEntry
 @end
@@ -3548,8 +3549,155 @@ create_new_command_buffer:
 }
 
 #pragma mark pipeline descriptor
+
+- (id<MTLTexture>)sampleFlipTextureViewForObject:(Texture *)object
+{
+    id<MTLTexture> source = (__bridge id<MTLTexture>)object->mtl_data;
+    NSUInteger levels = mglGLSampledCopyLevelCount(object, source);
+    NSUInteger base = object->params.base_level;
+    if (base >= levels) return nil;
+    if (base == 0u && levels == source.mipmapLevelCount) return source;
+    /* Mirror storage used to bound the mip window implicitly. The original
+     * allocation may have more mips than GL exposes, including BASE_LEVEL=0.
+     * Retain both source and view so pointer-based keys cannot alias a reused
+     * allocation after the GL texture replaces its backing storage. */
+    uintptr_t keyWords[3] = {(uintptr_t)(__bridge void *)source, base, levels};
+    NSData *key = [NSData dataWithBytes:keyWords length:sizeof(keyWords)];
+    if (!_sampleFlipTextureViewCache) {
+        _sampleFlipTextureViewCache = [NSCache new];
+        _sampleFlipTextureViewCache.countLimit = 128u;
+        _sampleFlipTextureViewCache.totalCostLimit = 64u * 1024u * 1024u;
+    }
+    NSArray<id<MTLTexture>> *cached = [_sampleFlipTextureViewCache objectForKey:key];
+    if (cached) return cached[1];
+    id<MTLTexture> view = [source newTextureViewWithPixelFormat:source.pixelFormat
+        textureType:MTLTextureType2D levels:NSMakeRange(base, levels - base)
+        slices:NSMakeRange(0u, 1u)];
+    if (view) [_sampleFlipTextureViewCache setObject:@[source, view] forKey:key
+        cost:source.width * source.height * 32u];
+    return view;
+}
+
+- (uint64_t)fragmentSampleFlipMaskForProgram:(Program *)program
+{
+    if (!program || !mglEnvFlagEnabled("MGL_RT_SAMPLE_FLIP")) return 0u;
+
+    Spirv *spirv = &program->spirv[_FRAGMENT_SHADER];
+    if (!spirv->sample_flip_attempted) return 0u;
+
+    SpirvResourceList *resources = &program->spirv_resources_list[_FRAGMENT_SHADER][SPVC_RESOURCE_TYPE_SAMPLED_IMAGE];
+    uint64_t mask = 0u;
+    uint32_t limit = spirv->sample_flip_resource_count;
+    if (limit > 64u) limit = 64u;
+    for (uint32_t flipIndex = 0; flipIndex < limit; flipIndex++) {
+        MGLSpirvSampleFlipResource *flipResource = &spirv->sample_flip_resources[flipIndex];
+        SpirvResource *resource = NULL;
+        GLuint resourceIndex = 0u;
+        for (GLuint i = 0; i < resources->count; i++) {
+            if (resources->list[i]._id == flipResource->resource_id) {
+                resource = &resources->list[i];
+                resourceIndex = i;
+                break;
+            }
+        }
+        if (!resource || mglShouldSkipStageTextureResource(program,
+                _FRAGMENT_SHADER, SPVC_RESOURCE_TYPE_SAMPLED_IMAGE, resource)) continue;
+        MGLTextureDataKind kind = [self getProgramExpectedTextureDataKind:_FRAGMENT_SHADER
+            type:SPVC_RESOURCE_TYPE_SAMPLED_IMAGE index:(int)resourceIndex];
+        if (kind != MGLTextureDataKindFloat && kind != MGLTextureDataKindDepth) continue;
+
+        MTLTextureType expectedType = [self getProgramExpectedTextureType:_FRAGMENT_SHADER
+            type:SPVC_RESOURCE_TYPE_SAMPLED_IMAGE index:(int)resourceIndex];
+        MTLTextureType declaredType = [self getProgramDeclaredTextureType:_FRAGMENT_SHADER
+            type:SPVC_RESOURCE_TYPE_SAMPLED_IMAGE index:(int)resourceIndex];
+        if (expectedType != MTLTextureType2D || (declaredType && declaredType != MTLTextureType2D)) continue;
+
+        GLuint binding = [self getProgramBinding:_FRAGMENT_SHADER
+            type:SPVC_RESOURCE_TYPE_SAMPLED_IMAGE index:(int)resourceIndex];
+        Texture *object = [self textureForSampledResource:resource metalBinding:binding
+            stage:_FRAGMENT_SHADER expectedType:declaredType ? declaredType : expectedType];
+        /* A narrowed Metal view must preserve the GL component mapping. Keep
+         * swizzled textures on the existing copy path until that ABI is covered. */
+        if (!object || object->target != GL_TEXTURE_2D || !object->mtl_data ||
+            object->params.swizzled) continue;
+        id<MTLTexture> source = (__bridge id<MTLTexture>)object->mtl_data;
+        BOOL supportedFormat = kind == MGLTextureDataKindFloat
+            ? [self textureCanUseGLSampledRenderTargetCopy:object source:source]
+            : object->is_render_target && source.pixelFormat == MTLPixelFormatDepth32Float;
+        if (source.textureType != MTLTextureType2D || source.sampleCount != 1u ||
+            !supportedFormat ||
+            mglTextureIsAttachmentOfFramebuffer(ctx->state.framebuffer, object) ||
+            object->mtl_render_target_write_version == 0u ||
+            mglDecideYFlipForSampledRT(object, program) != MGL_YFLIP_USE_SAMPLED_COPY) continue;
+        mask |= (uint64_t)1u << flipIndex;
+    }
+
+    if (mglEnvFlagEnabled("MGL_SAMPLE_FLIP_TRACE")) {
+        static uint64_t traceCount = 0;
+        uint64_t hit = ++traceCount;
+        if (hit <= 32u) {
+            NSLog(@"MGL SAMPLE FLIP program=%u mask=0x%016llx resources=%u selected=%u",
+                  (unsigned)program->name, (unsigned long long)mask, (unsigned)limit,
+                  (unsigned)__builtin_popcountll(mask));
+        }
+    }
+    return mask;
+}
+
+- (id<MTLFunction>)sampleFlipSpecializedFragmentFunctionForProgram:(Program *)program
+                                                    baseFunction:(id<MTLFunction>)baseFunction
+                                                            mask:(uint64_t)mask
+{
+    if (!program || !baseFunction) return baseFunction;
+    if (program->spirv[_FRAGMENT_SHADER].sample_flip_resource_count == 0u) return baseFunction;
+
+    Spirv *spirv = &program->spirv[_FRAGMENT_SHADER];
+    id<MTLLibrary> library = (__bridge id<MTLLibrary>)spirv->mtl_library;
+    if (!library) return nil;
+
+    NSMutableData *keyData = [NSMutableData dataWithCapacity:sizeof(uint64_t) * 3u + sizeof(uintptr_t) * 2u];
+    uintptr_t functionIdentity = (uintptr_t)(__bridge void *)baseFunction;
+    [keyData appendBytes:&program->msl_texture_cache_instance_id length:sizeof(program->msl_texture_cache_instance_id)];
+    [keyData appendBytes:&program->msl_texture_cache_generation length:sizeof(program->msl_texture_cache_generation)];
+    [keyData appendBytes:&functionIdentity length:sizeof(functionIdentity)];
+    [keyData appendBytes:&mask length:sizeof(mask)];
+    if (!_sampleFlipFunctionCache) {
+        _sampleFlipFunctionCache = [[NSCache alloc] init];
+        _sampleFlipFunctionCache.countLimit = 128;
+    }
+    id<MTLFunction> cached = [_sampleFlipFunctionCache objectForKey:keyData];
+    if (cached) return cached;
+
+    MTLFunctionConstantValues *values = [[MTLFunctionConstantValues alloc] init];
+    uint32_t limit = spirv->sample_flip_resource_count;
+    if (limit > 64u) limit = 64u;
+    for (uint32_t i = 0; i < limit; i++) {
+        bool enabled = ((mask >> i) & 1u) != 0u;
+        uint32_t specID = spirv->sample_flip_resources[i].spec_id;
+        [values setConstantValue:&enabled type:MTLDataTypeBool atIndex:specID];
+    }
+    NSError *error = nil;
+    id<MTLFunction> specialized = [library newFunctionWithName:baseFunction.name
+                                              constantValues:values error:&error];
+    if (!specialized) {
+        NSLog(@"MGL SAMPLE FLIP specialization failed program=%u function=%@ mask=0x%016llx error=%@",
+              (unsigned)program->name, baseFunction.name, (unsigned long long)mask, error);
+        return nil;
+    }
+    [_sampleFlipFunctionCache setObject:specialized forKey:keyData];
+    if (mglEnvFlagEnabled("MGL_SAMPLE_FLIP_TRACE")) {
+        static unsigned traceCount;
+        if (traceCount++ < 32u) NSLog(@"MGL SAMPLE FLIP SPECIALIZED program=%u mask=0x%llx resources=%u",
+            program->name, (unsigned long long)mask, limit);
+    }
+    return specialized;
+}
+
 -(MTLRenderPipelineDescriptor *)generatePipelineDescriptor
 {
+    _pipelineSampleFlipMask = 0u;
+    _pipelineSampleFlipProgramInstance = 0u;
+    _pipelineSampleFlipProgramGeneration = 0u;
     if (!ctx) {
         NSLog(@"MGL PIPELINE DESC fail: context is NULL");
         return nil;
@@ -3620,6 +3768,17 @@ create_new_command_buffer:
 
 	    id<MTLFunction> vertexFunction = (__bridge id<MTLFunction>)vertexFunctionPtr;
 	    id<MTLFunction> fragmentFunction = fragmentProgram ? (__bridge id<MTLFunction>)(fragmentProgram->spirv[_FRAGMENT_SHADER].mtl_function) : nil;
+    if (fragmentProgram) {
+        uint64_t sampleFlipMask = [self fragmentSampleFlipMaskForProgram:fragmentProgram];
+        if (fragmentProgram->spirv[_FRAGMENT_SHADER].sample_flip_resource_count != 0u) {
+            fragmentFunction = [self sampleFlipSpecializedFragmentFunctionForProgram:fragmentProgram
+                baseFunction:fragmentFunction mask:sampleFlipMask];
+            if (!fragmentFunction) return nil;
+        }
+        _pipelineSampleFlipMask = sampleFlipMask;
+        _pipelineSampleFlipProgramInstance = fragmentProgram->msl_texture_cache_instance_id;
+        _pipelineSampleFlipProgramGeneration = fragmentProgram->msl_texture_cache_generation;
+    }
     if (kMGLVerbosePipelineLogs) {
         NSLog(@"MGL PIPELINE DESC vs=%@ fs=%@",
               vertexFunction ? vertexFunction.name : @"(null)",
@@ -5422,7 +5581,8 @@ stencil_format_ok:;
 
             NSData *earlyInputKey = nil;
             MGLEarlyPipelineCacheEntry *earlyEntry = nil;
-            if (!skipPipelineBuild && _earlyPipelineCacheEnabled) {
+            if (!skipPipelineBuild && _earlyPipelineCacheEnabled &&
+                !mglEnvFlagEnabled("MGL_RT_SAMPLE_FLIP")) {
                 earlyInputKey = [self earlyPipelineInputKeyForVertexProgram:currentVertexProgram
                     fragmentProgram:currentFragmentProgram vao:currentVAO];
                 earlyEntry = earlyInputKey ? [_earlyPipelineStateCache objectForKey:earlyInputKey] : nil;
@@ -5903,7 +6063,8 @@ stencil_format_ok:;
 	            }
 	            }
 
-                if (exactPipelineCompiled && _earlyPipelineCacheEnabled && pipelineCacheKey) {
+                if (exactPipelineCompiled && _earlyPipelineCacheEnabled && pipelineCacheKey &&
+                    !mglEnvFlagEnabled("MGL_RT_SAMPLE_FLIP")) {
                     // Descriptor generation can bind shader/attachment resources and
                     // repair blend state. Snapshot the resulting inputs, not stale inputs.
                     NSData *builtInputKey = [self earlyPipelineInputKeyForVertexProgram:currentVertexProgram

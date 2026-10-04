@@ -7,6 +7,16 @@
 #import "mgl_frame_activity.h"
 #import "mgl_byte_hash.h"
 
+static int mglSampleFlipResourceIndex(Program *program, const SpirvResource *resource)
+{
+    if (!program || !resource) return -1;
+    Spirv *stage = &program->spirv[_FRAGMENT_SHADER];
+    for (GLuint i = 0; i < stage->sample_flip_resource_count && i < 64u; i++) {
+        if (stage->sample_flip_resources[i].resource_id == resource->_id) return (int)i;
+    }
+    return -1;
+}
+
 /* MGL_VERIFY_VBO_STALE: draw-time CPU-shadow vs Metal-contents verification
  * for persistent/client-storage buffers (flower/cross-quad corruption triage).
  * Logs hash mismatches with a bounded budget to avoid log storms. */
@@ -2531,10 +2541,22 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
             RETURN_FALSE_ON_FAILURE([self bindMTLTexture:ptr]);
             MGL_ABORT_TBIND_IF_ENCODER_CLOSED();
             if (ptr->mtl_data) {
-                texture = mglSampledTextureViewForBaseLevel(ptr, (__bridge id<MTLTexture>)ptr->mtl_data);
+                int flipIndex = mglSampleFlipResourceIndex(sampleProgram, sampledResource);
+                BOOL directFlip = flipIndex >= 0 &&
+                    _pipelineSampleFlipProgramInstance == sampleProgram->msl_texture_cache_instance_id &&
+                    _pipelineSampleFlipProgramGeneration == sampleProgram->msl_texture_cache_generation &&
+                    ((_pipelineSampleFlipMask >> flipIndex) & 1u);
+                texture = directFlip ? [self sampleFlipTextureViewForObject:ptr]
+                    : mglSampledTextureViewForBaseLevel(ptr, (__bridge id<MTLTexture>)ptr->mtl_data);
+                if (directFlip && mglEnvFlagEnabled("MGL_SAMPLE_FLIP_TRACE")) {
+                    static unsigned traceCount;
+                    if (traceCount++ < 64u) NSLog(@"MGL SAMPLE FLIP DIRECT program=%u resource=%u texture=%u format=%lu levels=%lu",
+                        sampleProgram->name, sampledResource->_id, ptr->name,
+                        (unsigned long)texture.pixelFormat, (unsigned long)texture.mipmapLevelCount);
+                }
                 if (expectedKind == MGLTextureDataKindFloat && mglMetalPixelFormatHasDepth(texture.pixelFormat)) {
                     texture = mglSampledTextureViewForBaseLevel(ptr, [self depthReadTextureForObject:ptr program:sampleProgram]);
-                } else if (expectedKind == MGLTextureDataKindDepth) {
+                } else if (expectedKind == MGLTextureDataKindDepth && !directFlip) {
                     texture = mglSampledTextureViewForBaseLevel(ptr, [self depthCompareTextureForObject:ptr program:sampleProgram]);
                 }
             }
@@ -2549,6 +2571,7 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
                                           fragmentProgramName:fragmentProgramName
                                            vertexProgramName:vertexProgramName
                                                  sampleProgram:sampleProgram
+                                               sampledResource:sampledResource
                                              usedFallbackTexture:&usedFallbackTexture
                                         usedSampledCopyForTrace:&usedSampledCopyForTrace
                                            directTextureForTrace:&directTextureForTrace
@@ -2907,6 +2930,7 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
                          fragmentProgramName:(GLuint)fragmentProgramName
                           vertexProgramName:(GLuint)vertexProgramName
                                 sampleProgram:(Program *)sampleProgram
+                              sampledResource:(SpirvResource *)sampledResource
                             usedFallbackTexture:(BOOL *)usedFallbackTexturePtr
                        usedSampledCopyForTrace:(BOOL *)usedSampledCopyForTracePtr
                           directTextureForTrace:(id<MTLTexture> *)directTextureForTracePtr
@@ -2918,6 +2942,12 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
     BOOL usedSampledCopyForTrace = *usedSampledCopyForTracePtr;
     id<MTLTexture> directTextureForTrace = *directTextureForTracePtr;
     id<MTLTexture> sampledCopyForTrace = *sampledCopyForTracePtr;
+
+    int sampleFlipIndex = mglSampleFlipResourceIndex(sampleProgram, sampledResource);
+    BOOL shaderFlipsSample = sampleFlipIndex >= 0 &&
+        _pipelineSampleFlipProgramInstance == sampleProgram->msl_texture_cache_instance_id &&
+        _pipelineSampleFlipProgramGeneration == sampleProgram->msl_texture_cache_generation &&
+        ((_pipelineSampleFlipMask >> sampleFlipIndex) & 1u);
 
     /* Y-Flip Subsystem: unified decision for sampling a render target.
      *
@@ -2957,7 +2987,7 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
                         mglProgramHasExistingFramebufferSampleYFlip(sampleProgram) ? 1 : 0);
         }
 
-        if (yflip == MGL_YFLIP_USE_SAMPLED_COPY) {
+        if (yflip == MGL_YFLIP_USE_SAMPLED_COPY && !shaderFlipsSample) {
             BOOL boundSampledCopy = NO;
             if (ptr->mtl_gl_sampled_data &&
                 ptr->mtl_gl_sampled_write_version == ptr->mtl_render_target_write_version &&
@@ -4131,6 +4161,8 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
     for (unsigned stageIndex = 0; stageIndex < 2; stageIndex++) {
         int stage = stages[stageIndex];
         Program *program = mglResolveProgramForStageFromState(ctx, stage);
+        uint64_t directSampleMask = stage == _FRAGMENT_SHADER
+            ? [self fragmentSampleFlipMaskForProgram:program] : 0u;
         GLuint count = [self getProgramBindingCount:stage type:SPVC_RESOURCE_TYPE_SAMPLED_IMAGE];
         for (GLuint i = 0; program && i < count; i++) {
             SpirvResourceList *resources = &program->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_SAMPLED_IMAGE];
@@ -4150,6 +4182,9 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
                 [self textureCanUseGLSampledRenderTargetCopy:object source:source] &&
                 object->mtl_render_target_write_version != 0u &&
                 mglDecideYFlipForSampledRT(object, program) == MGL_YFLIP_USE_SAMPLED_COPY) {
+                int flipIndex = stage == _FRAGMENT_SHADER
+                    ? mglSampleFlipResourceIndex(program, resource) : -1;
+                if (flipIndex >= 0 && ((directSampleMask >> flipIndex) & 1u)) continue;
                 if (!mglGLSampledCopyIsFresh(object, source)) {
                     if (batchColorCopies) {
                         unsigned index = 0;
@@ -4169,6 +4204,9 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
             unsigned orientation = object->is_render_target &&
                 mglDecideYFlipForSampledRT(object, program) == MGL_YFLIP_USE_SAMPLED_COPY;
             if (kind == MGLTextureDataKindDepth) {
+                int flipIndex = stage == _FRAGMENT_SHADER
+                    ? mglSampleFlipResourceIndex(program, resource) : -1;
+                if (flipIndex >= 0 && ((directSampleMask >> flipIndex) & 1u)) continue;
                 if ([self depthCompareTextureForObject:object program:program]) continue;
             } else {
                 object->mtl_depth_read_requested_mask |= 1u << orientation;
@@ -4216,6 +4254,25 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
      * away and immediately replayed on the replacement encoder. */
     RETURN_FALSE_ON_FAILURE([self bindActiveTexturesToMTL]);
     RETURN_FALSE_ON_FAILURE([self prepareSampledCopiesForDraw]);
+    Program *sampleFlipProgram = mglResolveProgramForStageFromState(glm_ctx, _FRAGMENT_SHADER);
+    if (mglEnvFlagEnabled("MGL_RT_SAMPLE_FLIP") && sampleFlipProgram &&
+        sampleFlipProgram->spirv[_FRAGMENT_SHADER].sample_flip_resource_count) {
+        /* Texture upload and pass completion can change the authoritative
+         * orientation after the ordinary dirty-state pipeline lookup. Select
+         * the final function before replaying bindings, even on a draw whose
+         * only change was a sampler's GL texture unit. */
+        uint64_t mask = [self fragmentSampleFlipMaskForProgram:sampleFlipProgram];
+        if (_pipelineSampleFlipMask != mask ||
+            _pipelineSampleFlipProgramInstance != sampleFlipProgram->msl_texture_cache_instance_id ||
+            _pipelineSampleFlipProgramGeneration != sampleFlipProgram->msl_texture_cache_generation) {
+            RETURN_FALSE_ON_FAILURE([self syncPipelineStateWithDeferredBufferMap:NO mappedCommandBuffer:NULL]);
+            if (!_pipelineState) return false;
+            if (_currentRenderEncoder) {
+                [_currentRenderEncoder setRenderPipelineState:_pipelineState];
+                _lastPipelineState = _pipelineState;
+            }
+        }
+    }
     if (!_currentRenderEncoder) {
         RETURN_FALSE_ON_FAILURE([self restoreRenderEncoderAfterTextureUploadForDraw:"final-active-texture-bind"]);
     } else {

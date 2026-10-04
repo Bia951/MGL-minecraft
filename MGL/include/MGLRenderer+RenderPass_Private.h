@@ -96,6 +96,11 @@ void mglEnableIndirectCommandBuffersForPipeline(MTLRenderPipelineDescriptor *pip
 - (bool)rotateRenderEncoderForCurrentFramebufferLocked;
 - (bool)syncPipelineStateWithDeferredBufferMap:(bool)deferredBufferMapForPipelineBuild
                        mappedCommandBuffer:(id<MTLCommandBuffer> *)mappedCommandBuffer;
+- (uint64_t)fragmentSampleFlipMaskForProgram:(Program *)program;
+- (id<MTLTexture>)sampleFlipTextureViewForObject:(Texture *)object;
+- (id<MTLFunction>)sampleFlipSpecializedFragmentFunctionForProgram:(Program *)program
+                                                    baseFunction:(id<MTLFunction>)baseFunction
+                                                            mask:(uint64_t)mask;
 - (bool)processDirtyStateDomainsLocked:(bool)draw_command
                    mappedCommandBuffer:(id<MTLCommandBuffer> *)mappedCommandBuffer;
 - (BOOL)shouldUseDontCareLoadForColorTexture:(Texture *)tex
