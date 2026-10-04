@@ -1344,22 +1344,24 @@ static bool mglGeometryShaderIsPassthrough(const Shader *shader)
     BOOL useDepthState = state->caps.depth_test && passHasDepthAttachment;
     BOOL useStencilState = state->caps.stencil_test && passHasStencilAttachment;
 
-    if (state->caps.depth_test && !passHasDepthAttachment) {
+    /* Missing depth/stencil attachments are legal GL states: the respective
+     * tests act as disabled. Keep their state diagnostics out of normal draws. */
+    if (mglTraceLogIsEnabled() && state->caps.depth_test && !passHasDepthAttachment) {
         static uint64_t s_missingDepthAttachmentCount = 0;
         uint64_t hit = ++s_missingDepthAttachmentCount;
         if (hit <= 32 || (hit % 256) == 0) {
-            NSLog(@"MGL WARNING: depth test/write requested without depth attachment, disabling depth for this pass hit=%llu fbo=%u drawBuf=0x%x",
+            MGLTraceNSLog(@"MGL depth test without depth attachment: disabled for this pass hit=%llu fbo=%u drawBuf=0x%x",
                   (unsigned long long)hit,
                   mglRendererSafeFramebufferName(ctx),
                   state->draw_buffer);
         }
     }
 
-    if (state->caps.stencil_test && !passHasStencilAttachment) {
+    if (mglTraceLogIsEnabled() && state->caps.stencil_test && !passHasStencilAttachment) {
         static uint64_t s_missingStencilAttachmentCount = 0;
         uint64_t hit = ++s_missingStencilAttachmentCount;
         if (hit <= 32 || (hit % 256) == 0) {
-            NSLog(@"MGL WARNING: stencil test requested without stencil attachment, disabling stencil for this pass hit=%llu fbo=%u drawBuf=0x%x",
+            MGLTraceNSLog(@"MGL stencil test without stencil attachment: disabled for this pass hit=%llu fbo=%u drawBuf=0x%x",
                   (unsigned long long)hit,
                   mglRendererSafeFramebufferName(ctx),
                   state->draw_buffer);
@@ -1740,8 +1742,9 @@ static bool mglGeometryShaderIsPassthrough(const Shader *shader)
                 }
             }
 
-            if (traceEncoderState || sx != rawSx || sy != rawSy || sw != rawSw || sh != rawSh || metalSy != sy) {
-                NSLog(@"MGL SCISSOR apply pass=%lux%lu scissorEnabled=%d origin=0x%x raw=(%d,%d,%d,%d) glResolved=(%d,%d,%d,%d) metal=(%d,%d,%d,%d)",
+            if (mglTraceLogIsEnabled() &&
+                (traceEncoderState || sx != rawSx || sy != rawSy || sw != rawSw || sh != rawSh || metalSy != sy)) {
+                MGLTraceNSLog(@"MGL SCISSOR apply pass=%lux%lu scissorEnabled=%d origin=0x%x raw=(%d,%d,%d,%d) glResolved=(%d,%d,%d,%d) metal=(%d,%d,%d,%d)",
                       (unsigned long)passWidth, (unsigned long)passHeight,
                       state->caps.scissor_test ? 1 : 0,
                       state->var.clip_origin,

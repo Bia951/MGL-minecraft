@@ -1597,6 +1597,7 @@ static void mglVerifySampledCopyIfSelected(id<MTLDevice> device,
         return source;
     }
 
+    NSUInteger copyLevelCount = mglGLSampledCopyLevelCount(object, source);
     id<MTLTexture> cached = (__bridge id<MTLTexture>)object->mtl_depth_compare_data;
     if (cached &&
         object->mtl_depth_compare_version == object->mtl_render_target_write_version &&
@@ -1604,7 +1605,7 @@ static void mglVerifySampledCopyIfSelected(id<MTLDevice> device,
         cached.height == source.height &&
         cached.textureType == source.textureType &&
         cached.arrayLength == source.arrayLength &&
-        cached.mipmapLevelCount == source.mipmapLevelCount) {
+        cached.mipmapLevelCount == copyLevelCount) {
         return cached;
     }
 
@@ -1626,6 +1627,7 @@ static void mglVerifySampledCopyIfSelected(id<MTLDevice> device,
         source.mipmapLevelCount == 0u) {
         return NO;
     }
+    NSUInteger copyLevelCount = mglGLSampledCopyLevelCount(object, source);
 
     id<MTLTexture> destination = (__bridge id<MTLTexture>)object->mtl_depth_compare_data;
     BOOL shapeMatches = destination &&
@@ -1633,7 +1635,7 @@ static void mglVerifySampledCopyIfSelected(id<MTLDevice> device,
         destination.height == source.height &&
         destination.textureType == source.textureType &&
         destination.arrayLength == source.arrayLength &&
-        destination.mipmapLevelCount == source.mipmapLevelCount &&
+        destination.mipmapLevelCount == copyLevelCount &&
         destination.pixelFormat == MTLPixelFormatDepth32Float;
     if (shapeMatches &&
         object->mtl_depth_compare_version == object->mtl_render_target_write_version) {
@@ -1648,10 +1650,10 @@ static void mglVerifySampledCopyIfSelected(id<MTLDevice> device,
             [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
                                                                width:source.width
                                                               height:source.height
-                                                           mipmapped:source.mipmapLevelCount > 1u];
+                                                           mipmapped:copyLevelCount > 1u];
         descriptor.textureType = source.textureType;
         descriptor.arrayLength = source.arrayLength;
-        descriptor.mipmapLevelCount = source.mipmapLevelCount;
+        descriptor.mipmapLevelCount = copyLevelCount;
         descriptor.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
         descriptor.storageMode = MTLStorageModePrivate;
         destination = [_device newTextureWithDescriptor:descriptor];
@@ -1670,7 +1672,7 @@ static void mglVerifySampledCopyIfSelected(id<MTLDevice> device,
     }
 
     id<MTLRenderCommandEncoder> encoder = nil;
-    for (NSUInteger level = 0; level < source.mipmapLevelCount; level++) {
+    for (NSUInteger level = 0; level < copyLevelCount; level++) {
         NSUInteger levelWidth = mglMetalTextureLevelDimension(source.width, level);
         NSUInteger levelHeight = mglMetalTextureLevelDimension(source.height, level);
         NSUInteger sliceCount = source.textureType == MTLTextureType2DArray

@@ -2331,6 +2331,7 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
 
     unsigned orientation = object->is_render_target &&
         mglDecideYFlipForSampledRT(object, program) == MGL_YFLIP_USE_SAMPLED_COPY;
+    NSUInteger copyLevelCount = mglGLSampledCopyLevelCount(object, source);
     id<MTLTexture> cached = (__bridge id<MTLTexture>)object->mtl_depth_read_data[orientation];
     if (!cached ||
         object->mtl_depth_read_version[orientation] != object->mtl_render_target_write_version ||
@@ -2338,7 +2339,7 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
         cached.height != source.height ||
         cached.textureType != source.textureType ||
         cached.arrayLength != source.arrayLength ||
-        cached.mipmapLevelCount != source.mipmapLevelCount) {
+        cached.mipmapLevelCount != copyLevelCount) {
         return nil;
     }
     return cached;
@@ -2357,6 +2358,7 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
         !mglMetalPixelFormatHasDepth(source.pixelFormat)) {
         return NO;
     }
+    NSUInteger copyLevelCount = mglGLSampledCopyLevelCount(object, source);
 
     /* This updater is intentionally restricted to a render-pass boundary.
      * Starting a compute encoder from texture binding tears down the active
@@ -2374,7 +2376,7 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
             cached.height == source.height &&
             cached.textureType == source.textureType &&
             cached.arrayLength == source.arrayLength &&
-            cached.mipmapLevelCount == source.mipmapLevelCount;
+            cached.mipmapLevelCount == copyLevelCount;
         if (cached && !shapeMatches) {
             mglSafeReleaseMetalObj(&object->mtl_depth_read_data[orientation]);
             object->mtl_depth_read_version[orientation] = 0u;
@@ -2429,10 +2431,10 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
         MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
                                                                                               width:source.width
                                                                                              height:source.height
-                                                                                          mipmapped:source.mipmapLevelCount > 1];
+                                                                                          mipmapped:copyLevelCount > 1];
         descriptor.textureType = source.textureType;
         descriptor.arrayLength = source.arrayLength;
-        descriptor.mipmapLevelCount = source.mipmapLevelCount;
+        descriptor.mipmapLevelCount = copyLevelCount;
         descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
         descriptor.storageMode = MTLStorageModePrivate;
         id<MTLTexture> destination = [_device newTextureWithDescriptor:descriptor];
@@ -2460,7 +2462,7 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
         uint32_t flip = orientation;
         [encoder setBytes:&flip length:sizeof(flip) atIndex:0];
         BOOL encodedAllLevels = YES;
-        for (NSUInteger level = 0; level < source.mipmapLevelCount; level++) {
+        for (NSUInteger level = 0; level < copyLevelCount; level++) {
             @autoreleasepool {
                 id<MTLTexture> input = source;
                 id<MTLTexture> output = destination;

@@ -145,6 +145,32 @@ Final resource synchronization retains its normal freshness checks and binds.
 Parallel workers keep their existing path. This defaults off pending actual
 game correctness and frame-rate measurements.
 
+An additional experiment ran this preparation before dirty-state processing
+on every draw, including draws within the same FBO. Adjacent 90-second runs
+measured 49.99 FPS enabled and 49.45 FPS disabled, while encoder creation
+increased from roughly 46-48 to 60 in representative summaries. This did not
+establish a useful gain; the additional experimental path was removed.
+
+### Depth-copy scope and diagnostics
+
+Depth read and compare mirrors now use the same GL-visible mip window as
+color mirrors. Allocation, freshness checks and copy loops agree on that
+window; absolute mip indices and array slices are retained. Changing the
+visible window invalidates the mirror's shape. Stale depth-read requests for
+both orientations of one texture are gathered across vertex and fragment
+stages and encoded together, retaining separate outputs for the two directions.
+
+A visible, unlocked 90-second Minecraft run at 1708x960 with Complementary
+and fixed noon measured 49.11 FPS. Three depth-read mirrors, including the
+2048x2048 shadow texture, were compared to their source with the appropriate
+row orientation and reported zero maximum error. The drawable was also
+checked. This establishes behavior in the measured scene, not a frame-rate
+gain or runtime coverage of mip-window changes and opposite-stage requests.
+
+Normal scissor coordinate conversion and legal depth/stencil tests without
+the respective framebuffer attachment now report through the opt-in trace
+logger. Their GL state translation is unchanged.
+
 ### SPIR-V optimization experiment
 
 `MGL_SPIRV_OPTIMIZE=1` enables the bundled glslang's GLSL optimization passes

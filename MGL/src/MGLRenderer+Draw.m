@@ -4118,6 +4118,12 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
 - (bool)prepareSampledCopiesForDraw
 {
     BOOL endedEncoder = NO;
+    /* Gather both stages before dispatching so requests for opposite
+     * orientations share one compute encoder. Bound the list by all GL
+     * targets on all texture units, including targets lowered to Metal 2D. */
+    Texture *depthReadObjects[_MAX_TEXTURE_TYPES * TEXTURE_UNITS];
+    unsigned depthReadMasks[_MAX_TEXTURE_TYPES * TEXTURE_UNITS];
+    unsigned depthReadCount = 0;
     const int stages[] = {_VERTEX_SHADER, _FRAGMENT_SHADER};
     for (unsigned stageIndex = 0; stageIndex < 2; stageIndex++) {
         int stage = stages[stageIndex];
@@ -4158,14 +4164,24 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
             } else {
                 object->mtl_depth_read_requested_mask |= 1u << orientation;
                 if ([self depthReadTextureForObject:object program:program]) continue;
+                unsigned index = 0;
+                while (index < depthReadCount && depthReadObjects[index] != object) index++;
+                if (index == depthReadCount) {
+                    depthReadObjects[index] = object;
+                    depthReadMasks[index] = 0u;
+                    depthReadCount++;
+                }
+                depthReadMasks[index] |= 1u << orientation;
+                continue;
             }
             if (!endedEncoder) { [self endRenderEncoding]; endedEncoder = YES; }
-            if (kind == MGLTextureDataKindDepth) {
-                RETURN_FALSE_ON_FAILURE([self updateDepthCompareCopyForTexture:object]);
-            } else {
-                RETURN_FALSE_ON_FAILURE([self updateDepthReadCopiesForTexture:object orientationMask:1u << orientation]);
-            }
+            RETURN_FALSE_ON_FAILURE([self updateDepthCompareCopyForTexture:object]);
         }
+    }
+    for (unsigned index = 0; index < depthReadCount; index++) {
+        if (!endedEncoder) { [self endRenderEncoding]; endedEncoder = YES; }
+        RETURN_FALSE_ON_FAILURE([self updateDepthReadCopiesForTexture:depthReadObjects[index]
+            orientationMask:depthReadMasks[index]]);
     }
     return true;
 }
