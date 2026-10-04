@@ -37,6 +37,23 @@ typedef struct MGLBlitColorState {
     double scaledDstMetalY;
 } MGLBlitColorState;
 
+typedef struct MGLSampledCopyMRTItem {
+    Texture *texture;
+    __unsafe_unretained id<MTLTexture> source;
+    __unsafe_unretained id<MTLTexture> destination;
+    NSUInteger mipLevels;
+    uint32_t copyMask;
+    uint32_t copiedMask;
+    uint32_t mipMask;
+} MGLSampledCopyMRTItem;
+
+typedef struct MGLSampledCopyMRTTask {
+    NSUInteger itemIndex;
+    NSUInteger level;
+    NSUInteger width;
+    NSUInteger height;
+} MGLSampledCopyMRTTask;
+
 /* Exact storage sizes for formats supported by the raw texture-buffer copy.
  * Compressed, packed depth/stencil and stencil formats retain native row blits. */
 static NSUInteger mglCopyImageRawPixelSize(MTLPixelFormat format)
@@ -586,6 +603,89 @@ static void mglVerifySampledCopyIfSelected(id<MTLDevice> device,
 
     _scaledBlitPipelineCache[key] = pipeline;
     NSLog(@"MGL INFO: created scaled blit pipeline pixelFormat=%lu", (unsigned long)pixelFormat);
+    return pipeline;
+}
+
+- (id<MTLRenderPipelineState>)sampledCopyMRTPipelineForFormats:(const MTLPixelFormat *)formats
+                                                           count:(NSUInteger)count
+{
+    if (!formats || count == 0u || count > MAX_COLOR_ATTACHMENTS) return nil;
+
+    uint8_t keyBytes[1u + sizeof(MTLPixelFormat) * MAX_COLOR_ATTACHMENTS] = {0};
+    keyBytes[0] = (uint8_t)count;
+    memcpy(keyBytes + 1u, formats, count * sizeof(MTLPixelFormat));
+    NSData *key = [NSData dataWithBytes:keyBytes
+                                 length:1u + count * sizeof(MTLPixelFormat)];
+    if (!_sampledCopyMRTPipelineCache) {
+        _sampledCopyMRTPipelineCache = [[NSCache alloc] init];
+        _sampledCopyMRTPipelineCache.countLimit = 128u;
+    }
+    id<MTLRenderPipelineState> cached = [_sampledCopyMRTPipelineCache objectForKey:key];
+    if (cached) return cached;
+
+    static NSString *vertexSource =
+        @"#include <metal_stdlib>\n"
+         "using namespace metal;\n"
+         "struct MGLSampledCopyParams { float4 uvRect; float forceOpaqueAlpha; float3 _padding; };\n"
+         "struct MGLSampledCopyVOut { float4 position [[position]]; float2 uv; };\n"
+         "vertex MGLSampledCopyVOut mgl_sampled_copy_vs(uint vid [[vertex_id]], constant MGLSampledCopyParams& p [[buffer(0)]]) {\n"
+         "    float2 pos[4] = { float2(-1.0, -1.0), float2(1.0, -1.0), float2(-1.0, 1.0), float2(1.0, 1.0) };\n"
+         "    float2 uv[4] = { float2(p.uvRect.x, p.uvRect.w), float2(p.uvRect.z, p.uvRect.w), float2(p.uvRect.x, p.uvRect.y), float2(p.uvRect.z, p.uvRect.y) };\n"
+         "    MGLSampledCopyVOut o; o.position = float4(pos[vid], 0.0, 1.0); o.uv = uv[vid]; return o;\n"
+         "}\n";
+    NSMutableString *source = [NSMutableString stringWithString:vertexSource];
+    [source appendString:@"struct MGLSampledCopyMRTOut {\n"];
+    for (NSUInteger i = 0; i < count; i++) {
+        [source appendFormat:@"    float4 color%lu [[color(%lu)]];\n",
+                             (unsigned long)i, (unsigned long)i];
+    }
+    [source appendString:@"};\n"
+                       "fragment MGLSampledCopyMRTOut mgl_sampled_copy_mrt_fs(MGLSampledCopyVOut in [[stage_in]], constant MGLSampledCopyParams& p [[buffer(0)]], sampler s [[sampler(0)]], "];
+    for (NSUInteger i = 0; i < count; i++) {
+        [source appendFormat:@"texture2d<float> src%lu [[texture(%lu)]]%@",
+                             (unsigned long)i, (unsigned long)i,
+                             i + 1u < count ? @", " : @") {\n"];
+    }
+    [source appendString:@"    MGLSampledCopyMRTOut out;\n"];
+    for (NSUInteger i = 0; i < count; i++) {
+        [source appendFormat:@"    float4 color%lu = src%lu.sample(s, in.uv);\n"
+                             "    if (p.forceOpaqueAlpha > 0.5) { color%lu.a = 1.0; }\n"
+                             "    out.color%lu = color%lu;\n",
+                             (unsigned long)i, (unsigned long)i,
+                             (unsigned long)i,
+                             (unsigned long)i, (unsigned long)i];
+    }
+    [source appendString:@"    return out;\n}\n"];
+
+    NSError *error = nil;
+    id<MTLLibrary> library = [self newMetalLibraryWithSource:source
+                                                     options:nil
+                                                       label:@"MGL sampled-copy MRT"
+                                                       error:&error];
+    id<MTLFunction> vs = [library newFunctionWithName:@"mgl_sampled_copy_vs"];
+    id<MTLFunction> fs = [library newFunctionWithName:@"mgl_sampled_copy_mrt_fs"];
+    if (!vs || !fs) {
+        NSLog(@"MGL ERROR: sampled-copy MRT functions missing count=%lu error=%@",
+              (unsigned long)count, error);
+        return nil;
+    }
+
+    MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
+    desc.label = @"MGL sampled-copy MRT";
+    desc.vertexFunction = vs;
+    desc.fragmentFunction = fs;
+    desc.rasterSampleCount = 1u;
+    for (NSUInteger i = 0; i < count; i++) {
+        desc.colorAttachments[i].pixelFormat = formats[i];
+    }
+    mglEnableIndirectCommandBuffersForPipeline(desc);
+    id<MTLRenderPipelineState> pipeline = [_device newRenderPipelineStateWithDescriptor:desc error:&error];
+    if (!pipeline) {
+        NSLog(@"MGL ERROR: sampled-copy MRT pipeline failed count=%lu error=%@",
+              (unsigned long)count, error);
+        return nil;
+    }
+    [_sampledCopyMRTPipelineCache setObject:pipeline forKey:key];
     return pipeline;
 }
 
@@ -1473,6 +1573,296 @@ static void mglVerifySampledCopyIfSelected(id<MTLDevice> device,
     }
 
     return YES;
+}
+
+- (BOOL)updateGLSampledRenderTargetCopiesForTextures:(Texture * const *)textures
+                                                count:(NSUInteger)count
+{
+    if (!textures && count != 0u) return NO;
+    if (!mglEnvFlagEnabled("MGL_RT_SAMPLE_MRT")) {
+        for (NSUInteger i = 0; i < count; i++) {
+            Texture *tex = textures[i];
+            id<MTLTexture> source = tex && tex->mtl_data
+                ? (__bridge id<MTLTexture>)tex->mtl_data : nil;
+            if (![self updateGLSampledRenderTargetCopyForTexture:tex
+                                                           source:source
+                                                           reason:"sampled_copy_mrt_disabled"]) {
+                return NO;
+            }
+        }
+        return YES;
+    }
+
+    if (count == 0u) return YES;
+    if (count > NSUIntegerMax / sizeof(MGLSampledCopyMRTItem) ||
+        count > NSUIntegerMax / (32u * sizeof(MGLSampledCopyMRTTask))) {
+        return NO;
+    }
+    MGLSampledCopyMRTItem *items = calloc(count, sizeof(*items));
+    MGLSampledCopyMRTTask *tasks = calloc(count * 32u, sizeof(*tasks));
+    BOOL *taskDone = calloc(count * 32u, sizeof(*taskDone));
+    if (!items || !tasks || !taskDone) {
+        free(items);
+        free(tasks);
+        free(taskDone);
+        return NO;
+    }
+
+    NSUInteger itemCount = 0u;
+    NSUInteger taskCount = 0u;
+    BOOL ok = YES;
+    for (NSUInteger i = 0; i < count && ok; i++) {
+        Texture *tex = textures[i];
+        id<MTLTexture> source = tex && tex->mtl_data
+            ? (__bridge id<MTLTexture>)tex->mtl_data : nil;
+        if (!tex || !source || ![self textureCanUseGLSampledRenderTargetCopy:tex source:source] ||
+            tex->mtl_render_target_write_version == 0u) {
+            ok = NO;
+            break;
+        }
+        if (mglGLSampledCopyIsFresh(tex, source)) continue;
+
+        /* Preserve the existing exact per-texture compute route; MRT only
+         * combines the raster path's fullscreen color copies. */
+        if ([self canComputeSampledCopyForTexture:source] ||
+            source.sampleCount != 1u || source.textureType != MTLTextureType2D ||
+            mglCopyImageRawPixelSize(source.pixelFormat) == 0u) {
+            ok = [self updateGLSampledRenderTargetCopyForTexture:tex
+                                                           source:source
+                                                           reason:"sampled_copy_mrt_legacy_path"];
+            continue;
+        }
+
+        NSUInteger mipLevels = mglGLSampledCopyLevelCount(tex, source);
+        if (mipLevels == 0u || mipLevels > 32u) {
+            ok = NO;
+            break;
+        }
+        BOOL needsNewCopy = tex->mtl_gl_sampled_data == NULL ||
+            tex->mtl_gl_sampled_width != (GLuint)source.width ||
+            tex->mtl_gl_sampled_height != (GLuint)source.height ||
+            tex->mtl_gl_sampled_format != (GLuint)source.pixelFormat ||
+            tex->mtl_gl_sampled_levels != (GLuint)mipLevels;
+        if (needsNewCopy) {
+            [self releaseGLSampledRenderTargetCopyForTexture:tex];
+            BOOL mipmapped = (mipLevels > 1u);
+            MTLTextureDescriptor *desc =
+                [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:source.pixelFormat
+                                                                   width:source.width
+                                                                  height:source.height
+                                                               mipmapped:mipmapped];
+            if (mipmapped) desc.mipmapLevelCount = mipLevels;
+            desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+            desc.storageMode = MTLStorageModePrivate;
+            id<MTLTexture> copy = [_device newTextureWithDescriptor:desc];
+            if (!copy) {
+                NSLog(@"MGL ERROR: sampled-copy MRT destination allocation failed tex=%u fmt=%lu size=%lux%lu",
+                      (unsigned)tex->name, (unsigned long)source.pixelFormat,
+                      (unsigned long)source.width, (unsigned long)source.height);
+                ok = NO;
+                break;
+            }
+            tex->mtl_gl_sampled_data = (void *)CFBridgingRetain(copy);
+            tex->mtl_gl_sampled_width = (GLuint)source.width;
+            tex->mtl_gl_sampled_height = (GLuint)source.height;
+            tex->mtl_gl_sampled_format = (GLuint)source.pixelFormat;
+            tex->mtl_gl_sampled_levels = (GLuint)mipLevels;
+        }
+
+        id<MTLTexture> destination = (__bridge id<MTLTexture>)tex->mtl_gl_sampled_data;
+        if (!destination || destination.mipmapLevelCount < mipLevels) {
+            ok = NO;
+            break;
+        }
+        uint32_t mipMask = mipLevels == 32u
+            ? UINT32_MAX : (((uint32_t)1u << mipLevels) - 1u);
+        uint32_t copyMask = needsNewCopy
+            ? mipMask : (tex->mtl_gl_sampled_dirty_mip_mask & mipMask);
+        if (copyMask == 0u &&
+            tex->mtl_gl_sampled_write_version != tex->mtl_render_target_write_version) {
+            copyMask = mipMask;
+        }
+        if (copyMask == 0u) continue;
+
+        MGLSampledCopyMRTItem *item = &items[itemCount++];
+        item->texture = tex;
+        item->source = source;
+        item->destination = destination;
+        item->mipLevels = mipLevels;
+        item->copyMask = copyMask;
+        item->mipMask = mipMask;
+        for (NSUInteger level = 0; level < mipLevels; level++) {
+            if ((copyMask & ((uint32_t)1u << level)) == 0u) continue;
+            MGLSampledCopyMRTTask *task = &tasks[taskCount++];
+            task->itemIndex = itemCount - 1u;
+            task->level = level;
+            task->width = MAX((NSUInteger)1u, destination.width >> level);
+            task->height = MAX((NSUInteger)1u, destination.height >> level);
+        }
+    }
+
+    NSUInteger encoderCount = 0u;
+    if (ok && taskCount > 0u && ![self ensureWritableCommandBuffer:"sampled_copy_mrt"]) {
+        ok = NO;
+    }
+    id<MTLSamplerState> sampledCopySampler = taskCount > 0u
+        ? [self scaledBlitSamplerForFilter:GL_NEAREST] : nil;
+    if (taskCount > 0u && !sampledCopySampler) ok = NO;
+
+    const MGLScaledBlitParams params = {
+        .uvRect = {0.0f, 1.0f, 1.0f, 0.0f},
+        .forceOpaqueAlpha = 0.0f,
+        ._padding = {0.0f, 0.0f, 0.0f}
+    };
+    BOOL directDestinationMip = mglEnvFlagEnabled("MGL_RT_SAMPLE_DIRECT_MIP");
+    for (NSUInteger first = 0; ok && first < taskCount; first++) {
+        if (taskDone[first]) continue;
+        NSUInteger group[MAX_COLOR_ATTACHMENTS] = {first};
+        NSUInteger groupCount = 1u;
+        MGLSampledCopyMRTTask *firstTask = &tasks[first];
+        for (NSUInteger candidate = first + 1u;
+             candidate < taskCount && groupCount < 2u;
+             candidate++) {
+            if (taskDone[candidate]) continue;
+            if (tasks[candidate].width == firstTask->width &&
+                tasks[candidate].height == firstTask->height) {
+                group[groupCount++] = candidate;
+            }
+        }
+
+        @autoreleasepool {
+            MTLPixelFormat formats[MAX_COLOR_ATTACHMENTS];
+            id<MTLTexture> sourceViews[MAX_COLOR_ATTACHMENTS] = { nil };
+            id<MTLTexture> destinationViews[MAX_COLOR_ATTACHMENTS] = { nil };
+            for (NSUInteger attachment = 0; attachment < groupCount; attachment++) {
+                MGLSampledCopyMRTTask *task = &tasks[group[attachment]];
+                MGLSampledCopyMRTItem *item = &items[task->itemIndex];
+                formats[attachment] = item->destination.pixelFormat;
+                sourceViews[attachment] = item->source;
+                if (item->mipLevels > 1u) {
+                    sourceViews[attachment] = [item->source
+                        newTextureViewWithPixelFormat:item->source.pixelFormat
+                                         textureType:MTLTextureType2D
+                                              levels:NSMakeRange(task->level, 1u)
+                                              slices:NSMakeRange(0u, 1u)];
+                    if (!directDestinationMip) {
+                        destinationViews[attachment] = [item->destination
+                            newTextureViewWithPixelFormat:item->destination.pixelFormat
+                                             textureType:MTLTextureType2D
+                                                  levels:NSMakeRange(task->level, 1u)
+                                                  slices:NSMakeRange(0u, 1u)];
+                    } else {
+                        destinationViews[attachment] = item->destination;
+                    }
+                } else {
+                    destinationViews[attachment] = item->destination;
+                }
+                if (!sourceViews[attachment] || !destinationViews[attachment]) {
+                    NSLog(@"MGL ERROR: sampled-copy MRT mip view failed tex=%u level=%lu",
+                          (unsigned)item->texture->name, (unsigned long)task->level);
+                    ok = NO;
+                    break;
+                }
+            }
+            if (ok) {
+                id<MTLRenderPipelineState> pipeline =
+                    [self sampledCopyMRTPipelineForFormats:formats count:groupCount];
+                if (!pipeline) {
+                    ok = NO;
+                } else {
+                    MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+                    for (NSUInteger attachment = 0; attachment < groupCount; attachment++) {
+                        MGLSampledCopyMRTTask *task = &tasks[group[attachment]];
+                        MGLSampledCopyMRTItem *item = &items[task->itemIndex];
+                        pass.colorAttachments[attachment].texture = destinationViews[attachment];
+                        pass.colorAttachments[attachment].level =
+                            (item->mipLevels > 1u && directDestinationMip) ? task->level : 0u;
+                        pass.colorAttachments[attachment].loadAction = MTLLoadActionDontCare;
+                        pass.colorAttachments[attachment].storeAction = MTLStoreActionStore;
+                    }
+                    pass.renderTargetWidth = firstTask->width;
+                    pass.renderTargetHeight = firstTask->height;
+                    id<MTLRenderCommandEncoder> encoder =
+                        mglProfileRender(_currentCommandBuffer, pass, __func__, __LINE__,
+                                         ctx ? ctx->state.program_name : 0,
+                                         ctx && ctx->state.framebuffer ? ctx->state.framebuffer->name : 0);
+                    if (!encoder) {
+                        ok = NO;
+                    } else {
+                        [encoder setRenderPipelineState:pipeline];
+                        [encoder setVertexBytes:&params length:sizeof(params) atIndex:0];
+                        [encoder setFragmentBytes:&params length:sizeof(params) atIndex:0];
+                        for (NSUInteger attachment = 0; attachment < groupCount; attachment++) {
+                            [encoder setFragmentTexture:sourceViews[attachment] atIndex:attachment];
+                        }
+                        [encoder setFragmentSamplerState:sampledCopySampler atIndex:0];
+                        [encoder setViewport:(MTLViewport){
+                            .originX = 0.0, .originY = 0.0,
+                            .width = (double)firstTask->width,
+                            .height = (double)firstTask->height,
+                            .znear = 0.0, .zfar = 1.0
+                        }];
+                        [encoder setScissorRect:(MTLScissorRect){
+                            .x = 0, .y = 0,
+                            .width = firstTask->width,
+                            .height = firstTask->height
+                        }];
+                        [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+                        [encoder endEncoding];
+                        encoderCount++;
+                        for (NSUInteger attachment = 0; attachment < groupCount; attachment++) {
+                            MGLSampledCopyMRTTask *task = &tasks[group[attachment]];
+                            items[task->itemIndex].copiedMask |= (uint32_t)1u << task->level;
+                            taskDone[group[attachment]] = YES;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (ok) {
+        for (NSUInteger i = 0; i < itemCount; i++) {
+            MGLSampledCopyMRTItem *item = &items[i];
+            if (item->copiedMask != item->copyMask) {
+                ok = NO;
+                break;
+            }
+        }
+    }
+    if (ok) {
+        for (NSUInteger i = 0; i < itemCount; i++) {
+            MGLSampledCopyMRTItem *item = &items[i];
+            mglVerifySampledCopyIfSelected(_device, _currentCommandBuffer,
+                                           item->source, item->destination,
+                                           item->mipLevels, item->copiedMask);
+            item->texture->mtl_gl_sampled_dirty_mip_mask &= ~item->copiedMask;
+            if ((item->texture->mtl_gl_sampled_dirty_mip_mask & item->mipMask) == 0u) {
+                item->texture->mtl_gl_sampled_write_version =
+                    item->texture->mtl_render_target_write_version;
+            }
+        }
+    }
+
+    if (mglEnvFlagEnabled("MGL_RT_SAMPLE_MRT_TRACE")) {
+        static uint64_t traceCalls = 0u;
+        static uint64_t logicalCopies = 0u;
+        static uint64_t renderEncoders = 0u;
+        uint64_t call = ++traceCalls;
+        logicalCopies += taskCount;
+        renderEncoders += encoderCount;
+        if (call <= 32u) {
+            NSLog(@"MGL RT-SAMPLE MRT call=%llu ok=%d inputs=%lu logicalCopies=%lu encoders=%lu cumulativeCopies=%llu cumulativeEncoders=%llu",
+                  (unsigned long long)call, ok ? 1 : 0, (unsigned long)count,
+                  (unsigned long)taskCount, (unsigned long)encoderCount,
+                  (unsigned long long)logicalCopies, (unsigned long long)renderEncoders);
+        }
+    }
+
+    free(items);
+    free(tasks);
+    free(taskDone);
+    return ok;
 }
 
 - (id<MTLRenderPipelineState>)clearRectPipelineForColorFormat:(MTLPixelFormat)colorFormat

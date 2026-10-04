@@ -171,6 +171,30 @@ Normal scissor coordinate conversion and legal depth/stencil tests without
 the respective framebuffer attachment now report through the opt-in trace
 logger. Their GL state translation is unchanged.
 
+### Batched raster sampled copies
+
+`MGL_RT_SAMPLE_MRT=1` gathers stale color sampled copies across both shader
+stages before binding draw resources. It combines copies with equal mip
+dimensions into a render pass with at most two color attachments. Sources keep
+single-mip views; each destination retains its own format and dirty mip state.
+The existing compute-copy path, depth paths and unsupported raster formats keep
+their existing handling. The flag defaults off pending actual-game comparison.
+
+`MGL_RT_SAMPLE_MRT_TRACE=1` reports logical mip copies and render encoder counts
+for the first 32 calls. `MGL_RT_SAMPLE_COPY_VERIFY=1` also checks copies made by
+this path. Disable both for frame-rate comparisons.
+
+The actual Complementary workload encoded 99 logical mip copies with 78 render
+encoders in the first 32 traced calls. All 28 selected raw-byte checks across four
+formats matched reversed source rows, including multi-mip textures. This checks
+the exercised copies; it does not establish a performance gain or cover every
+possible mixed-format combination.
+
+Visible, unlocked 90-second runs at 1708x960 with Complementary and fixed noon
+measured 53.16 FPS disabled and 53.32 FPS enabled, with GPU profiling, copy
+verification and capture disabled. The approximately 0.3 percent difference
+does not establish a material performance benefit. Keep this experiment off.
+
 ### Native texel-buffer experiment
 
 `MGL_NATIVE_TEXEL_BUFFER=1` enables native Metal `texture_buffer` declarations

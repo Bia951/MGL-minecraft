@@ -143,6 +143,8 @@ void mglMarkTextureLevelRenderTargetWrittenImpl(Texture *tex,
 - (BOOL)updateGLSampledRenderTargetCopyForTexture:(Texture *)tex
                                            source:(id<MTLTexture>)source
                                            reason:(const char *)reason;
+- (BOOL)updateGLSampledRenderTargetCopiesForTextures:(Texture * const *)textures
+                                                count:(NSUInteger)count;
 - (id<MTLTexture>)freshGLSampledRenderTargetCopyForSampling:(Texture *)tex
                                                      source:(id<MTLTexture>)source
                                                       stage:(const char *)stage

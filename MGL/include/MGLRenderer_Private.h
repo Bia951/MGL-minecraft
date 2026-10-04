@@ -323,6 +323,7 @@ typedef struct MGLPlainUniformArenaCacheEntry_t {
     id<MTLSamplerState> _fallbackSamplerState;
     MGLFragmentTextureTraceBinding _fragmentTextureTraceBindings[TEXTURE_UNITS];
     NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *_scaledBlitPipelineCache;
+    NSCache<NSData *, id<MTLRenderPipelineState>> *_sampledCopyMRTPipelineCache;
     id<MTLSamplerState> _scaledBlitNearestSampler;
     id<MTLSamplerState> _scaledBlitLinearSampler;
     NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *_scaledDepthBlitPipelineCache;

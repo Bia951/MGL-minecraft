@@ -4124,6 +4124,9 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
     Texture *depthReadObjects[_MAX_TEXTURE_TYPES * TEXTURE_UNITS];
     unsigned depthReadMasks[_MAX_TEXTURE_TYPES * TEXTURE_UNITS];
     unsigned depthReadCount = 0;
+    BOOL batchColorCopies = mglEnvFlagEnabled("MGL_RT_SAMPLE_MRT");
+    Texture *colorCopyObjects[_MAX_TEXTURE_TYPES * TEXTURE_UNITS];
+    unsigned colorCopyCount = 0;
     const int stages[] = {_VERTEX_SHADER, _FRAGMENT_SHADER};
     for (unsigned stageIndex = 0; stageIndex < 2; stageIndex++) {
         int stage = stages[stageIndex];
@@ -4148,9 +4151,15 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
                 object->mtl_render_target_write_version != 0u &&
                 mglDecideYFlipForSampledRT(object, program) == MGL_YFLIP_USE_SAMPLED_COPY) {
                 if (!mglGLSampledCopyIsFresh(object, source)) {
-                    if (!endedEncoder) { [self endRenderEncoding]; endedEncoder = YES; }
-                    RETURN_FALSE_ON_FAILURE([self updateGLSampledRenderTargetCopyForTexture:object
-                        source:source reason:"draw_sample_preflight"]);
+                    if (batchColorCopies) {
+                        unsigned index = 0;
+                        while (index < colorCopyCount && colorCopyObjects[index] != object) index++;
+                        if (index == colorCopyCount) colorCopyObjects[colorCopyCount++] = object;
+                    } else {
+                        if (!endedEncoder) { [self endRenderEncoding]; endedEncoder = YES; }
+                        RETURN_FALSE_ON_FAILURE([self updateGLSampledRenderTargetCopyForTexture:object
+                            source:source reason:"draw_sample_preflight"]);
+                    }
                 }
                 continue;
             }
@@ -4177,6 +4186,11 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
             if (!endedEncoder) { [self endRenderEncoding]; endedEncoder = YES; }
             RETURN_FALSE_ON_FAILURE([self updateDepthCompareCopyForTexture:object]);
         }
+    }
+    if (colorCopyCount) {
+        if (!endedEncoder) { [self endRenderEncoding]; endedEncoder = YES; }
+        RETURN_FALSE_ON_FAILURE([self updateGLSampledRenderTargetCopiesForTextures:colorCopyObjects
+            count:colorCopyCount]);
     }
     for (unsigned index = 0; index < depthReadCount; index++) {
         if (!endedEncoder) { [self endRenderEncoding]; endedEncoder = YES; }
