@@ -248,6 +248,8 @@ bool compileStageFromLinkedProgram(GLMContext ctx, Program *pptr, glslang_progra
 void error_callback(void *userdata, const char *error);
 void addShadersToProgram(GLMContext ctx, Program *pptr, glslang_program_t *glsl_program);
 char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage);
+/* Private fragment sampler variant; no GL reflection mutation. Caller frees. */
+char *mglNativeDepthMSL(GLMContext ctx, Program *program, uint64_t depth_mask, uint64_t flip_mask);
 char *mglCompileMSLCaptureVariant(GLMContext ctx, Program *ptr, int stage);
 GLboolean mglProgramPipelinePerVertexCompatible(Program *const *stage_programs);
 

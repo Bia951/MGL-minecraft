@@ -317,6 +317,23 @@ static inline void mglMetalUnlock(os_unfair_lock *lock) {
      * wrapping an MTLTextureType.  Program instances have process-unique IDs,
      * so allocator address reuse cannot return another Program's value. */
     NSCache<NSString *, NSNumber *> *_mslTextureTypeCache;
+    /* Native depth is opt-in and disabled for parallel encode workers.
+     * Masks index fragment sampled-resource reflection, not Metal slots. */
+    BOOL _nativeDepthSamplingEnabled;
+    BOOL _nativeDepthReady;
+    uint64_t _nativeDepthMask;
+    uint64_t _nativeDepthFlipMask;
+    uint64_t _nativeDepthProgramInstance;
+    uint64_t _nativeDepthLinkGeneration;
+    id<MTLRenderPipelineState> _nativeDepthBasePipeline;
+    id<MTLRenderPipelineState> _nativeDepthSelectedPipeline;
+    NSMutableDictionary<NSArray *, id> *_nativeDepthShaderCache;
+    NSMutableDictionary<NSArray *, id> *_nativeDepthPipelineCache;
+    Texture *_nativeDepthGLTextures[64];
+    void *_nativeDepthBackings[64];
+    GLuint _nativeDepthTextureUnits[64];
+    id<MTLTexture> _nativeDepthTextures[64];
+    id<MTLSamplerState> _nativeDepthSamplers[64];
 
     /* === Task 4: Snapshot Arena (bump allocator) ===
      * Gated by MGL_ARENA_SNAPSHOT (default ON; =0 disables).  When enabled,

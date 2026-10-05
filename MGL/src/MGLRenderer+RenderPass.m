@@ -4800,6 +4800,9 @@ create_new_command_buffer:
         }
     }
 
+    /* Keep the normal pipeline builder and its fallback chain unaware of
+     * private depth shaders. Re-select the actual binding combination below. */
+    if (_nativeDepthSamplingEnabled) [self resetNativeDepthDraw];
     RETURN_FALSE_ON_FAILURE([self processDirtyStateDomainsLocked:draw_command]);
 
     // Ensure a render encoder exists for draw commands.
@@ -4895,6 +4898,7 @@ create_new_command_buffer:
         return false;
     }
 
+    if (draw_command) RETURN_FALSE_ON_FAILURE([self selectNativeDepthPipelineForDraw]);
     RETURN_FALSE_ON_FAILURE([self validateRenderPassAttachmentsAndPipelineFormatsLocked:traceProcess]);
 
     @try {

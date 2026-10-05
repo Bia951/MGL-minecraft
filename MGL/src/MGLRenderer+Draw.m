@@ -2528,7 +2528,15 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
         BOOL suppressMissingTextureFallback = NO;
         BOOL usedSampledCopyForTrace = NO;
 
-        if (ptr) {
+        BOOL nativeDepthSelected = _nativeDepthReady && i < 64u &&
+            ((_nativeDepthMask & (UINT64_C(1) << i)) != 0u);
+        if (nativeDepthSelected) {
+            if (textureUnit != _nativeDepthTextureUnits[i] ||
+                ![self nativeDepthBindingAtResourceIndex:i program:sampleProgram texture:ptr]) return false;
+            texture = _nativeDepthTextures[i];
+            sampler = _nativeDepthSamplers[i];
+            directTextureForTrace = texture;
+        } else if (ptr) {
             if (![self recoverFragmentSampledDepthTexture:&ptr
                                                    texture:&texture
                                                sampledName:sampledName
@@ -4025,6 +4033,20 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
     if (!fbo) {
         return;
     }
+    /* Native depth consumers need the same GPU-write/orientation authority
+     * as color consumers. Do not leave an uploaded CPU shadow authoritative
+     * after a depth-writing draw. Disabled mode retains existing behavior. */
+    if (_nativeDepthSamplingEnabled && ctx->state.caps.depth_test &&
+        ctx->state.var.depth_writemask && _renderPassDescriptor.depthAttachment.texture) {
+        Texture *depthTexture = [self framebufferAttachmentTexture:&fbo->depth];
+        if (depthTexture) {
+            depthTexture->is_render_target = true;
+            mglMarkTextureLevelRenderTargetWritten(depthTexture, fbo->depth.level);
+            Program *producer = mglResolveProgramForStageFromState(ctx, _VERTEX_SHADER);
+            if (producer && producer->spirv[_VERTEX_SHADER].mgl_injected_framebuffer_yflip)
+                depthTexture->mtl_render_yflip_authority |= 1u;
+        }
+    }
 
     /* Track which attachments the draw-buffer pass already marked, so the
      * render-pass-descriptor cross-check below doesn't double-bump
@@ -4525,6 +4547,16 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
     RETURN_FALSE_ON_FAILURE([self bindActiveTexturesToMTL]);
     RETURN_FALSE_ON_FAILURE([self restoreRenderEncoderAfterTextureUploadForDraw:"final-active-texture-bind"]);
     if (![self bindTexturesToCurrentRenderEncoder]) {
+        /* No draw was issued. A stale backing, failed view/bind or encoder
+         * interruption rolls the complete private transaction back to the
+         * base shader before any legacy texture fallback can be bound. */
+        if (_nativeDepthReady) {
+            [self resetNativeDepthDraw];
+            if (_currentRenderEncoder && _pipelineState) {
+                [_currentRenderEncoder setRenderPipelineState:_pipelineState];
+                _lastPipelineState = _pipelineState;
+            }
+        }
         RETURN_FALSE_ON_FAILURE([self restoreRenderEncoderAfterTextureUploadForDraw:"final-sampled-texture-bind"]);
         RETURN_FALSE_ON_FAILURE([self bindTexturesToCurrentRenderEncoder]);
     }

@@ -11889,6 +11889,9 @@ void* CppCreateMGLRendererAndBindToContext (void *glm_ctx)
     _gpuErrorRecoveryMode = NO;
     // Kill-switchable opts: unset = ON, =0/false/no/off = OFF.
     _mslCacheEnabled = mglEnvFlagEnabledDefaultOn("MGL_MSL_CACHE");
+    /* Parallel workers do not own native resource transaction snapshots. */
+    _nativeDepthSamplingEnabled = mglEnvFlagEnabled("MGL_NATIVE_DEPTH_SAMPLING") &&
+        !mglEnvFlagEnabled("MGL_PARALLEL_ENCODE");
     _packedUniformReuseEnabled = mglEnvFlagEnabled("MGL_PACKED_UNIFORM_REUSE");
     // Bounded per-Program MSL texture type lookup cache (always on; no env var).
     // Keys include a process-unique Program lifetime ID and link generation.

@@ -86,8 +86,20 @@ MTLPixelFormat mtlPixelFormatForGLTex(Texture *gl_tex);
 /* Pipeline helper — defined in MGLRenderer.m, used by RenderPass.m and Blit.m. */
 void mglEnableIndirectCommandBuffersForPipeline(MTLRenderPipelineDescriptor *pipelineStateDescriptor);
 
-@interface MGLRenderer ()
+@interface MGLRenderer (NativeDepth)
+- (void)resetNativeDepthDraw;
+- (bool)selectNativeDepthPipelineForDraw;
+- (bool)nativeDepthBindingAtResourceIndex:(GLuint)index program:(Program *)program
+                                texture:(Texture *)texture;
+@end
 
+@interface MGLRenderer (RenderPass)
+- (MTLRenderPipelineDescriptor *)generatePipelineDescriptor;
+- (MTLVertexDescriptor *)generateVertexDescriptor;
+- (void)bindBlendStateToPipelineStateDescriptor:(MTLRenderPipelineDescriptor *)descriptor;
+@end
+
+@interface MGLRenderer ()
 // === Render pass state sync ===
 - (bool)syncRenderPassStateForContext:(GLMContext)glm_ctx;
 - (bool)rotateRenderEncoderForCurrentFramebufferLocked;
