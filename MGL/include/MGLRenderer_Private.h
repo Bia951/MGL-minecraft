@@ -257,6 +257,10 @@ static inline void mglMetalUnlock(os_unfair_lock *lock) {
     NSMutableArray<id<MTLBuffer>> *_packedUniformRetiredArenas;
     NSUInteger _packedUniformArenaCapacity;
     NSUInteger _packedUniformArenaOffset;
+    /* Immutable content/range dedup scoped strictly to the current command
+     * buffer. Keys include program/link/stage/layout identity plus bytes. */
+    BOOL _packedUniformReuseEnabled;
+    NSMutableDictionary<NSArray *, NSArray *> *_packedUniformRangeCache;
     /* glVertexAttrib* current values are expanded into a repeated Metal
      * vertex stream.  Cache the immutable stream per attribute and rebuild it
      * only when the encoded value or stride actually changes. */

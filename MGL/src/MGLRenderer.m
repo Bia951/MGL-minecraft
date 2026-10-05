@@ -3737,6 +3737,7 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
  * object even if the arena has to grow between stages. */
 - (Buffer *)packedStructBufferWithData:(const void *)data
                                   size:(size_t)size
+                           snapshotKey:(NSArray *)snapshotKey
                                 offset:(GLintptr *)outOffset
 {
     if (!data || size == 0u || !outOffset || !_device || !_currentCommandBuffer) {
@@ -3749,6 +3750,7 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
         _packedUniformArenaCapacity = 0u;
         _packedUniformArenaOffset = 0u;
         [_packedUniformRetiredArenas removeAllObjects];
+        [_packedUniformRangeCache removeAllObjects];
     }
 
     if (s_packedStructBufferIdx >= MGL_MAX_PACKED_STRUCT_BUFFERS) {
@@ -3769,9 +3771,21 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
         return NULL;
     }
 
-    BOOL needsArena = !_packedUniformArenaBuffer ||
+    /* An exact byte key (not just a hash) prevents collisions and captures
+     * legacy global-fallback changes even without a reliable generation.
+     * Retain the selected arena, never cache mutable Buffer wrapper pointers. */
+    NSArray *contentKey = nil;
+    NSArray *cachedRange = nil;
+    if (_packedUniformReuseEnabled && snapshotKey) {
+        contentKey = @[snapshotKey, [NSData dataWithBytes:data length:size]];
+        cachedRange = [_packedUniformRangeCache objectForKey:contentKey];
+    }
+    id<MTLBuffer> selectedArena = cachedRange ? cachedRange[0] : nil;
+    if (cachedRange) alignedOffset = [cachedRange[1] unsignedIntegerValue];
+
+    BOOL needsArena = !cachedRange && (!_packedUniformArenaBuffer ||
         alignedOffset > _packedUniformArenaCapacity ||
-        alignedSize > (_packedUniformArenaCapacity - alignedOffset);
+        alignedSize > (_packedUniformArenaCapacity - alignedOffset));
     if (needsArena) {
         NSUInteger previousCapacity = _packedUniformArenaCapacity;
         NSUInteger grown = previousCapacity > 0u
@@ -3812,12 +3826,22 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
         alignedOffset = 0u;
     }
 
-    uint8_t *destination = (uint8_t *)_packedUniformArenaBuffer.contents + alignedOffset;
-    memcpy(destination, data, size);
-    if (alignedSize > size) {
-        memset(destination + size, 0, alignedSize - size);
+    if (!cachedRange) {
+        selectedArena = _packedUniformArenaBuffer;
+        uint8_t *destination = (uint8_t *)selectedArena.contents + alignedOffset;
+        memcpy(destination, data, size);
+        if (alignedSize > size) {
+            memset(destination + size, 0, alignedSize - size);
+        }
+        _packedUniformArenaOffset = alignedOffset + alignedSize;
+        if (contentKey) {
+            if (!_packedUniformRangeCache) _packedUniformRangeCache = [NSMutableDictionary new];
+            /* Bounded cache: dropping metadata never overwrites an encoded
+             * range; the allocator still advances monotonically. */
+            if (_packedUniformRangeCache.count >= 128u) [_packedUniformRangeCache removeAllObjects];
+            _packedUniformRangeCache[contentKey] = @[selectedArena, @(alignedOffset)];
+        }
     }
-    _packedUniformArenaOffset = alignedOffset + alignedSize;
 
     int idx = s_packedStructBufferIdx++;
     Buffer *buf = s_packedStructBuffers[idx];
@@ -3834,10 +3858,10 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
 
     /* Non-owning bridge: the renderer retains the active/retired arenas and
      * Metal command buffers retain every encoded resource until completion. */
-    buf->data.mtl_data = (__bridge void *)_packedUniformArenaBuffer;
-    buf->size = (GLsizeiptr)_packedUniformArenaCapacity;
+    buf->data.mtl_data = (__bridge void *)selectedArena;
+    buf->size = (GLsizeiptr)selectedArena.length;
     buf->data.buffer_data = 0;
-    buf->data.buffer_size = _packedUniformArenaCapacity;
+    buf->data.buffer_size = selectedArena.length;
     buf->data.dirty_bits = 0;
     buf->has_initialized_data = GL_TRUE;
     buf->ever_written = GL_TRUE;
@@ -4183,8 +4207,14 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
                         }
 
                         GLintptr packedOffset = 0;
+                        NSArray *snapshotKey = _packedUniformReuseEnabled
+                            ? @[@(program->msl_texture_cache_instance_id),
+                                @(program->msl_texture_cache_generation), @(stage),
+                                @(resource->_id), @(element), @(metal_binding), @(struct_size)]
+                            : nil;
                         Buffer *packedBuf = [self packedStructBufferWithData:packed
                                                                        size:struct_size
+                                                                snapshotKey:snapshotKey
                                                                      offset:&packedOffset];
                         if (packed != stack_packed) {
                             free(packed);
@@ -11859,6 +11889,7 @@ void* CppCreateMGLRendererAndBindToContext (void *glm_ctx)
     _gpuErrorRecoveryMode = NO;
     // Kill-switchable opts: unset = ON, =0/false/no/off = OFF.
     _mslCacheEnabled = mglEnvFlagEnabledDefaultOn("MGL_MSL_CACHE");
+    _packedUniformReuseEnabled = mglEnvFlagEnabled("MGL_PACKED_UNIFORM_REUSE");
     // Bounded per-Program MSL texture type lookup cache (always on; no env var).
     // Keys include a process-unique Program lifetime ID and link generation.
     _mslTextureTypeCache = [NSCache new];

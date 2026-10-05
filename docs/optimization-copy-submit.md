@@ -10,6 +10,16 @@ Relink replaces stage reflection storage; failed links never publish new metadat
 
 Build: `make -j4` passed for core/ES dylibs and GLFW. This is static metadata only, not yet the complete once-per-draw resolved binding plan or upload/copy-before-pipeline submission ordering.
 
+## Packed uniform range reuse (second CPU increment)
+
+`MGL_PACKED_UNIFORM_REUSE=1`, default off, independently switchable. No existing uniform-generation/snapshot experiment switch was found in this checkout, so this incremental experiment has an explicit new gate rather than silently changing an unrelated/default-on switch.
+
+After packing, an exact immutable byte key plus program lifetime/link generation/stage/resource ID/array element/Metal slot/size identifies identical content. At most 128 cached ranges are retained per renderer, strictly within one command buffer. Hits build a fresh per-map Buffer wrapper pointing at the retained original arena/offset (including retired arenas after growth). Misses allocate monotonically and never overwrite an earlier range. Changing command buffers drops the cache; no backing arena is pooled/recycled across command buffers. Existing Metal command buffers retain encoded resources through GPU completion.
+
+Small UBO setBytes snapshots, GPU-written buffers, uniform-update flushes, and GL hazard handling are unchanged. Thus old draws continue to execute before mutable program uniform storage is updated. CPU packing/version reuse and queued immutable snapshot ownership have **not** been implemented by this increment; it only deduplicates immutable Metal arena ranges after packing. Exact byte comparison deliberately protects global fallback changes and hash collisions.
+
+Build: `make -j4` passed for core/ES dylibs and GLFW. No game validation/performance claim. SPIR-V was not changed by either CPU increment, so no new SPIR-V variant exists to validate yet.
+
 ## Native depth status
 
 The earlier uncommitted MSL text-substitution prototype was removed after review. It did not provide legal private SPIR-V rewriting, independent depth coordinate flip masks, operation eligibility, and final shader/resource transactional fallback. Its patch was saved outside the repository at `/tmp/mgl-native-depth-incomplete.patch` for inspection only. Do not deploy it.
