@@ -24,4 +24,12 @@ Build: `make -j4` passed for core/ES dylibs and GLFW. No game validation/perform
 
 The earlier uncommitted MSL text-substitution prototype was removed after review. It did not provide legal private SPIR-V rewriting, independent depth coordinate flip masks, operation eligibility, and final shader/resource transactional fallback. Its patch was saved outside the repository at `/tmp/mgl-native-depth-incomplete.patch` for inspection only. Do not deploy it.
 
-Native depth, full binding resolution, generation-keyed CPU snapshots, and Minecraft performance/visual verification remain pending. No independent GL validation executable, game screenshots, FPS calibration, or A/B runs were added/run.
+### Private SPIR-V rewriter (implemented, not yet connected to draws)
+
+`MGL/src/mgl_native_depth_ir.c` provides a transactional pure IR transform. It validates both input/output with SPIRV-Tools, clones the selected sampler variable's image/sampled-image/pointer type chain, preserves original resource IDs/decorations, and explicitly reconstructs depth results as `(d,0,0,1)`. Selected resources share deduplicated private types where needed; unselected samplers retain their original types. The source module/reflection is never mutated.
+
+Supported: fragment scalar float sampler2D, ordinary sample (including bias), LOD, Grad, texelFetch and size/levels queries. Normalized coordinate flips use `1-y`; Grad flips negate gradient Y; fetch queries the bound image's size at the requested LOD and uses `height-1-y`. Color-only flip masks are also supported by the transform without changing the image type. Array/MS/comparison, gather/offset/projection, sparse operations and opaque sampler parameter passing reject the combination. Conservative rejection/validation failure returns no output; runtime must use its existing fallback, not bypass copies.
+
+`python3 tools/check_native_depth_ir.py` passed offline fixtures for sample/LOD/Grad/fetch/combined, shared-type isolation, reversed resource order, malformed masks/modules and unsupported-operation rejection. Every supported fixture combination passes `spirv-val`, SPIRV-Cross MSL generation and `xcrun metal` compilation. Tests do not create a GL context or launch a game. `make -j4` passed.
+
+No runtime native-depth switch/copy bypass is published yet: private MSL ABI parity, bounded program-lifecycle variant cache, final pipeline/texture transaction and resource preparation ordering still need integration. Native-depth draws, full binding resolution, generation-keyed CPU snapshots, and Minecraft performance/visual verification remain pending. No independent GL validation executable, game screenshots, FPS calibration, or A/B runs were added/run.
