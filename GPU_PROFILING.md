@@ -15,6 +15,24 @@ Counter intervals are converted with two CPU/GPU clock pairs. Metal's CPU timest
 
 Profiling can affect scheduling and sampled frames. Compare mode 1 with mode 2 and normal performance summaries in the actual application before drawing conclusions.
 
+## Frame-rate measurement scope
+
+Historical numbers called FPS in this document were derived from timestamped
+`MGL PERF` summaries, with 30 swap-boundary calls per emitted summary. They
+measure renderer swap cadence, not Minecraft's F3 frame counter or completed
+GPU presents. The summary counter is process-global and also runs on the normal
+GL_NONE no-present path. A one-to-one mapping to application frames has not been
+verified. Treat those values as comparative diagnostics, not proof that the
+application or display achieved that frame rate. The measurement helper now
+labels its output `renderer_swap_hz` rather than `fps`.
+
+Minecraft 26.1.2 updates its F3 counter after `RenderSystem.flipFrame` and the
+frame limiter, using completed `renderFrame` calls. Different averaging windows
+can produce short-term differences, but sustained discrepancies require a
+same-window comparison rather than assuming that explanation. Frozen/on and
+unfrozen/off results must also be kept distinct. In particular, the reported
+60.18 value was a frozen/on swap-cadence measurement, not a confirmed F3 result.
+
 ## Uniform arena experiments
 
 `MGL_PLAIN_UNIFORM_ARENA=1` opts ordinary vertex/fragment plain uniforms into immutable command-buffer arena storage. It is disabled by default. UBO and SSBO storage is unchanged. `MGL_UNIFORM_VERSIONS=1` independently opts queued draws into immutable Program uniform versions; it also remains disabled by default.
