@@ -189,6 +189,13 @@ typedef struct SpirvResource_t {
     GLuint  image_multisampled;
     /* 0 unknown, 1 present, 2 absent in this stage's generated MSL. */
     uint8_t msl_texture_argument_state;
+    /* Private link-time binding metadata; does not alter GL reflection.
+     * Metal enum values are stored as integers to keep this header C-only. */
+    GLboolean binding_plan_valid;
+    GLboolean binding_plan_skip_buffer;
+    GLboolean binding_plan_skip_sampler;
+    GLuint binding_plan_texture_type;
+    GLuint binding_plan_texture_kind;
     /* True for tessellation patch variables (SpvDecorationPatch). */
     GLboolean is_per_patch;
     /* UBO member uniforms (only valid for SPVC_RESOURCE_TYPE_UNIFORM_BUFFER). */
@@ -286,6 +293,9 @@ typedef struct Program_t {
     GLuint builtin_program_output_count[_MAX_SHADER_TYPES];
     void *mtl_data;
 } Program;
+
+GLboolean mglResourceBindingPlanEnabled(void);
+void mglBuildResourceBindingPlan(Program *program);
 
 GLint mglProgramActiveUniformCount(Program *program);
 GLint mglProgramActiveUniformMaxNameLength(Program *program);

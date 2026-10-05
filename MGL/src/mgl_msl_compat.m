@@ -480,6 +480,40 @@ bool mglStageMSLHasArgumentAtBinding(Program *program,
     return result;
 }
 
+/* === Private link-time binding plan === */
+
+GLboolean mglResourceBindingPlanEnabled(void)
+{
+    static GLboolean enabled;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *value = getenv("MGL_RESOURCE_BINDING_PLAN");
+        enabled = value && *value && strcmp(value, "0") &&
+            strcasecmp(value, "false") && strcasecmp(value, "no") &&
+            strcasecmp(value, "off");
+    });
+    return enabled;
+}
+
+void mglBuildResourceBindingPlan(Program *program)
+{
+    if (!program || !mglResourceBindingPlanEnabled()) return;
+    for (int stage = 0; stage < _MAX_SHADER_TYPES; stage++) {
+        for (int type = 0; type < _MAX_SPIRV_RES; type++) {
+            SpirvResourceList *list = &program->spirv_resources_list[stage][type];
+            for (GLuint i = 0; list->list && i < list->count; i++) {
+                SpirvResource *res = &list->list[i];
+                res->binding_plan_valid = GL_FALSE;
+                res->binding_plan_skip_buffer = mglShouldSkipStageBufferResource(program, stage, type, res);
+                res->binding_plan_skip_sampler = mglShouldSkipStageSamplerResource(program, stage, type, res);
+                res->binding_plan_texture_type = (GLuint)mglExpectedTextureTypeFromMSL(program->spirv[stage].msl_str, res->binding);
+                res->binding_plan_texture_kind = (GLuint)mglExpectedTextureDataKindFromMSL(program->spirv[stage].msl_str, res->binding);
+                res->binding_plan_valid = GL_TRUE;
+            }
+        }
+    }
+}
+
 /* === Stale resource skip gating === */
 
 bool mglShouldSkipStageBufferResource(Program *program,
@@ -489,6 +523,10 @@ bool mglShouldSkipStageBufferResource(Program *program,
 {
     if (!program || !resource) {
         return false;
+    }
+
+    if (mglResourceBindingPlanEnabled() && resource->binding_plan_valid) {
+        return resource->binding_plan_skip_buffer;
     }
 
     if (resource->uses_argument_buffer) {
@@ -598,6 +636,9 @@ bool mglShouldSkipStageSamplerResource(Program *program,
 
     if (resourceType != SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS) {
         return false;
+    }
+    if (mglResourceBindingPlanEnabled() && resource->binding_plan_valid) {
+        return resource->binding_plan_skip_sampler;
     }
 
     if (mglStageMSLHasNamedSamplerArgument(program, stage, resource->name, resource->binding)) {

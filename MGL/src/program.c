@@ -1132,6 +1132,7 @@ void mglLinkProgram(GLMContext ctx, GLuint program)
         }
         pptr->vertexAttribUsageMask = attr_mask;
         pptr->mslCacheValid = GL_TRUE;
+        mglBuildResourceBindingPlan(pptr);
     }
 
     /* Only call mtlBindProgram if Metal functions are initialized */

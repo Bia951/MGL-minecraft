@@ -7327,17 +7327,21 @@ static BOOL mglSnapshotSharedBufferRange(id<MTLDevice> device,
     // texture type for a given (program instance, generation, stage, binding)
     // never changes.  The Program instance ID is never reused, even if malloc
     // later reuses the Program's address.
-    NSString *mslTextureCacheKey = [NSString stringWithFormat:@"T_%llu_%llu_%d_%u",
-                                    (unsigned long long)ptr->msl_texture_cache_instance_id,
-                                    (unsigned long long)ptr->msl_texture_cache_generation,
-                                    stage, (unsigned)res->binding];
-    NSNumber *cachedMslType = [_mslTextureTypeCache objectForKey:mslTextureCacheKey];
     MTLTextureType mslType;
-    if (cachedMslType != nil) {
-        mslType = (MTLTextureType)[cachedMslType unsignedIntegerValue];
+    if (mglResourceBindingPlanEnabled() && res->binding_plan_valid) {
+        mslType = (MTLTextureType)res->binding_plan_texture_type;
     } else {
-        mslType = mglExpectedTextureTypeFromMSL(ptr->spirv[stage].msl_str, res->binding);
-        [_mslTextureTypeCache setObject:@(mslType) forKey:mslTextureCacheKey];
+        NSString *mslTextureCacheKey = [NSString stringWithFormat:@"T_%llu_%llu_%d_%u",
+                                        (unsigned long long)ptr->msl_texture_cache_instance_id,
+                                        (unsigned long long)ptr->msl_texture_cache_generation,
+                                        stage, (unsigned)res->binding];
+        NSNumber *cachedMslType = [_mslTextureTypeCache objectForKey:mslTextureCacheKey];
+        if (cachedMslType != nil) {
+            mslType = (MTLTextureType)[cachedMslType unsignedIntegerValue];
+        } else {
+            mslType = mglExpectedTextureTypeFromMSL(ptr->spirv[stage].msl_str, res->binding);
+            [_mslTextureTypeCache setObject:@(mslType) forKey:mslTextureCacheKey];
+        }
     }
 
     MTLTextureType spirvType = 0;
@@ -7405,6 +7409,10 @@ static BOOL mglSnapshotSharedBufferRange(id<MTLDevice> device,
     }
 
     SpirvResource *res = &ptr->spirv_resources_list[stage][type].list[index];
+    if (mglResourceBindingPlanEnabled() && res->binding_plan_valid) {
+        MGLTextureDataKind kind = (MGLTextureDataKind)res->binding_plan_texture_kind;
+        return kind != MGLTextureDataKindUnknown ? kind : MGLTextureDataKindFloat;
+    }
     NSString *mslDataKindCacheKey = [NSString stringWithFormat:@"K_%llu_%llu_%d_%u",
                                       (unsigned long long)ptr->msl_texture_cache_instance_id,
                                       (unsigned long long)ptr->msl_texture_cache_generation,
