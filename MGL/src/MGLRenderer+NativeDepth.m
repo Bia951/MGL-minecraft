@@ -11,6 +11,7 @@
     _nativeDepthSelectedPipeline = nil;
     _nativeDepthBasePipeline = nil;
     _nativeDepthReady = NO;
+    _nativeDepthBindingRejected = NO;
     _nativeDepthMask = _nativeDepthFlipMask = 0;
     for (NSUInteger i = 0; i < 64; i++) {
         _nativeDepthGLTextures[i] = NULL;
@@ -53,6 +54,33 @@
     return function;
 }
 
+- (id<MTLSamplerState>)nativeDepthSamplerForParameters:(const TextureParameter *)params
+{
+    /* An application's sampler object may also have been bound to a rectangle
+     * texture, whose cached Metal sampler uses unnormalized coordinates.
+     * Do not borrow that target-dependent cache for native depth2d sampling. */
+    uint32_t keyWords[15] = {params->min_filter, params->mag_filter,
+        params->wrap_s, params->wrap_t, params->wrap_r, params->compare_mode, params->compare_func};
+    memcpy(&keyWords[7], &params->min_lod, sizeof(GLfloat));
+    memcpy(&keyWords[8], &params->max_lod, sizeof(GLfloat));
+    memcpy(&keyWords[9], &params->lod_bias, sizeof(GLfloat));
+    memcpy(&keyWords[10], &params->max_anisotropy, sizeof(GLfloat));
+    memcpy(&keyWords[11], params->border_color, 4u * sizeof(GLfloat));
+    NSData *key = [NSData dataWithBytes:keyWords length:sizeof(keyWords)];
+    id<MTLSamplerState> sampler = _nativeDepthSamplerCache[key];
+    if (!sampler) {
+        // The existing factory only reads the parameter record.
+        TextureParameter copy = *params;
+        sampler = [self createMTLSamplerForTexParam:&copy target:GL_TEXTURE_2D];
+        if (sampler) {
+            if (!_nativeDepthSamplerCache) _nativeDepthSamplerCache = [NSMutableDictionary new];
+            if (_nativeDepthSamplerCache.count >= 128u) [_nativeDepthSamplerCache removeAllObjects];
+            _nativeDepthSamplerCache[key] = sampler;
+        }
+    }
+    return sampler;
+}
+
 - (bool)selectNativeDepthPipelineForDraw
 {
     if (!_nativeDepthSamplingEnabled || _parallelEncodeActive || !ctx || !_pipelineState ||
@@ -87,7 +115,8 @@
         id<MTLTexture> backing = tex->mtl_data ? (__bridge id<MTLTexture>)tex->mtl_data : nil;
         if (!backing || backing.pixelFormat != MTLPixelFormatDepth32Float ||
             backing.textureType != MTLTextureType2D || backing.sampleCount != 1u ||
-            !(backing.usage & MTLTextureUsageShaderRead) || [self currentRenderPassUsesTexture:backing]) continue;
+            !(backing.usage & MTLTextureUsageShaderRead) || backing.parentTexture ||
+            [self currentRenderPassUsesTexture:backing]) continue;
         NSUInteger base = tex->params.base_level;
         NSUInteger max = MIN((NSUInteger)tex->params.max_level, backing.mipmapLevelCount - 1u);
         if (base >= backing.mipmapLevelCount || max < base) continue;
@@ -98,19 +127,7 @@
                     slices:NSMakeRange(0, 1)];
             if (!view) continue; // Never bind a wrong mip range on view failure.
         }
-        Sampler *glSampler = ctx->state.texture_samplers[unit];
-        id<MTLSamplerState> sampler = nil;
-        if (glSampler) {
-            if (glSampler->dirty_bits && glSampler->mtl_data)
-                mglSafeReleaseMetalObj((void **)&glSampler->mtl_data);
-            if (!glSampler->mtl_data) {
-                sampler = [self createMTLSamplerForTexParam:params target:tex->target];
-                if (sampler) {
-                    glSampler->mtl_data = (void *)CFBridgingRetain(sampler);
-                    glSampler->dirty_bits = 0;
-                }
-            } else sampler = (__bridge id<MTLSamplerState>)glSampler->mtl_data;
-        } else if (tex->params.mtl_data) sampler = (__bridge id<MTLSamplerState>)tex->params.mtl_data;
+        id<MTLSamplerState> sampler = [self nativeDepthSamplerForParameters:params];
         if (!sampler) continue;
         _nativeDepthGLTextures[i] = tex;
         _nativeDepthBackings[i] = tex->mtl_data;
@@ -160,6 +177,42 @@
     _nativeDepthProgramInstance = program->msl_texture_cache_instance_id;
     _nativeDepthLinkGeneration = program->msl_texture_cache_generation;
     _nativeDepthReady = YES;
+    return true;
+}
+
+- (bool)fallbackNativeDepthForCurrentDraw
+{
+    if (!_nativeDepthReady || !ctx) return false;
+    id<MTLRenderPipelineState> base = _nativeDepthBasePipeline;
+    [self resetNativeDepthDraw];
+    [self discardResolvedTextureBindings];
+    if (!_pipelineState) _pipelineState = base;
+    ctx->state.dirty_bits |= DIRTY_PROGRAM | DIRTY_VAO | DIRTY_FBO | DIRTY_RENDER_STATE;
+    if (![self syncPipelineStateWithDeferredBufferMap:NO]) return false;
+    if (!_currentRenderEncoder && ![self restoreRenderEncoderAfterTextureUploadForDraw:"native-pipeline-fallback"]) return false;
+    if (_resolvedTexturePlanEnabled && ![self prepareResolvedTextureBindingsForDraw]) return false;
+    [self updateCurrentRenderEncoder];
+    return [self validateRenderPassAttachmentsAndPipelineFormatsLocked:false];
+}
+
+- (bool)nativeDepthBindingsRemainUsable
+{
+    if (!_nativeDepthReady || _nativeDepthBindingRejected || !ctx ||
+        _pipelineState != _nativeDepthSelectedPipeline) return false;
+    Program *program = mglResolveProgramForStageFromState(ctx, _FRAGMENT_SHADER);
+    if (!program || program->msl_texture_cache_instance_id != _nativeDepthProgramInstance ||
+        program->msl_texture_cache_generation != _nativeDepthLinkGeneration) return false;
+    SpirvResourceList *images = &program->spirv_resources_list[_FRAGMENT_SHADER][SPVC_RESOURCE_TYPE_SAMPLED_IMAGE];
+    if (images->count > 64u || !images->list) return false;
+    for (GLuint i = 0; i < images->count; i++) {
+        if (!(_nativeDepthMask & (UINT64_C(1) << i))) continue;
+        SpirvResource *resource = &images->list[i];
+        GLuint unit = [self textureUnitForSampledResource:resource metalBinding:resource->binding stage:_FRAGMENT_SHADER];
+        Texture *texture = [self textureForSampledResource:resource metalBinding:resource->binding
+                                                   stage:_FRAGMENT_SHADER expectedType:MTLTextureType2D];
+        if (unit != _nativeDepthTextureUnits[i] ||
+            ![self nativeDepthBindingAtResourceIndex:i program:program texture:texture]) return false;
+    }
     return true;
 }
 

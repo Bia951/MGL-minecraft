@@ -2533,7 +2533,10 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
             ((_nativeDepthMask & (UINT64_C(1) << i)) != 0u);
         if (nativeDepthSelected) {
             if (textureUnit != _nativeDepthTextureUnits[i] ||
-                ![self nativeDepthBindingAtResourceIndex:i program:sampleProgram texture:ptr]) return false;
+                ![self nativeDepthBindingAtResourceIndex:i program:sampleProgram texture:ptr]) {
+                _nativeDepthBindingRejected = YES;
+                return false;
+            }
             texture = _nativeDepthTextures[i];
             sampler = _nativeDepthSamplers[i];
             directTextureForTrace = texture;
@@ -4043,9 +4046,9 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
         if (depthTexture) {
             depthTexture->is_render_target = true;
             mglMarkTextureLevelRenderTargetWritten(depthTexture, fbo->depth.level);
-            Program *producer = mglResolveProgramForStageFromState(ctx, _VERTEX_SHADER);
-            if (producer && producer->spirv[_VERTEX_SHADER].mgl_injected_framebuffer_yflip)
-                depthTexture->mtl_render_yflip_authority |= 1u;
+            /* A VS sampled-UV flip does not prove the orientation of geometry
+             * depth. Leave original-orientation authority conservative; use
+             * the existing consumer flip matrix instead of inferring it. */
         }
     }
 
@@ -4579,10 +4582,9 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
     RETURN_FALSE_ON_FAILURE([self bindActiveTexturesToMTL]);
     RETURN_FALSE_ON_FAILURE([self restoreRenderEncoderAfterTextureUploadForDraw:"final-active-texture-bind"]);
     if (![self bindTexturesToCurrentRenderEncoder]) {
-        /* No draw was issued. A stale backing, failed view/bind or encoder
-         * interruption rolls the complete private transaction back to the
-         * base shader before any legacy texture fallback can be bound. */
-        if (_nativeDepthReady) {
+        /* Keep a usable shader/view combination across a benign copy-induced
+         * encoder restart. Rejected private bindings require full rollback. */
+        if (_nativeDepthReady && ![self nativeDepthBindingsRemainUsable]) {
             [self resetNativeDepthDraw];
             if (_currentRenderEncoder && _pipelineState) {
                 [_currentRenderEncoder setRenderPipelineState:_pipelineState];
@@ -4590,7 +4592,12 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
             }
         }
         RETURN_FALSE_ON_FAILURE([self restoreRenderEncoderAfterTextureUploadForDraw:"final-sampled-texture-bind"]);
-        RETURN_FALSE_ON_FAILURE([self bindTexturesToCurrentRenderEncoder]);
+        if (![self bindTexturesToCurrentRenderEncoder]) {
+            if (!_nativeDepthReady || ![self fallbackNativeDepthForCurrentDraw]) return false;
+            [_currentRenderEncoder setRenderPipelineState:_pipelineState];
+            _lastPipelineState = _pipelineState;
+            return [self syncResourceBindingsForContext:glm_ctx];
+        }
     }
     return true;
 }

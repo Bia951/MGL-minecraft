@@ -38,11 +38,27 @@ int main(int argc, char **argv) {
     applyMSLUniformBufferPacking(p, _FRAGMENT_SHADER);
     Program *before = malloc(sizeof(*p)); memcpy(before, p, sizeof(*p));
     Shader shader_before = *s;
+    uint32_t *ir_before = malloc(bytes); memcpy(ir_before, p->spirv[_FRAGMENT_SHADER].ir, bytes);
+    SpirvUBOMember **member_copies[_MAX_SPIRV_RES] = {0};
+    GLuint **binding_copies[_MAX_SPIRV_RES] = {0};
     SpirvResource *copies[_MAX_SPIRV_RES] = {0};
     for (int type = 0; type < _MAX_SPIRV_RES; type++) {
         SpirvResourceList *list = &p->spirv_resources_list[_FRAGMENT_SHADER][type];
         if (list->count) { copies[type] = malloc(list->count * sizeof(SpirvResource));
             memcpy(copies[type], list->list, list->count * sizeof(SpirvResource)); }
+        member_copies[type] = calloc(list->count, sizeof(SpirvUBOMember *));
+        binding_copies[type] = calloc(list->count, sizeof(GLuint *));
+        for (GLuint i = 0; i < list->count; i++) {
+            SpirvResource *r = &list->list[i];
+            if (r->ubo_members && r->ubo_member_count) {
+                size_t n = r->ubo_member_count * sizeof(SpirvUBOMember);
+                member_copies[type][i] = malloc(n); memcpy(member_copies[type][i], r->ubo_members, n);
+            }
+            if (r->ubo_array_bindings && r->ubo_array_size) {
+                size_t n = r->ubo_array_size * sizeof(GLuint);
+                binding_copies[type][i] = malloc(n); memcpy(binding_copies[type][i], r->ubo_array_bindings, n);
+            }
+        }
     }
     // Reflection order is toolchain-defined; find the actual 'a' bit.
     SpirvResourceList *images = &p->spirv_resources_list[_FRAGMENT_SHADER][SPVC_RESOURCE_TYPE_SAMPLED_IMAGE];
@@ -51,10 +67,18 @@ int main(int argc, char **argv) {
         if (images->list[i].name && !strcmp(images->list[i].name, "a")) mask |= UINT64_C(1) << i;
     if (!mask) return 4;
     char *variant = mglNativeDepthMSL(ctx, p, mask, atoi(argv[5]) ? mask : 0);
-    if (memcmp(p, before, sizeof(*p)) || memcmp(s, &shader_before, sizeof(*s))) return 5;
+    if (memcmp(p, before, sizeof(*p)) || memcmp(s, &shader_before, sizeof(*s)) ||
+        memcmp(ir_before, p->spirv[_FRAGMENT_SHADER].ir, bytes)) return 5;
     for (int type = 0; type < _MAX_SPIRV_RES; type++) {
         SpirvResourceList *list = &p->spirv_resources_list[_FRAGMENT_SHADER][type];
         if (list->count && memcmp(copies[type], list->list, list->count * sizeof(SpirvResource))) return 6;
+        for (GLuint i = 0; i < list->count; i++) {
+            SpirvResource *r = &list->list[i];
+            if (member_copies[type][i] && memcmp(member_copies[type][i], r->ubo_members,
+                r->ubo_member_count * sizeof(SpirvUBOMember))) return 6;
+            if (binding_copies[type][i] && memcmp(binding_copies[type][i], r->ubo_array_bindings,
+                r->ubo_array_size * sizeof(GLuint))) return 6;
+        }
     }
     if (atoi(argv[5]) == 2) {
         if (variant || !p->spirv[_FRAGMENT_SHADER].uses_argument_buffers) return 10;
@@ -76,6 +100,8 @@ layout(location=0) out vec4 color;
 '''
 CASES = {
     "sample": "void main(){color=texture(a,uv)+texture(b,uv);}",
+    "bias": "void main(){color=texture(a,uv,0.5)+texture(b,uv);}",
+    "queries": "void main(){color=texture(a,uv)+texture(b,uv)+vec4(vec2(textureSize(a,1)),float(textureQueryLevels(a)),0);}",
     "lod": "void main(){color=textureLod(a,uv,1)+texture(b,uv);}",
     "grad": "void main(){color=textureGrad(a,uv,dFdx(uv),dFdy(uv))+texture(b,uv);}",
     "fetch": "void main(){color=texelFetch(a,ivec2(uv),1)+texture(b,uv);}",
@@ -136,6 +162,7 @@ with tempfile.TemporaryDirectory(prefix="mgl-depth-msl-") as tmp:
         print("PASS fallback", name)
     argument_cases = {
         "argument_ubo": CASES["ubo"],
+        "argument_arrays": "layout(std140,binding=3) uniform Params{vec4 factor;} p[3]; layout(std430,binding=10) buffer Store{vec4 values[];} s[2];\nvoid main(){color=texture(a,uv)+texture(b,uv)+p[1].factor+s[1].values[s[1].values.length()-1];}",
         "argument_ssbo": "layout(std430,binding=2) buffer Store{vec4 values[];} s;\nvoid main(){color=texture(a,uv)+texture(b,uv)+s.values[s.values.length()-1];}",
     }
     for name, body in argument_cases.items():

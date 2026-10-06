@@ -4906,7 +4906,9 @@ create_new_command_buffer:
             [self updateCurrentRenderEncoder];
         }
     }
-    RETURN_FALSE_ON_FAILURE([self validateRenderPassAttachmentsAndPipelineFormatsLocked:traceProcess]);
+    if (![self validateRenderPassAttachmentsAndPipelineFormatsLocked:traceProcess]) {
+        if (!_nativeDepthReady || ![self fallbackNativeDepthForCurrentDraw]) return false;
+    }
 
     @try {
         if (!_lastBoundValid || _lastPipelineState != _pipelineState) {
@@ -4924,17 +4926,26 @@ create_new_command_buffer:
         }
     } @catch (NSException *exception) {
         NSLog(@"MGL ERROR: processGLState - setRenderPipelineState failed: %@", exception.reason);
-        // Force pipeline/state retranslation on next draw instead of crashing this frame.
-        ctx->state.dirty_bits |= (DIRTY_PROGRAM | DIRTY_VAO | DIRTY_FBO | DIRTY_RENDER_STATE);
-        if (traceProcess) {
-            mglLogStateSnapshot("processGLState.fail.set_pipeline",
-                                ctx,
-                                _currentCommandBuffer,
-                                _currentRenderEncoder,
-                                _renderPassDescriptor,
-                                _drawable);
+        BOOL recovered = NO;
+        if (_nativeDepthReady && [self fallbackNativeDepthForCurrentDraw]) {
+            @try {
+                [_currentRenderEncoder setRenderPipelineState:_pipelineState];
+                _lastPipelineState = _pipelineState;
+                MGL_PERF_INC(g_mglSetRenderPipelineStateCallsSinceSwap);
+                recovered = YES;
+            } @catch (NSException *baseException) { recovered = NO; }
         }
-        return false;
+        if (!recovered) {
+            // Base failure too: force retranslation next draw, never encode
+            // legacy float texture fallbacks against a private depth shader.
+            [self discardResolvedTextureBindings];
+            ctx->state.dirty_bits |= (DIRTY_PROGRAM | DIRTY_VAO | DIRTY_FBO | DIRTY_RENDER_STATE);
+            if (traceProcess) {
+                mglLogStateSnapshot("processGLState.fail.set_pipeline", ctx,
+                    _currentCommandBuffer, _currentRenderEncoder, _renderPassDescriptor, _drawable);
+            }
+            return false;
+        }
     }
 
     // Resource Sync domain (Stage 3.4): stability rebind before draw. The logic was moved to

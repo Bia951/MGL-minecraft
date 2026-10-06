@@ -54,6 +54,8 @@ layout(location=0) out vec4 color;
 """
 CASES = {
     "sample": "color = texture(a, uv) + texture(b, uv);",
+    "bias": "color = texture(a, uv, 0.5) + texture(b, uv);",
+    "queries": "color = texture(a,uv) + texture(b,uv) + vec4(vec2(textureSize(a,1)),float(textureQueryLevels(a)),0.0);",
     "lod": "color = textureLod(a, uv, 1.0) + texture(b, uv);",
     "grad": "color = textureGrad(a, uv, dFdx(uv), dFdy(uv)) + texture(b, uv);",
     "fetch": "color = texelFetch(a, ivec2(uv), 1) + texture(b, uv);",

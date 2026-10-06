@@ -335,6 +335,7 @@ static inline void mglMetalUnlock(os_unfair_lock *lock) {
      * Masks index fragment sampled-resource reflection, not Metal slots. */
     BOOL _nativeDepthSamplingEnabled;
     BOOL _nativeDepthReady;
+    BOOL _nativeDepthBindingRejected;
     uint64_t _nativeDepthMask;
     uint64_t _nativeDepthFlipMask;
     uint64_t _nativeDepthProgramInstance;
@@ -343,6 +344,7 @@ static inline void mglMetalUnlock(os_unfair_lock *lock) {
     id<MTLRenderPipelineState> _nativeDepthSelectedPipeline;
     NSMutableDictionary<NSArray *, id> *_nativeDepthShaderCache;
     NSMutableDictionary<NSArray *, id> *_nativeDepthPipelineCache;
+    NSMutableDictionary<NSData *, id<MTLSamplerState>> *_nativeDepthSamplerCache;
     Texture *_nativeDepthGLTextures[64];
     void *_nativeDepthBackings[64];
     GLuint _nativeDepthTextureUnits[64];

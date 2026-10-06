@@ -89,11 +89,15 @@ void mglEnableIndirectCommandBuffersForPipeline(MTLRenderPipelineDescriptor *pip
 @interface MGLRenderer (NativeDepth)
 - (void)resetNativeDepthDraw;
 - (bool)selectNativeDepthPipelineForDraw;
+- (bool)nativeDepthBindingsRemainUsable;
+- (bool)fallbackNativeDepthForCurrentDraw;
 - (bool)nativeDepthBindingAtResourceIndex:(GLuint)index program:(Program *)program
                                 texture:(Texture *)texture;
 @end
 
 @interface MGLRenderer (RenderPass)
+- (void)updateCurrentRenderEncoder;
+- (bool)validateRenderPassAttachmentsAndPipelineFormatsLocked:(BOOL)traceProcess;
 - (MTLRenderPipelineDescriptor *)generatePipelineDescriptor;
 - (MTLVertexDescriptor *)generateVertexDescriptor;
 - (void)bindBlendStateToPipelineStateDescriptor:(MTLRenderPipelineDescriptor *)descriptor;

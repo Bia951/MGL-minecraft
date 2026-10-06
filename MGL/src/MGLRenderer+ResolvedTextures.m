@@ -133,9 +133,10 @@
                     complete = YES;
                     break;
                 }
-                // A private backing check or copy interrupted preparation.
-                // The retry must resolve every binding against the base shader.
-                if (_nativeDepthReady) [self resetNativeDepthDraw];
+                // A benign color-copy/encoder interruption need not discard
+                // a usable native shader/view combination. A rejected backing
+                // or changed program/unit does: retry all bindings with base.
+                if (_nativeDepthReady && ![self nativeDepthBindingsRemainUsable]) [self resetNativeDepthDraw];
             }
         }
     } @catch (NSException *exception) {
