@@ -2,6 +2,7 @@
 // Render pass lifecycle methods extracted from MGLRenderer.m
 
 #import "MGLRenderer_Private.h"
+#import "mgl_resolved_texture_bindings.h"
 #import "MGLRenderer+RenderPass_Private.h"
 
 extern void mglBeginProgramResolveScope(GLMContext ctx);
@@ -5895,7 +5896,7 @@ stencil_format_ok:;
                                                    length:sizeof(sizeConstants)
                                                   options:MTLResourceStorageModeShared];
         if (s_vertexSizeBuffer) {
-            [_currentRenderEncoder setVertexBuffer:s_vertexSizeBuffer offset:0 atIndex:MGL_BUFFER_SIZE_BUFFER_INDEX];
+            [[self bufferBindingSink] setVertexBuffer:s_vertexSizeBuffer offset:0 atIndex:MGL_BUFFER_SIZE_BUFFER_INDEX];
             [self recordLastBoundVertexBuffer:s_vertexSizeBuffer
                                        offset:0
                                       atIndex:MGL_BUFFER_SIZE_BUFFER_INDEX];
@@ -5929,7 +5930,7 @@ stencil_format_ok:;
                                                      length:sizeof(sizeConstants)
                                                     options:MTLResourceStorageModeShared];
         if (s_fragmentSizeBuffer) {
-            [_currentRenderEncoder setFragmentBuffer:s_fragmentSizeBuffer offset:0 atIndex:MGL_BUFFER_SIZE_BUFFER_INDEX];
+            [[self bufferBindingSink] setFragmentBuffer:s_fragmentSizeBuffer offset:0 atIndex:MGL_BUFFER_SIZE_BUFFER_INDEX];
             [self recordLastBoundFragmentBuffer:s_fragmentSizeBuffer
                                          offset:0
                                         atIndex:MGL_BUFFER_SIZE_BUFFER_INDEX];

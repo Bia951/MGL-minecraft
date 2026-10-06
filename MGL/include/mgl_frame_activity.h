@@ -153,6 +153,9 @@ extern _Atomic uint64_t g_mglDirtyKeyDeltaNarrowSinceSwap;
 extern _Atomic uint64_t g_mglBatchesReplayedSinceSwap;
 
 int mglPerfSummaryEnabled(void);
+/* Recording requests are not Metal buffer calls. Thread-local so actual
+ * bindings in another context/thread remain counted normally. */
+extern __thread int g_mglRecordingBufferBindings;
 int mglPerfLockTimingEnabled(void);
 uint64_t mglPerfSummaryInterval(void);
 
@@ -191,7 +194,12 @@ int mglSignpostEnabled(void);
 #define MGL_FRAME_INC(var) \
     MGL_FRAME_ADD((var), 1)
 #define MGL_PERF_ADD(var, value) \
-    do { if (mglPerfSummaryEnabled()) MGL_FRAME_ADD((var), (value)); } while (0)
+    do { if (mglPerfSummaryEnabled() && !(g_mglRecordingBufferBindings && \
+        (&(var) == &g_mglSetVertexBufferCallsSinceSwap || \
+         &(var) == &g_mglSetFragmentBufferCallsSinceSwap || \
+         &(var) == &g_mglSetVertexBufferSkipsSinceSwap || \
+         &(var) == &g_mglSetFragmentBufferSkipsSinceSwap))) \
+        MGL_FRAME_ADD((var), (value)); } while (0)
 #define MGL_PERF_INC(var) \
     MGL_PERF_ADD((var), 1)
 

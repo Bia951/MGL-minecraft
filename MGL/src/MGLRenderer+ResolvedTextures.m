@@ -3,6 +3,45 @@
 
 @implementation MGLRenderer (ResolvedTextures)
 
+- (id<MGLResolvedBufferBindingSink>)bufferBindingSink
+{
+    return _resolvedTextureBindingsPreparing ? _resolvedTextureBindings
+        : (id<MGLResolvedBufferBindingSink>)_currentRenderEncoder;
+}
+
+- (void)setVertexBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
+{
+    if (!_currentRenderEncoder || index >= kMGLMaxBufferSlots) return;
+    if (!_lastBoundValid || _lastBoundVertexBuffers[index].buffer != buffer ||
+        _lastBoundVertexBuffers[index].offset != offset) {
+        [_currentRenderEncoder setVertexBuffer:buffer offset:offset atIndex:index];
+        [self recordLastBoundVertexBuffer:buffer offset:offset atIndex:index];
+        MGL_PERF_INC(g_mglSetVertexBufferCallsSinceSwap);
+    } else MGL_PERF_INC(g_mglSetVertexBufferSkipsSinceSwap);
+}
+- (void)setFragmentBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
+{
+    if (!_currentRenderEncoder || index >= kMGLMaxBufferSlots) return;
+    if (!_lastBoundValid || _lastBoundFragmentBuffers[index].buffer != buffer ||
+        _lastBoundFragmentBuffers[index].offset != offset) {
+        [_currentRenderEncoder setFragmentBuffer:buffer offset:offset atIndex:index];
+        [self recordLastBoundFragmentBuffer:buffer offset:offset atIndex:index];
+        MGL_PERF_INC(g_mglSetFragmentBufferCallsSinceSwap);
+    } else MGL_PERF_INC(g_mglSetFragmentBufferSkipsSinceSwap);
+}
+- (void)setVertexBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
+{
+    if (!_currentRenderEncoder || index >= kMGLMaxBufferSlots) return;
+    [_currentRenderEncoder setVertexBytes:bytes length:length atIndex:index];
+    [self invalidateLastBoundVertexBufferAtIndex:index];
+}
+- (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
+{
+    if (!_currentRenderEncoder || index >= kMGLMaxBufferSlots) return;
+    [_currentRenderEncoder setFragmentBytes:bytes length:length atIndex:index];
+    [self invalidateLastBoundFragmentBufferAtIndex:index];
+}
+
 - (void)discardResolvedTextureBindings
 {
     _resolvedTextureBindings = nil;
@@ -35,6 +74,15 @@
         fragment->spirv[_FRAGMENT_SHADER].uses_argument_buffers) return true;
 
     BOOL complete = NO;
+    id<MTLRenderCommandEncoder> initialEncoder = _currentRenderEncoder;
+    BOOL initialLastBoundValid = _lastBoundValid;
+    int savedRecordingCounters = g_mglRecordingBufferBindings;
+    MGLLastBoundBuffer savedVertex[kMGLMaxBufferSlots] = {0};
+    MGLLastBoundBuffer savedFragment[kMGLMaxBufferSlots] = {0};
+    for (NSUInteger i = 0; i < kMGLMaxBufferSlots; i++) {
+        savedVertex[i] = _lastBoundVertexBuffers[i];
+        savedFragment[i] = _lastBoundFragmentBuffers[i];
+    }
     @try {
         // Upload mapped buffers before texture copies. Native depth's earlier
         // selection is a preflight: its shader/PSO/views must already be usable
@@ -44,6 +92,7 @@
             [self updateDirtyBaseBufferList:&ctx->state.fragment_buffer_map_list];
         if (buffersReady && [self bindActiveTexturesToMTL]) {
             _resolvedTextureBindingsPreparing = YES;
+            g_mglRecordingBufferBindings = 1;
             // Encoder-ending copies require a bounded restart. Partial slot
             // collections are discarded, never published or reused next draw.
             for (NSUInteger attempt = 0; attempt < 3; attempt++) {
@@ -51,7 +100,15 @@
                 if (![self restoreRenderEncoderAfterTextureUploadForDraw:"resolve-textures-before-final-pipeline"])
                     break;
                 _currentDrawUsesRTSampledCopy = NO;
-                if ([self bindTexturesToCurrentRenderEncoder] && _currentRenderEncoder &&
+                // Resolve every buffer/conversion/inline snapshot once too.
+                // Force collection without poisoning the real encoder's dedup
+                // state; restore that state after collection below.
+                _lastBoundValid = NO;
+                BOOL vertexReady = [self bindVertexBuffersToCurrentRenderEncoder];
+                _lastBoundValid = NO;
+                BOOL fragmentReady = vertexReady && [self bindFragmentBuffersToCurrentRenderEncoder];
+                BOOL sizesReady = fragmentReady && [self bindBufferSizeConstantsForRenderEncoder];
+                if (sizesReady && [self bindTexturesToCurrentRenderEncoder] && _currentRenderEncoder &&
                     _currentCommandBuffer && [_resolvedTextureBindings seal]) {
                     _resolvedTextureCommandBuffer = _currentCommandBuffer;
                     _resolvedTextureEncoder = _currentRenderEncoder;
@@ -72,6 +129,14 @@
         complete = NO;
     } @finally {
         _resolvedTextureBindingsPreparing = NO;
+        g_mglRecordingBufferBindings = savedRecordingCounters;
+        if (_currentRenderEncoder == initialEncoder) {
+            for (NSUInteger i = 0; i < kMGLMaxBufferSlots; i++) {
+                _lastBoundVertexBuffers[i] = savedVertex[i];
+                _lastBoundFragmentBuffers[i] = savedFragment[i];
+            }
+            _lastBoundValid = initialLastBoundValid;
+        } else [self invalidateLastBoundState];
     }
     if (!complete) {
         [self discardResolvedTextureBindings];
@@ -88,7 +153,9 @@
 - (bool)replayResolvedTextureBindingsForDraw
 {
     if (![self resolvedTextureBindingsMatchCurrentDraw]) return false;
-    BOOL result = [_resolvedTextureBindings replayToSink:(id<MGLResolvedTextureBindingSink>)self];
+    BOOL result = [_resolvedTextureBindings replayBuffersToSink:(id<MGLResolvedBufferBindingSink>)self] &&
+        [_resolvedTextureBindings replayToSink:(id<MGLResolvedTextureBindingSink>)self];
+    if (result) _lastBoundValid = YES;
     [self discardResolvedTextureBindings]; // One draw/encoder/CB only.
     return result;
 }

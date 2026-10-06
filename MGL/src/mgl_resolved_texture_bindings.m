@@ -5,6 +5,10 @@
     id<MTLSamplerState> _samplers[2][TEXTURE_UNITS];
     BOOL _textureWritten[2][TEXTURE_UNITS];
     BOOL _samplerWritten[2][TEXTURE_UNITS];
+    id<MTLBuffer> _buffers[2][MAX_MAPPED_BUFFERS];
+    NSData *_bytes[2][MAX_MAPPED_BUFFERS];
+    NSUInteger _offsets[2][MAX_MAPPED_BUFFERS];
+    uint8_t _bufferKind[2][MAX_MAPPED_BUFFERS]; // 0 untouched, 1 buffer, 2 bytes
 }
 - (instancetype)init
 {
@@ -26,7 +30,43 @@
     _samplers[stage][slot] = sampler;
     _samplerWritten[stage][slot] = YES;
 }
+- (void)recordBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset vertex:(BOOL)vertex slot:(NSUInteger)slot
+{
+    if (_sealed || slot >= 31u) { _valid = NO; return; }
+    NSUInteger stage = vertex ? 0 : 1;
+    _buffers[stage][slot] = buffer;
+    _bytes[stage][slot] = nil;
+    _offsets[stage][slot] = offset;
+    _bufferKind[stage][slot] = 1;
+}
+- (void)recordBytes:(const void *)bytes length:(NSUInteger)length vertex:(BOOL)vertex slot:(NSUInteger)slot
+{
+    if (_sealed || slot >= 31u || length > 4096u || (length && !bytes)) { _valid = NO; return; }
+    NSUInteger stage = vertex ? 0 : 1;
+    _bytes[stage][slot] = [NSData dataWithBytes:bytes length:length];
+    _buffers[stage][slot] = nil;
+    _bufferKind[stage][slot] = 2;
+}
+- (void)setVertexBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
+{ [self recordBuffer:buffer offset:offset vertex:YES slot:index]; }
+- (void)setFragmentBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
+{ [self recordBuffer:buffer offset:offset vertex:NO slot:index]; }
+- (void)setVertexBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
+{ [self recordBytes:bytes length:length vertex:YES slot:index]; }
+- (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
+{ [self recordBytes:bytes length:length vertex:NO slot:index]; }
 - (BOOL)seal { _sealed = YES; return _valid; }
+- (BOOL)replayBuffersToSink:(id<MGLResolvedBufferBindingSink>)sink
+{
+    if (!_sealed || !_valid || !sink) return NO;
+    for (NSUInteger i = 0; i < MAX_MAPPED_BUFFERS; i++) {
+        if (_bufferKind[0][i] == 1) [sink setVertexBuffer:_buffers[0][i] offset:_offsets[0][i] atIndex:i];
+        else if (_bufferKind[0][i] == 2) [sink setVertexBytes:_bytes[0][i].bytes length:_bytes[0][i].length atIndex:i];
+        if (_bufferKind[1][i] == 1) [sink setFragmentBuffer:_buffers[1][i] offset:_offsets[1][i] atIndex:i];
+        else if (_bufferKind[1][i] == 2) [sink setFragmentBytes:_bytes[1][i].bytes length:_bytes[1][i].length atIndex:i];
+    }
+    return YES;
+}
 - (BOOL)replayToSink:(id<MGLResolvedTextureBindingSink>)sink
 {
     if (!_sealed || !_valid || !sink) return NO;

@@ -81,6 +81,8 @@ int mglSignpostEnabled(void)
 
 /* === Last draw-call metadata === */
 
+__thread int g_mglRecordingBufferBindings = 0;
+
 _Atomic uint64_t g_mglLastDrawArraysCall       = 0;
 _Atomic double   g_mglLastDrawArraysSeconds    = 0.0;
 _Atomic uint64_t g_mglLastDrawElementsCall     = 0;

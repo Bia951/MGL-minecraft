@@ -11,15 +11,23 @@
 - (void)setFragmentSamplerStateIfNeeded:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index;
 @end
 
+@protocol MGLResolvedBufferBindingSink
+- (void)setVertexBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index;
+- (void)setFragmentBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index;
+- (void)setVertexBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index;
+- (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index;
+@end
+
 /* One draw's final Metal bindings, not a GL pointer cache. Latest writes win;
  * explicit nil is distinct from an untouched slot. Strong resource ownership
  * survives temporary views, encoder interruption and autorelease pools. */
-@interface MGLResolvedTextureBindings : NSObject
+@interface MGLResolvedTextureBindings : NSObject <MGLResolvedBufferBindingSink>
 @property(nonatomic, readonly) BOOL valid;
 @property(nonatomic, readonly) BOOL sealed;
 - (void)recordTexture:(id<MTLTexture>)texture vertex:(BOOL)vertex slot:(NSUInteger)slot;
 - (void)recordSampler:(id<MTLSamplerState>)sampler vertex:(BOOL)vertex slot:(NSUInteger)slot;
 - (BOOL)seal;
 - (BOOL)replayToSink:(id<MGLResolvedTextureBindingSink>)sink;
+- (BOOL)replayBuffersToSink:(id<MGLResolvedBufferBindingSink>)sink;
 @end
 #endif

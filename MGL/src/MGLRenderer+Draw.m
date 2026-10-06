@@ -354,7 +354,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
 
         if (!ptr) {
             NSLog(@"MGL WARNING: Vertex buffer map[%d] has invalid/NULL buffer pointer, skipping", i);
-            [_currentRenderEncoder setVertexBuffer:nil offset:0 atIndex:bindingIndex];
+            [[self bufferBindingSink] setVertexBuffer:nil offset:0 atIndex:bindingIndex];
             _lastBoundVertexBuffers[bindingIndex].buffer = nil;
             _lastBoundVertexBuffers[bindingIndex].offset = 0;
             continue;
@@ -363,7 +363,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
         if (offset < 0) {
             NSLog(@"MGL WARNING: Vertex buffer map[%d] has negative offset=%lld, skipping",
                   i, (long long)offset);
-            [_currentRenderEncoder setVertexBuffer:nil offset:0 atIndex:bindingIndex];
+            [[self bufferBindingSink] setVertexBuffer:nil offset:0 atIndex:bindingIndex];
             _lastBoundVertexBuffers[bindingIndex].buffer = nil;
             _lastBoundVertexBuffers[bindingIndex].offset = 0;
             continue;
@@ -372,7 +372,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
         if (ptr->size < 0) {
             NSLog(@"MGL WARNING: Vertex buffer %u has invalid size=%lld, skipping",
                   ptr->name, (long long)ptr->size);
-            [_currentRenderEncoder setVertexBuffer:nil offset:0 atIndex:bindingIndex];
+            [[self bufferBindingSink] setVertexBuffer:nil offset:0 atIndex:bindingIndex];
             _lastBoundVertexBuffers[bindingIndex].buffer = nil;
             _lastBoundVertexBuffers[bindingIndex].offset = 0;
             continue;
@@ -383,7 +383,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
         }
         if (!ptr->data.mtl_data) {
             NSLog(@"MGL WARNING: Vertex buffer %u has no Metal backing after bind attempt, skipping slot %d", ptr->name, i);
-            [_currentRenderEncoder setVertexBuffer:nil offset:0 atIndex:bindingIndex];
+            [[self bufferBindingSink] setVertexBuffer:nil offset:0 atIndex:bindingIndex];
             _lastBoundVertexBuffers[bindingIndex].buffer = nil;
             _lastBoundVertexBuffers[bindingIndex].offset = 0;
             continue;
@@ -391,7 +391,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
         if ((uintptr_t)ptr->data.mtl_data < 0x10000u) {
             NSLog(@"MGL VBIND skip base slot %d buffer=%u: suspicious mtl_data pointer=%p",
                   i, ptr->name, ptr->data.mtl_data);
-            [_currentRenderEncoder setVertexBuffer:nil offset:0 atIndex:bindingIndex];
+            [[self bufferBindingSink] setVertexBuffer:nil offset:0 atIndex:bindingIndex];
             _lastBoundVertexBuffers[bindingIndex].buffer = nil;
             _lastBoundVertexBuffers[bindingIndex].offset = 0;
             continue;
@@ -400,7 +400,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
         id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)(ptr->data.mtl_data);
         if (!buffer) {
             NSLog(@"MGL WARNING: Vertex buffer %u Metal object bridge failed, skipping slot %d", ptr->name, i);
-            [_currentRenderEncoder setVertexBuffer:nil offset:0 atIndex:bindingIndex];
+            [[self bufferBindingSink] setVertexBuffer:nil offset:0 atIndex:bindingIndex];
             _lastBoundVertexBuffers[bindingIndex].buffer = nil;
             _lastBoundVertexBuffers[bindingIndex].offset = 0;
             continue;
@@ -411,7 +411,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
         if (bindOffset >= metalLen) {
             NSLog(@"MGL VBIND skip base slot %d buffer=%u: offset=%lu length=%lu",
                   i, ptr->name, (unsigned long)bindOffset, (unsigned long)metalLen);
-            [_currentRenderEncoder setVertexBuffer:nil offset:0 atIndex:bindingIndex];
+            [[self bufferBindingSink] setVertexBuffer:nil offset:0 atIndex:bindingIndex];
             _lastBoundVertexBuffers[bindingIndex].buffer = nil;
             _lastBoundVertexBuffers[bindingIndex].offset = 0;
             continue;
@@ -477,7 +477,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
                             memcpy(paddedBytes,
                                ((const uint8_t *)ptr->data.buffer_data) + cpuOffset,
                                copyLen);
-                            [_currentRenderEncoder setVertexBytes:paddedBytes
+                            [[self bufferBindingSink] setVertexBytes:paddedBytes
                                                            length:paddedLen
                                                           atIndex:bindingIndex];
                             [self invalidateLastBoundVertexBufferAtIndex:bindingIndex];
@@ -515,7 +515,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
                     if (!_lastBoundValid ||
                         _lastBoundVertexBuffers[bindingIndex].buffer != minimumBindingBuffer ||
                         _lastBoundVertexBuffers[bindingIndex].offset != 0) {
-                        [_currentRenderEncoder setVertexBuffer:minimumBindingBuffer
+                        [[self bufferBindingSink] setVertexBuffer:minimumBindingBuffer
                                                         offset:0
                                                        atIndex:bindingIndex];
                         _lastBoundVertexBuffers[bindingIndex].buffer = minimumBindingBuffer;
@@ -555,7 +555,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
                                                       bindOffset,
                                                       uniformSnapshotLength);
             if (uniformSnapshotBytes) {
-                [_currentRenderEncoder setVertexBytes:uniformSnapshotBytes
+                [[self bufferBindingSink] setVertexBytes:uniformSnapshotBytes
                                                 length:uniformSnapshotLength
                                                atIndex:bindingIndex];
                 [self invalidateLastBoundVertexBufferAtIndex:bindingIndex];
@@ -582,7 +582,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
             ptr->data.buffer_data &&
             (NSUInteger)ptr->size <= 4096 &&
             offset == 0) {
-            [_currentRenderEncoder setVertexBytes:(const void *)(uintptr_t)ptr->data.buffer_data
+            [[self bufferBindingSink] setVertexBytes:(const void *)(uintptr_t)ptr->data.buffer_data
                                             length:(NSUInteger)ptr->size
                                            atIndex:bindingIndex];
             [self invalidateLastBoundVertexBufferAtIndex:bindingIndex];
@@ -594,7 +594,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
         if (!_lastBoundValid ||
             _lastBoundVertexBuffers[bindingIndex].buffer != buffer ||
             _lastBoundVertexBuffers[bindingIndex].offset != (NSUInteger)offset) {
-            [_currentRenderEncoder setVertexBuffer:buffer offset:offset atIndex:bindingIndex];
+            [[self bufferBindingSink] setVertexBuffer:buffer offset:offset atIndex:bindingIndex];
             _lastBoundVertexBuffers[bindingIndex].buffer = buffer;
             _lastBoundVertexBuffers[bindingIndex].offset = (NSUInteger)offset;
             MGL_PERF_INC(g_mglSetVertexBufferCallsSinceSwap);
@@ -792,7 +792,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
             if (!_lastBoundValid ||
                 _lastBoundVertexBuffers[bindingIndex].buffer != currentAttribBuffer ||
                 _lastBoundVertexBuffers[bindingIndex].offset != 0) {
-                [_currentRenderEncoder setVertexBuffer:currentAttribBuffer
+                [[self bufferBindingSink] setVertexBuffer:currentAttribBuffer
                                                 offset:0
                                                atIndex:bindingIndex];
                 _lastBoundVertexBuffers[bindingIndex].buffer = currentAttribBuffer;
@@ -964,7 +964,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
             if (!_lastBoundValid ||
                 _lastBoundVertexBuffers[bindingIndex].buffer != convertedBuffer ||
                 _lastBoundVertexBuffers[bindingIndex].offset != 0) {
-                [_currentRenderEncoder setVertexBuffer:convertedBuffer offset:0 atIndex:bindingIndex];
+                [[self bufferBindingSink] setVertexBuffer:convertedBuffer offset:0 atIndex:bindingIndex];
                 _lastBoundVertexBuffers[bindingIndex].buffer = convertedBuffer;
                 _lastBoundVertexBuffers[bindingIndex].offset = 0;
                 MGL_PERF_INC(g_mglSetVertexBufferCallsSinceSwap);
@@ -992,7 +992,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
             if (!_lastBoundValid ||
                 _lastBoundVertexBuffers[bindingIndex].buffer != convertedBuffer ||
                 _lastBoundVertexBuffers[bindingIndex].offset != 0) {
-                [_currentRenderEncoder setVertexBuffer:convertedBuffer offset:0 atIndex:bindingIndex];
+                [[self bufferBindingSink] setVertexBuffer:convertedBuffer offset:0 atIndex:bindingIndex];
                 _lastBoundVertexBuffers[bindingIndex].buffer = convertedBuffer;
                 _lastBoundVertexBuffers[bindingIndex].offset = 0;
                 MGL_PERF_INC(g_mglSetVertexBufferCallsSinceSwap);
@@ -1022,7 +1022,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
             if (!_lastBoundValid ||
                 _lastBoundVertexBuffers[bindingIndex].buffer != convertedBuffer ||
                 _lastBoundVertexBuffers[bindingIndex].offset != 0) {
-                [_currentRenderEncoder setVertexBuffer:convertedBuffer offset:0 atIndex:bindingIndex];
+                [[self bufferBindingSink] setVertexBuffer:convertedBuffer offset:0 atIndex:bindingIndex];
                 _lastBoundVertexBuffers[bindingIndex].buffer = convertedBuffer;
                 _lastBoundVertexBuffers[bindingIndex].offset = 0;
                 MGL_PERF_INC(g_mglSetVertexBufferCallsSinceSwap);
@@ -1075,7 +1075,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
 	    if (!_lastBoundValid ||
 	        _lastBoundVertexBuffers[bindingIndex].buffer != attribMetalBuffer ||
 	        _lastBoundVertexBuffers[bindingIndex].offset != 0) {
-	        [_currentRenderEncoder setVertexBuffer:attribMetalBuffer offset:0 atIndex:bindingIndex];
+	        [[self bufferBindingSink] setVertexBuffer:attribMetalBuffer offset:0 atIndex:bindingIndex];
 	        _lastBoundVertexBuffers[bindingIndex].buffer = attribMetalBuffer;
 	        _lastBoundVertexBuffers[bindingIndex].offset = 0;
 	        MGL_PERF_INC(g_mglSetVertexBufferCallsSinceSwap);
@@ -1188,7 +1188,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
                     if (!_lastBoundValid ||
                         _lastBoundVertexBuffers[_slot].buffer != fallbackBindingBuffer ||
                         _lastBoundVertexBuffers[_slot].offset != 0) {
-                        [_currentRenderEncoder setVertexBuffer:fallbackBindingBuffer offset:0 atIndex:_slot];
+                        [[self bufferBindingSink] setVertexBuffer:fallbackBindingBuffer offset:0 atIndex:_slot];
                         _lastBoundVertexBuffers[_slot].buffer = fallbackBindingBuffer;
                         _lastBoundVertexBuffers[_slot].offset = 0;
                         MGL_PERF_INC(g_mglSetVertexBufferCallsSinceSwap);
@@ -1211,7 +1211,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
                 if (!_lastBoundValid ||
                     _lastBoundVertexBuffers[s].buffer != fallbackBindingBuffer ||
                     _lastBoundVertexBuffers[s].offset != 0) {
-                    [_currentRenderEncoder setVertexBuffer:fallbackBindingBuffer offset:0 atIndex:s];
+                    [[self bufferBindingSink] setVertexBuffer:fallbackBindingBuffer offset:0 atIndex:s];
                     _lastBoundVertexBuffers[s].buffer = fallbackBindingBuffer;
                     _lastBoundVertexBuffers[s].offset = 0;
                     MGL_PERF_INC(g_mglSetVertexBufferCallsSinceSwap);
@@ -1251,7 +1251,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
                 ctx && ctx->state.var.point_size > 0.0f ? ctx->state.var.point_size : 1.0f,
                 ctx && ctx->state.caps.program_point_size ? 1.0f : 0.0f
             };
-            [_currentRenderEncoder setVertexBytes:pointSizeParams
+            [[self bufferBindingSink] setVertexBytes:pointSizeParams
                                           length:sizeof(pointSizeParams)
                                           atIndex:psSlot];
             [self invalidateLastBoundVertexBufferAtIndex:psSlot];
@@ -1350,7 +1350,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
         if (!ptr) {
             NSLog(@"MGL FBIND skip slot=%u: invalid/NULL candidate=%p", i, map->buf);
             map->buf = NULL;
-            [_currentRenderEncoder setFragmentBuffer:nil offset:0 atIndex:bindingIndex];
+            [[self bufferBindingSink] setFragmentBuffer:nil offset:0 atIndex:bindingIndex];
             _lastBoundFragmentBuffers[bindingIndex].buffer = nil;
             _lastBoundFragmentBuffers[bindingIndex].offset = 0;
             continue;
@@ -1359,7 +1359,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
         if (offset < 0) {
             NSLog(@"MGL FBIND skip slot=%u buffer=%u: negative offset=%lld",
                   i, ptr->name, (long long)offset);
-            [_currentRenderEncoder setFragmentBuffer:nil offset:0 atIndex:bindingIndex];
+            [[self bufferBindingSink] setFragmentBuffer:nil offset:0 atIndex:bindingIndex];
             _lastBoundFragmentBuffers[bindingIndex].buffer = nil;
             _lastBoundFragmentBuffers[bindingIndex].offset = 0;
             continue;
@@ -1378,7 +1378,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
                 if (cpuData < 0x100000000ULL) {
                     NSLog(@"MGL FBIND skip small buffer=%u slot=%u: suspicious CPU pointer=%p",
                           ptr->name, i, (void *)ptr->data.buffer_data);
-                    [_currentRenderEncoder setFragmentBuffer:nil offset:0 atIndex:bindingIndex];
+                    [[self bufferBindingSink] setFragmentBuffer:nil offset:0 atIndex:bindingIndex];
                     _lastBoundFragmentBuffers[bindingIndex].buffer = nil;
                     _lastBoundFragmentBuffers[bindingIndex].offset = 0;
             _lastBoundFragmentBuffers[bindingIndex].buffer = nil;
@@ -1391,7 +1391,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
                 if (bindOffset >= bufferSize) {
                     NSLog(@"MGL FBIND skip small buffer=%u slot=%u: offset=%lu bufferSize=%lu",
                           ptr->name, i, (unsigned long)bindOffset, (unsigned long)bufferSize);
-                    [_currentRenderEncoder setFragmentBuffer:nil offset:0 atIndex:bindingIndex];
+                    [[self bufferBindingSink] setFragmentBuffer:nil offset:0 atIndex:bindingIndex];
                     _lastBoundFragmentBuffers[bindingIndex].buffer = nil;
                     _lastBoundFragmentBuffers[bindingIndex].offset = 0;
             _lastBoundFragmentBuffers[bindingIndex].buffer = nil;
@@ -1401,7 +1401,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
 
                 size_t bindLength = bufferSize - bindOffset;
                 const uint8_t *bindPtr = ((const uint8_t *)ptr->data.buffer_data) + bindOffset;
-                [_currentRenderEncoder setFragmentBytes:bindPtr length:bindLength atIndex:bindingIndex];
+                [[self bufferBindingSink] setFragmentBytes:bindPtr length:bindLength atIndex:bindingIndex];
                 [self invalidateLastBoundFragmentBufferAtIndex:bindingIndex];
                 if (kMGLVerboseBindLogs) {
                     NSLog(@"MGL FBIND ok(slot=%lu) setFragmentBytes buffer=%u len=%lu offset=%lu",
@@ -1415,7 +1415,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
                 if ((uintptr_t)ptr->data.mtl_data < 0x100000000ULL) {
                     NSLog(@"MGL FBIND skip small MTL buffer=%u slot=%u: suspicious mtl_data pointer=%p",
                           ptr->name, i, ptr->data.mtl_data);
-                    [_currentRenderEncoder setFragmentBuffer:nil offset:0 atIndex:bindingIndex];
+                    [[self bufferBindingSink] setFragmentBuffer:nil offset:0 atIndex:bindingIndex];
                     _lastBoundFragmentBuffers[bindingIndex].buffer = nil;
                     _lastBoundFragmentBuffers[bindingIndex].offset = 0;
             _lastBoundFragmentBuffers[bindingIndex].buffer = nil;
@@ -1429,7 +1429,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
                     if (bindOffset >= metalLen) {
                         NSLog(@"MGL FBIND skip small MTL buffer=%u slot=%u: offset=%lu length=%lu",
                               ptr->name, i, (unsigned long)bindOffset, (unsigned long)metalLen);
-                        [_currentRenderEncoder setFragmentBuffer:nil offset:0 atIndex:bindingIndex];
+                        [[self bufferBindingSink] setFragmentBuffer:nil offset:0 atIndex:bindingIndex];
                     _lastBoundFragmentBuffers[bindingIndex].buffer = nil;
                     _lastBoundFragmentBuffers[bindingIndex].offset = 0;
             _lastBoundFragmentBuffers[bindingIndex].buffer = nil;
@@ -1440,7 +1440,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
                     if (!_lastBoundValid ||
                         _lastBoundFragmentBuffers[bindingIndex].buffer != fallbackBuffer ||
                         _lastBoundFragmentBuffers[bindingIndex].offset != (NSUInteger)offset) {
-                        [_currentRenderEncoder setFragmentBuffer:fallbackBuffer offset:offset atIndex:bindingIndex];
+                        [[self bufferBindingSink] setFragmentBuffer:fallbackBuffer offset:offset atIndex:bindingIndex];
                         _lastBoundFragmentBuffers[bindingIndex].buffer = fallbackBuffer;
                         _lastBoundFragmentBuffers[bindingIndex].offset = (NSUInteger)offset;
                         MGL_PERF_INC(g_mglSetFragmentBufferCallsSinceSwap);
@@ -1458,7 +1458,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
                     anyBindingPresent[bindingIndex] = true;
                 }
             } else {
-                [_currentRenderEncoder setFragmentBuffer:nil offset:0 atIndex:bindingIndex];
+                [[self bufferBindingSink] setFragmentBuffer:nil offset:0 atIndex:bindingIndex];
             _lastBoundFragmentBuffers[bindingIndex].buffer = nil;
             _lastBoundFragmentBuffers[bindingIndex].offset = 0;
             }
@@ -1473,7 +1473,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
             }
             if (!ptr->data.mtl_data) {
                 NSLog(@"MGL WARNING: Fragment buffer %u has no Metal backing after bind attempt, skipping slot %d", ptr->name, i);
-                [_currentRenderEncoder setFragmentBuffer:nil offset:0 atIndex:bindingIndex];
+                [[self bufferBindingSink] setFragmentBuffer:nil offset:0 atIndex:bindingIndex];
             _lastBoundFragmentBuffers[bindingIndex].buffer = nil;
             _lastBoundFragmentBuffers[bindingIndex].offset = 0;
                 continue;
@@ -1481,7 +1481,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
             if ((uintptr_t)ptr->data.mtl_data < 0x100000000ULL) {
                 NSLog(@"MGL FBIND skip slot=%u buffer=%u: suspicious mtl_data pointer=%p",
                       i, ptr->name, ptr->data.mtl_data);
-                [_currentRenderEncoder setFragmentBuffer:nil offset:0 atIndex:bindingIndex];
+                [[self bufferBindingSink] setFragmentBuffer:nil offset:0 atIndex:bindingIndex];
             _lastBoundFragmentBuffers[bindingIndex].buffer = nil;
             _lastBoundFragmentBuffers[bindingIndex].offset = 0;
                 continue;
@@ -1490,7 +1490,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
             id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)(ptr->data.mtl_data);
             if (!buffer) {
                 NSLog(@"MGL WARNING: Fragment buffer %u Metal object bridge failed, skipping slot %d", ptr->name, i);
-                [_currentRenderEncoder setFragmentBuffer:nil offset:0 atIndex:bindingIndex];
+                [[self bufferBindingSink] setFragmentBuffer:nil offset:0 atIndex:bindingIndex];
             _lastBoundFragmentBuffers[bindingIndex].buffer = nil;
             _lastBoundFragmentBuffers[bindingIndex].offset = 0;
                 continue;
@@ -1501,7 +1501,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
             if (bindOffset >= metalLen) {
                 NSLog(@"MGL FBIND skip slot=%u buffer=%u: offset=%lu length=%lu",
                       i, ptr->name, (unsigned long)bindOffset, (unsigned long)metalLen);
-                [_currentRenderEncoder setFragmentBuffer:nil offset:0 atIndex:bindingIndex];
+                [[self bufferBindingSink] setFragmentBuffer:nil offset:0 atIndex:bindingIndex];
             _lastBoundFragmentBuffers[bindingIndex].buffer = nil;
             _lastBoundFragmentBuffers[bindingIndex].offset = 0;
                 continue;
@@ -1562,7 +1562,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
                                 memcpy(paddedBytes,
                                    ((const uint8_t *)ptr->data.buffer_data) + cpuOffset,
                                    copyLen);
-                                [_currentRenderEncoder setFragmentBytes:paddedBytes
+                                [[self bufferBindingSink] setFragmentBytes:paddedBytes
                                                                  length:paddedLen
                                                                 atIndex:bindingIndex];
                                 [self invalidateLastBoundFragmentBufferAtIndex:bindingIndex];
@@ -1600,7 +1600,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
                         if (!_lastBoundValid ||
                             _lastBoundFragmentBuffers[bindingIndex].buffer != minimumBindingBuffer ||
                             _lastBoundFragmentBuffers[bindingIndex].offset != 0) {
-                            [_currentRenderEncoder setFragmentBuffer:minimumBindingBuffer
+                            [[self bufferBindingSink] setFragmentBuffer:minimumBindingBuffer
                                                               offset:0
                                                              atIndex:bindingIndex];
                             _lastBoundFragmentBuffers[bindingIndex].buffer = minimumBindingBuffer;
@@ -1639,7 +1639,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
                                                           bindOffset,
                                                           uniformSnapshotLength);
                 if (uniformSnapshotBytes) {
-                    [_currentRenderEncoder setFragmentBytes:uniformSnapshotBytes
+                    [[self bufferBindingSink] setFragmentBytes:uniformSnapshotBytes
                                                       length:uniformSnapshotLength
                                                      atIndex:bindingIndex];
                     [self invalidateLastBoundFragmentBufferAtIndex:bindingIndex];
@@ -1666,7 +1666,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
                 ptr->data.buffer_data &&
                 (NSUInteger)ptr->size <= 4096 &&
                 offset == 0) {
-                [_currentRenderEncoder setFragmentBytes:(const void *)(uintptr_t)ptr->data.buffer_data
+                [[self bufferBindingSink] setFragmentBytes:(const void *)(uintptr_t)ptr->data.buffer_data
                                                   length:(NSUInteger)ptr->size
                                                  atIndex:bindingIndex];
                 [self invalidateLastBoundFragmentBufferAtIndex:bindingIndex];
@@ -1684,7 +1684,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
             if (!_lastBoundValid ||
                 _lastBoundFragmentBuffers[bindingIndex].buffer != buffer ||
                 _lastBoundFragmentBuffers[bindingIndex].offset != (NSUInteger)offset) {
-                [_currentRenderEncoder setFragmentBuffer:buffer offset:offset atIndex:bindingIndex];
+                [[self bufferBindingSink] setFragmentBuffer:buffer offset:offset atIndex:bindingIndex];
                 _lastBoundFragmentBuffers[bindingIndex].buffer = buffer;
                 _lastBoundFragmentBuffers[bindingIndex].offset = (NSUInteger)offset;
                 MGL_PERF_INC(g_mglSetFragmentBufferCallsSinceSwap);
@@ -1824,7 +1824,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
                     if (!_lastBoundValid ||
                         _lastBoundFragmentBuffers[_slot].buffer != fallbackBindingBuffer ||
                         _lastBoundFragmentBuffers[_slot].offset != 0) {
-                        [_currentRenderEncoder setFragmentBuffer:fallbackBindingBuffer offset:0 atIndex:_slot];
+                        [[self bufferBindingSink] setFragmentBuffer:fallbackBindingBuffer offset:0 atIndex:_slot];
                         _lastBoundFragmentBuffers[_slot].buffer = fallbackBindingBuffer;
                         _lastBoundFragmentBuffers[_slot].offset = 0;
                         MGL_PERF_INC(g_mglSetFragmentBufferCallsSinceSwap);
@@ -1844,7 +1844,7 @@ static bool mglRendererProgramHasSampledResourceNamed(Program *program, const ch
                 if (!_lastBoundValid ||
                     _lastBoundFragmentBuffers[s].buffer != fallbackBindingBuffer ||
                     _lastBoundFragmentBuffers[s].offset != 0) {
-                    [_currentRenderEncoder setFragmentBuffer:fallbackBindingBuffer offset:0 atIndex:s];
+                    [[self bufferBindingSink] setFragmentBuffer:fallbackBindingBuffer offset:0 atIndex:s];
                     _lastBoundFragmentBuffers[s].buffer = fallbackBindingBuffer;
                     _lastBoundFragmentBuffers[s].offset = 0;
                     MGL_PERF_INC(g_mglSetFragmentBufferCallsSinceSwap);
@@ -4550,6 +4550,17 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
         RETURN_FALSE_ON_FAILURE([self updateDirtyBaseBufferList:&state->vertex_buffer_map_list]);
         RETURN_FALSE_ON_FAILURE([self updateDirtyBaseBufferList:&state->fragment_buffer_map_list]);
     }
+    if (preparedTextures) {
+        if ([self replayResolvedTextureBindingsForDraw]) return true;
+        [self discardResolvedTextureBindings];
+        if (_nativeDepthReady) [self resetNativeDepthDraw];
+        RETURN_FALSE_ON_FAILURE([self restoreRenderEncoderAfterTextureUploadForDraw:"resolved-resource-replay-fallback"]);
+        if (_currentRenderEncoder && _pipelineState) {
+            [_currentRenderEncoder setRenderPipelineState:_pipelineState];
+            _lastPipelineState = _pipelineState;
+        }
+        return [self syncResourceBindingsForContext:glm_ctx];
+    }
     RETURN_FALSE_ON_FAILURE([self bindVertexBuffersToCurrentRenderEncoder]);
     RETURN_FALSE_ON_FAILURE([self bindFragmentBuffersToCurrentRenderEncoder]);
     Program *vertexProgram = mglResolveProgramForStageFromState(glm_ctx, _VERTEX_SHADER);
@@ -4565,20 +4576,6 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
                                                   renderEncoder:_currentRenderEncoder
                                                  computeEncoder:nil]);
     RETURN_FALSE_ON_FAILURE([self bindBufferSizeConstantsForRenderEncoder]);
-    if (preparedTextures) {
-        if ([self replayResolvedTextureBindingsForDraw]) return true;
-        /* Unexpected encoder/CB/program change during buffer binding: cancel
-         * all private texture choices, remap against the current CB and retry
-         * the unchanged legacy resolver. No draw has been issued. */
-        [self discardResolvedTextureBindings];
-        if (_nativeDepthReady) [self resetNativeDepthDraw];
-        RETURN_FALSE_ON_FAILURE([self restoreRenderEncoderAfterTextureUploadForDraw:"resolved-texture-replay-fallback"]);
-        if (_currentRenderEncoder && _pipelineState) {
-            [_currentRenderEncoder setRenderPipelineState:_pipelineState];
-            _lastPipelineState = _pipelineState;
-        }
-        return [self syncResourceBindingsForContext:glm_ctx];
-    }
     RETURN_FALSE_ON_FAILURE([self bindActiveTexturesToMTL]);
     RETURN_FALSE_ON_FAILURE([self restoreRenderEncoderAfterTextureUploadForDraw:"final-active-texture-bind"]);
     if (![self bindTexturesToCurrentRenderEncoder]) {

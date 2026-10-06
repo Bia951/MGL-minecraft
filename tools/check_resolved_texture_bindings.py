@@ -6,12 +6,19 @@ import tempfile
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 HARNESS = r'''
 #import "mgl_resolved_texture_bindings.h"
+#include "mgl_frame_activity.h"
+#include <stdlib.h>
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); return 1; } } while(0)
-@interface Sink : NSObject <MGLResolvedTextureBindingSink> {
+@interface Sink : NSObject <MGLResolvedTextureBindingSink, MGLResolvedBufferBindingSink> {
 @public id textures[2][TEXTURE_UNITS]; id samplers[2][TEXTURE_UNITS]; NSUInteger calls;
+    id buffers[2][MAX_MAPPED_BUFFERS]; NSData *bytes[2][MAX_MAPPED_BUFFERS]; NSUInteger offsets[2][MAX_MAPPED_BUFFERS];
 }
 @end
 @implementation Sink
+- (void)setVertexBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i { buffers[0][i] = b; offsets[0][i] = o; calls++; }
+- (void)setFragmentBuffer:(id<MTLBuffer>)b offset:(NSUInteger)o atIndex:(NSUInteger)i { buffers[1][i] = b; offsets[1][i] = o; calls++; }
+- (void)setVertexBytes:(const void *)b length:(NSUInteger)n atIndex:(NSUInteger)i { bytes[0][i] = [NSData dataWithBytes:b length:n]; calls++; }
+- (void)setFragmentBytes:(const void *)b length:(NSUInteger)n atIndex:(NSUInteger)i { bytes[1][i] = [NSData dataWithBytes:b length:n]; calls++; }
 - (void)setVertexTextureIfNeeded:(id<MTLTexture>)value atIndex:(NSUInteger)i { textures[0][i] = value; calls++; }
 - (void)setFragmentTextureIfNeeded:(id<MTLTexture>)value atIndex:(NSUInteger)i { textures[1][i] = value; calls++; }
 - (void)setVertexSamplerStateIfNeeded:(id<MTLSamplerState>)value atIndex:(NSUInteger)i { samplers[0][i] = value; calls++; }
@@ -48,6 +55,28 @@ int main(void) { @autoreleasepool {
     Sink *owner = [Sink new]; CHECK([lifetime replayToSink:owner]); lifetime = nil;
     CHECK(weak != nil); // The actual sink takes ownership at binding.
     owner = nil; CHECK(weak == nil);
+    MGLResolvedTextureBindings *bp = [MGLResolvedTextureBindings new];
+    uint32_t value = 123;
+    [bp setVertexBuffer:(id<MTLBuffer>)texture offset:16 atIndex:4];
+    [bp setVertexBytes:&value length:sizeof(value) atIndex:4];
+    [bp setFragmentBytes:&value length:sizeof(value) atIndex:4];
+    [bp setFragmentBuffer:(id<MTLBuffer>)texture offset:32 atIndex:4];
+    [bp setFragmentBuffer:nil offset:0 atIndex:5];
+    value = 999;
+    CHECK(![bp replayBuffersToSink:sink]);
+    CHECK([bp seal] && [bp replayBuffersToSink:sink]);
+    CHECK(sink->calls == 8 && !sink->buffers[0][4] && sink->buffers[1][4] == texture && sink->offsets[1][4] == 32);
+    CHECK(*(const uint32_t *)sink->bytes[0][4].bytes == 123 && !sink->bytes[1][4] && !sink->buffers[1][5]);
+    MGLResolvedTextureBindings *tooBig = [MGLResolvedTextureBindings new];
+    [tooBig setVertexBytes:&value length:4097 atIndex:0]; CHECK(![tooBig seal]);
+    MGLResolvedTextureBindings *badSlot = [MGLResolvedTextureBindings new];
+    [badSlot setFragmentBuffer:nil offset:0 atIndex:31]; CHECK(![badSlot seal]);
+    setenv("MGL_PERF_SUMMARY", "1", 1); CHECK(mglPerfSummaryEnabled());
+    uint64_t before = MGL_FRAME_LOAD(g_mglSetVertexBufferCallsSinceSwap);
+    g_mglRecordingBufferBindings = 1; MGL_PERF_INC(g_mglSetVertexBufferCallsSinceSwap);
+    CHECK(MGL_FRAME_LOAD(g_mglSetVertexBufferCallsSinceSwap) == before);
+    g_mglRecordingBufferBindings = 0; MGL_PERF_INC(g_mglSetVertexBufferCallsSinceSwap);
+    CHECK(MGL_FRAME_LOAD(g_mglSetVertexBufferCallsSinceSwap) == before + 1);
     printf("PASS last-write replay, nil/untouched slots, stage isolation, sealing, bounds, strong lifetimes\n");
     return 0;
 } }
@@ -65,6 +94,6 @@ with tempfile.TemporaryDirectory(prefix="mgl-resolved-textures-") as tmp:
     exe = tmp / "replay_adapter"
     source.write_text(HARNESS)
     run("clang", "-fobjc-arc", source, "-o", exe, "-I" + str(ROOT / "MGL/include"),
-        "-L" + str(ROOT / "build"), "-lmgl", "-framework", "Foundation",
+        "-I" + str(ROOT / "MGL/include/GL"), "-L" + str(ROOT / "build"), "-lmgl", "-framework", "Foundation",
         "-framework", "Metal", "-Wl,-rpath," + str(ROOT / "build"))
     print(run(exe), end="")
