@@ -1,7 +1,13 @@
 #import "MGLRenderer_Private.h"
 #import "mgl_resolved_texture_bindings.h"
+#import "MGLRenderer+ArgumentBuffer_Private.h"
 
 @implementation MGLRenderer (ResolvedTextures)
+
+- (void)useResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage
+{
+    [_currentRenderEncoder useResource:resource usage:usage];
+}
 
 - (id<MGLResolvedBufferBindingSink>)bufferBindingSink
 {
@@ -66,12 +72,14 @@
 - (bool)prepareResolvedTextureBindingsForDraw
 {
     [self discardResolvedTextureBindings];
+    if (_resolvedArgumentBufferCommandBuffer != _currentCommandBuffer) {
+        [_resolvedArgumentBufferCache removeAllObjects];
+        _resolvedArgumentBufferCommandBuffer = _currentCommandBuffer;
+    }
     if (!_resolvedTexturePlanEnabled || _parallelEncodeActive || !ctx || !_currentRenderEncoder) return true;
     Program *vertex = mglResolveProgramForStageFromState(ctx, _VERTEX_SHADER);
     Program *fragment = mglResolveProgramForStageFromState(ctx, _FRAGMENT_SHADER);
-    if (!vertex || !fragment || !vertex->msl_texture_cache_instance_id || !fragment->msl_texture_cache_instance_id ||
-        vertex->spirv[_VERTEX_SHADER].uses_argument_buffers ||
-        fragment->spirv[_FRAGMENT_SHADER].uses_argument_buffers) return true;
+    if (!vertex || !fragment || !vertex->msl_texture_cache_instance_id || !fragment->msl_texture_cache_instance_id) return true;
 
     BOOL complete = NO;
     id<MTLRenderCommandEncoder> initialEncoder = _currentRenderEncoder;
@@ -107,7 +115,12 @@
                 BOOL vertexReady = [self bindVertexBuffersToCurrentRenderEncoder];
                 _lastBoundValid = NO;
                 BOOL fragmentReady = vertexReady && [self bindFragmentBuffersToCurrentRenderEncoder];
-                BOOL sizesReady = fragmentReady && [self bindBufferSizeConstantsForRenderEncoder];
+                BOOL argumentsReady = fragmentReady &&
+                    [self bindArgumentBuffersForProgram:vertex stage:_VERTEX_SHADER context:ctx
+                                         renderEncoder:_currentRenderEncoder computeEncoder:nil] &&
+                    [self bindArgumentBuffersForProgram:fragment stage:_FRAGMENT_SHADER context:ctx
+                                         renderEncoder:_currentRenderEncoder computeEncoder:nil];
+                BOOL sizesReady = argumentsReady && [self bindBufferSizeConstantsForRenderEncoder];
                 if (sizesReady && [self bindTexturesToCurrentRenderEncoder] && _currentRenderEncoder &&
                     _currentCommandBuffer && [_resolvedTextureBindings seal]) {
                     _resolvedTextureCommandBuffer = _currentCommandBuffer;
@@ -153,7 +166,8 @@
 - (bool)replayResolvedTextureBindingsForDraw
 {
     if (![self resolvedTextureBindingsMatchCurrentDraw]) return false;
-    BOOL result = [_resolvedTextureBindings replayBuffersToSink:(id<MGLResolvedBufferBindingSink>)self] &&
+    BOOL result = [_resolvedTextureBindings replayResourcesToSink:(id<MGLResolvedResourceUseSink>)self] &&
+        [_resolvedTextureBindings replayBuffersToSink:(id<MGLResolvedBufferBindingSink>)self] &&
         [_resolvedTextureBindings replayToSink:(id<MGLResolvedTextureBindingSink>)self];
     if (result) _lastBoundValid = YES;
     [self discardResolvedTextureBindings]; // One draw/encoder/CB only.

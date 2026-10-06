@@ -13,6 +13,7 @@
                               context:(GLMContext)bindingContext
                         renderEncoder:(id<MTLRenderCommandEncoder>)renderEncoder
                        computeEncoder:(id<MTLComputeCommandEncoder>)computeEncoder;
+- (bool)prepareArgumentBuffersForProgram:(Program *)program stage:(int)stage context:(GLMContext)context;
 - (void)appendArgumentBufferSizeConstantsForProgram:(Program *)program
                                                stage:(int)stage
                                              context:(GLMContext)bindingContext

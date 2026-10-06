@@ -9,6 +9,7 @@
     NSData *_bytes[2][MAX_MAPPED_BUFFERS];
     NSUInteger _offsets[2][MAX_MAPPED_BUFFERS];
     uint8_t _bufferKind[2][MAX_MAPPED_BUFFERS]; // 0 untouched, 1 buffer, 2 bytes
+    NSMutableDictionary<NSValue *, NSArray *> *_resources;
 }
 - (instancetype)init
 {
@@ -55,6 +56,22 @@
 { [self recordBytes:bytes length:length vertex:YES slot:index]; }
 - (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
 { [self recordBytes:bytes length:length vertex:NO slot:index]; }
+- (void)recordResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage
+{
+    if (_sealed || !resource) { _valid = NO; return; }
+    if (!_resources) _resources = [NSMutableDictionary new];
+    NSValue *key = [NSValue valueWithPointer:(__bridge void *)resource];
+    NSArray *old = _resources[key];
+    if (!old && _resources.count >= 4096u) { _valid = NO; return; }
+    _resources[key] = @[resource, @(usage | (old ? [old[1] unsignedIntegerValue] : 0u))];
+}
+- (BOOL)replayResourcesToSink:(id<MGLResolvedResourceUseSink>)sink
+{
+    if (!_sealed || !_valid || !sink) return NO;
+    for (NSArray *record in _resources.allValues)
+        [sink useResource:record[0] usage:[record[1] unsignedIntegerValue]];
+    return YES;
+}
 - (BOOL)seal { _sealed = YES; return _valid; }
 - (BOOL)replayBuffersToSink:(id<MGLResolvedBufferBindingSink>)sink
 {

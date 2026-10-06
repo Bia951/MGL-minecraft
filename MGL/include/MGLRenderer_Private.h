@@ -329,6 +329,8 @@ static inline void mglMetalUnlock(os_unfair_lock *lock) {
     id<MTLRenderCommandEncoder> _resolvedTextureEncoder;
     uint64_t _resolvedTextureProgramInstances[2];
     uint64_t _resolvedTextureLinkGenerations[2];
+    NSMutableDictionary<NSArray *, NSArray *> *_resolvedArgumentBufferCache;
+    id<MTLCommandBuffer> _resolvedArgumentBufferCommandBuffer;
     /* Native depth is opt-in and disabled for parallel encode workers.
      * Masks index fragment sampled-resource reflection, not Metal slots. */
     BOOL _nativeDepthSamplingEnabled;

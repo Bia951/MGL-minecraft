@@ -7,6 +7,9 @@
  */
 #import "MGLRenderer_Private.h"
 #import "mgl_metal_bridge.h"
+#import "mgl_argument_binding_table.h"
+#import "mgl_resolved_texture_bindings.h"
+#import "MGLRenderer+ArgumentBuffer_Private.h"
 
 static inline uint64_t mglABHashMix(uint64_t h, uint64_t value)
 {
@@ -90,6 +93,10 @@ static NSUInteger mglABSizeConstantCapacity(Program *program, int stage)
     if (!spirv->uses_argument_buffers || spirv->argument_buffer_set_mask == 0u) {
         return true;
     }
+
+    if (_resolvedTextureBindingsPreparing && !computeEncoder &&
+        (stage == _VERTEX_SHADER || stage == _FRAGMENT_SHADER))
+        return [self prepareArgumentBuffersForProgram:program stage:stage context:bindingContext];
 
     id<MTLFunction> function = [self argumentBufferFunctionForProgram:program stage:stage];
     if (!function) {
@@ -344,6 +351,112 @@ static NSUInteger mglABSizeConstantCapacity(Program *program, int stage)
         }
     }
 
+    return true;
+}
+
+/* Opt-in render preparation. Resolve each descriptor once and use exactly
+ * those objects for encoding, cache validation and indirect residency. The
+ * legacy/compute path above is unchanged. */
+- (bool)prepareArgumentBuffersForProgram:(Program *)program stage:(int)stage context:(GLMContext)bindingContext
+{
+    GLMContext resourceContext = bindingContext ? bindingContext : ctx;
+    Spirv *spirv = &program->spirv[stage];
+    id<MTLFunction> function = [self argumentBufferFunctionForProgram:program stage:stage];
+    if (!resourceContext || !function || !_currentCommandBuffer) return false;
+    GLMState *state = MGL_STATE(resourceContext);
+    for (GLuint set = 0; set < MGL_MAX_ARGUMENT_BUFFER_SETS; set++) {
+        if (!(spirv->argument_buffer_set_mask & (1u << set))) continue;
+        id<MTLArgumentEncoder> encoder = (__bridge id<MTLArgumentEncoder>)spirv->mtl_argument_encoders[set];
+        if (!encoder) {
+            encoder = [function newArgumentEncoderWithBufferIndex:set];
+            if (!encoder) return false;
+            spirv->mtl_argument_encoders[set] = (void *)CFBridgingRetain(encoder);
+        }
+        MGLArgumentBindingTable *table = [MGLArgumentBindingTable new];
+        uint32_t sizes[4096] = {0};
+        NSUInteger sizeCount = set == 1u && spirv->needs_buffer_size_buffer
+            ? mglABSizeConstantCapacity(program, stage) : 0u;
+        const int types[] = {SPVC_RESOURCE_TYPE_UNIFORM_BUFFER, SPVC_RESOURCE_TYPE_STORAGE_BUFFER};
+        NSMutableSet<NSValue *> *processed = [NSMutableSet new];
+        for (NSUInteger ti = 0; ti < 2; ti++) {
+            int type = types[ti];
+            GLuint target = type == SPVC_RESOURCE_TYPE_UNIFORM_BUFFER ? _UNIFORM_BUFFER : _SHADER_STORAGE_BUFFER;
+            MTLResourceUsage usage = type == SPVC_RESOURCE_TYPE_STORAGE_BUFFER
+                ? MTLResourceUsageRead | MTLResourceUsageWrite : MTLResourceUsageRead;
+            SpirvResourceList *list = &program->spirv_resources_list[stage][type];
+            for (GLuint ri = 0; ri < list->count; ri++) {
+                SpirvResource *resource = &list->list[ri];
+                if (!resource->uses_argument_buffer || resource->argument_buffer_set != set) continue;
+                GLuint count = MAX(1u, mglABElementCount(type, resource));
+                if (count > 4096u || resource->argument_id > UINT32_MAX - count) return false;
+                for (GLuint element = 0; element < count; element++) {
+                    GLuint argument = resource->argument_id + element;
+                    GLuint binding = mglClientBufferBindingForResourceElement(type, resource, element);
+                    BufferBaseTarget *base = binding < MAX_BINDABLE_BUFFERS
+                        ? &state->buffer_base[target].buffers[binding] : NULL;
+                    Buffer *buffer = base ? mglRendererGetValidatedBuffer(resourceContext, base->buf,
+                        "prepare-argument-buffer", binding) : NULL;
+                    NSUInteger offset = 0u, visible = resource->required_size;
+                    id<MTLBuffer> metal = nil;
+                    if (buffer) {
+                        NSValue *identity = [NSValue valueWithPointer:buffer];
+                        if (![processed containsObject:identity]) {
+                            if (![self processBuffer:buffer]) return false;
+                            [processed addObject:identity];
+                        }
+                        metal = (__bridge id<MTLBuffer>)buffer->data.mtl_data;
+                        if (base->offset > 0) offset = (NSUInteger)base->offset;
+                        if (base->size > 0) visible = (NSUInteger)base->size;
+                        else if (buffer->size > (GLsizeiptr)offset) visible = (NSUInteger)(buffer->size - (GLsizeiptr)offset);
+                        if (!metal || offset >= metal.length) metal = nil;
+                        if (sizeCount && argument < sizeCount) {
+                            GLsizeiptr range = base->size > 0 ? base->size : buffer->size - base->offset;
+                            sizes[argument] = range > 0 ? (uint32_t)MIN((uint64_t)range, (uint64_t)UINT32_MAX) : 0u;
+                        }
+                    }
+                    if (!metal) {
+                        metal = [self argumentBufferFallbackWithLength:MAX(visible, resource->required_size)];
+                        offset = 0u;
+                    }
+                    if (![table addBuffer:metal argument:argument offset:offset visibleSize:visible usage:usage]) return false;
+                }
+            }
+        }
+        NSData *sizeData = sizeCount ? [NSData dataWithBytes:sizes length:sizeCount * sizeof(uint32_t)] : nil;
+        if (![table sealWithSizeConstants:sizeData]) return false;
+        // Resolve/processBuffer may have rotated the command buffer. Descriptor
+        // caches never cross that boundary, just like immutable arena ranges.
+        if (_resolvedArgumentBufferCommandBuffer != _currentCommandBuffer) {
+            [_resolvedArgumentBufferCache removeAllObjects];
+            _resolvedArgumentBufferCommandBuffer = _currentCommandBuffer;
+        }
+        if (!_resolvedArgumentBufferCache) _resolvedArgumentBufferCache = [NSMutableDictionary new];
+        NSArray *key = @[@(program->msl_texture_cache_instance_id), @(program->msl_texture_cache_generation), @(stage), @(set)];
+        NSArray *cached = _resolvedArgumentBufferCache[key];
+        id<MTLBuffer> storage = cached ? cached[0] : nil;
+        id<MTLBuffer> auxiliary = cached && cached[2] != [NSNull null] ? cached[2] : nil;
+        if (!storage || storage.length < encoder.encodedLength || ![table hasSameBindingsAs:cached[1]]) {
+            storage = [_device newBufferWithLength:encoder.encodedLength options:MTLResourceStorageModeShared];
+            if (!storage) return false;
+            [encoder setArgumentBuffer:storage offset:0];
+            if (![table encodeTo:encoder]) return false;
+            auxiliary = nil;
+            if (sizeData) {
+                auxiliary = [_device newBufferWithBytes:sizeData.bytes length:sizeData.length options:MTLResourceStorageModeShared];
+                if (!auxiliary) return false;
+                [encoder setBuffer:auxiliary offset:0 atIndex:MGL_BUFFER_SIZE_BUFFER_INDEX];
+            }
+            if (_resolvedArgumentBufferCache.count >= 128u) [_resolvedArgumentBufferCache removeAllObjects];
+            _resolvedArgumentBufferCache[key] = @[storage, table, auxiliary ?: (id)[NSNull null]];
+        }
+        // The chosen fallback must be resident too; do not re-look up a live
+        // GL buffer that was rejected for an out-of-range offset above.
+        for (NSArray *entry in table.entries)
+            [_resolvedTextureBindings recordResource:entry[1] usage:[entry[4] unsignedIntegerValue]];
+        if (auxiliary) [_resolvedTextureBindings recordResource:auxiliary usage:MTLResourceUsageRead];
+        if (stage == _VERTEX_SHADER) [[self bufferBindingSink] setVertexBuffer:storage offset:0 atIndex:set];
+        else [[self bufferBindingSink] setFragmentBuffer:storage offset:0 atIndex:set];
+    }
     return true;
 }
 

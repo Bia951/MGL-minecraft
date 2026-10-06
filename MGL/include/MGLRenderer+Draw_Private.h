@@ -218,6 +218,7 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
 @protocol MGLResolvedBufferBindingSink;
 @interface MGLRenderer (ResolvedTextures)
 - (id<MGLResolvedBufferBindingSink>)bufferBindingSink;
+- (void)useResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage;
 - (void)setVertexBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index;
 - (void)setFragmentBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index;
 - (void)setVertexBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index;

@@ -3,6 +3,7 @@
 The temporary C adapter only constructs compiler input records and invokes the
 same reflection/compatibility passes as link, then the private variant compiler.
 """
+import os
 import pathlib
 import subprocess
 import tempfile
@@ -55,6 +56,10 @@ int main(int argc, char **argv) {
         SpirvResourceList *list = &p->spirv_resources_list[_FRAGMENT_SHADER][type];
         if (list->count && memcmp(copies[type], list->list, list->count * sizeof(SpirvResource))) return 6;
     }
+    if (atoi(argv[5]) == 2) {
+        if (variant || !p->spirv[_FRAGMENT_SHADER].uses_argument_buffers) return 10;
+        variant = strdup(p->spirv[_FRAGMENT_SHADER].msl_str);
+    }
     if (!variant) return 7;
     FILE *f = fopen(argv[3], "w"); if (!f) return 8; fputs(variant, f); fclose(f);
     f = fopen(argv[4], "w"); if (!f) return 9; fputs(p->spirv[_FRAGMENT_SHADER].msl_str, f); fclose(f);
@@ -85,8 +90,10 @@ REJECTED = {
     "helper": "vec4 sample_it(sampler2D s,vec2 p){return texture(s,p);}\nvoid main(){color=sample_it(a,uv)+texture(b,uv);}",
 }
 
-def run(*args):
-    proc = subprocess.run([str(a) for a in args], capture_output=True, text=True)
+def run(*args, env=None):
+    if env is None:
+        env = dict(os.environ, MGL_ARGUMENT_BUFFERS="0")
+    proc = subprocess.run([str(a) for a in args], capture_output=True, text=True, env=env)
     if proc.returncode:
         raise RuntimeError(f"{args}: exit {proc.returncode}\n{proc.stdout}\n{proc.stderr}")
     return proc
@@ -127,4 +134,20 @@ with tempfile.TemporaryDirectory(prefix="mgl-depth-msl-") as tmp:
                                    str(tmp / "unused-base.metal"), str(flip)], capture_output=True, text=True)
             assert proc.returncode == 7, (name, proc.returncode, proc.stdout, proc.stderr)
         print("PASS fallback", name)
+    argument_cases = {
+        "argument_ubo": CASES["ubo"],
+        "argument_ssbo": "layout(std430,binding=2) buffer Store{vec4 values[];} s;\nvoid main(){color=texture(a,uv)+texture(b,uv)+s.values[s.values.length()-1];}",
+    }
+    for name, body in argument_cases.items():
+        source = tmp / (name + ".frag")
+        spirv = source.with_suffix(".spv")
+        metal = source.with_suffix(".metal")
+        source.write_text(HEADER + body)
+        run(ROOT / "external/glslang/build/StandAlone/glslang", "-G", "-o", spirv, source)
+        run(exe, source, spirv, metal, tmp / "argument-base.metal", 2,
+            env=dict(os.environ, MGL_ARGUMENT_BUFFERS="1"))
+        assert "spvDescriptorSetBuffer" in metal.read_text()
+        run("python3", ROOT / "tools/check_argument_buffer_msl.py", metal)
+        run("xcrun", "-sdk", "macosx", "metal", "-std=metal3.1", "-c", metal, "-o", metal.with_suffix(".air"))
+        print("PASS", name, "ABI and native-depth rejection")
 print("PASS private MSL ABI checks, reflection immutability, and Metal compilation")

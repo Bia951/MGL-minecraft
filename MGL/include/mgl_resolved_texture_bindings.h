@@ -11,6 +11,10 @@
 - (void)setFragmentSamplerStateIfNeeded:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index;
 @end
 
+@protocol MGLResolvedResourceUseSink
+- (void)useResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage;
+@end
+
 @protocol MGLResolvedBufferBindingSink
 - (void)setVertexBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index;
 - (void)setFragmentBuffer:(id<MTLBuffer>)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index;
@@ -29,5 +33,7 @@
 - (BOOL)seal;
 - (BOOL)replayToSink:(id<MGLResolvedTextureBindingSink>)sink;
 - (BOOL)replayBuffersToSink:(id<MGLResolvedBufferBindingSink>)sink;
+- (void)recordResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage;
+- (BOOL)replayResourcesToSink:(id<MGLResolvedResourceUseSink>)sink;
 @end
 #endif
