@@ -2379,6 +2379,7 @@ void mglUniform(GLMContext ctx, GLint location, void *ptr, GLsizeiptr size)
             uniformSlot->buf = newBuffer(ctx, GL_UNIFORM_BUFFER, internalName);
             buf = uniformSlot->buf;
             if (buf) {
+                buf->plain_uniform_snapshot_private = mglPackedUniformReuseEnabled();
                 insertHashElement(&ctx->state.buffer_table, internalName, buf);
             }
         }
@@ -2388,6 +2389,8 @@ void mglUniform(GLMContext ctx, GLint location, void *ptr, GLsizeiptr size)
             return;
         }
 
+        if (mglPackedUniformReuseEnabled() && program->plain_uniform_generation != UINT64_MAX)
+            program->plain_uniform_generation++;
         initBufferData(ctx, buf, size, ptr, true);
         uniformSlot->buffer = buf->name;
         uniformSlot->offset = 0;
@@ -2406,11 +2409,14 @@ void mglUniform(GLMContext ctx, GLint location, void *ptr, GLsizeiptr size)
                             (GLuint)location;
         globalSlot->buf = newBuffer(ctx, GL_UNIFORM_BUFFER, globalName);
         if (globalSlot->buf) {
+            globalSlot->buf->plain_uniform_snapshot_private = mglPackedUniformReuseEnabled();
             insertHashElement(&ctx->state.buffer_table, globalName, globalSlot->buf);
         }
     }
     if (globalSlot->buf) {
         if (globalDataChanged) {
+            if (mglPackedUniformReuseEnabled() && ctx->plain_uniform_fallback_generation != UINT64_MAX)
+                ctx->plain_uniform_fallback_generation++;
             initBufferData(ctx, globalSlot->buf, size, ptr, true);
         }
         globalSlot->buffer = globalSlot->buf->name;

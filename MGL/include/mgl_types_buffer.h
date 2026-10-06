@@ -116,6 +116,9 @@ typedef struct Buffer_t {
     uint64_t last_write_src_hash;
     void *mapped_ptr;
     GLboolean transient_batch_buffer;
+    /* Private CPU-only glUniform storage. Public name lookup/binding revokes
+     * eligibility permanently, so GPU-written/aliased buffers are excluded. */
+    GLboolean plain_uniform_snapshot_private;
 } Buffer;
 
 typedef struct BufferBaseTarget_t {

@@ -220,6 +220,8 @@ typedef struct GLMContextRec_t {
      * NULL when MGL_ARENA_SNAPSHOT is not enabled; otherwise points to the
      * MGLRenderer-owned MGLBatchArena ivar.  Accessed from draw_command.c. */
     MGLBatchArena  *batch_arena;
+    /* Live-context epoch: global loose-uniform fallback updates flush first. */
+    uint64_t plain_uniform_fallback_generation;
 
     void (* error_func)(GLMContext ctx, const char *func, GLenum type);
 } GLMContextRec;

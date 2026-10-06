@@ -261,6 +261,8 @@ static inline void mglMetalUnlock(os_unfair_lock *lock) {
      * buffer. Keys include program/link/stage/layout identity plus bytes. */
     BOOL _packedUniformReuseEnabled;
     NSMutableDictionary<NSArray *, NSArray *> *_packedUniformRangeCache;
+    NSMutableDictionary<NSArray *, id> *_packedUniformCPUSnapshots;
+    NSUInteger _packedUniformCPUSnapshotBytes;
     /* glVertexAttrib* current values are expanded into a repeated Metal
      * vertex stream.  Cache the immutable stream per attribute and rebuild it
      * only when the encoded value or stride actually changes. */

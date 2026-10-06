@@ -76,6 +76,7 @@ CASES = {
     "fetch": "void main(){color=texelFetch(a,ivec2(uv),1)+texture(b,uv);}",
     "ubo": "layout(std140,binding=3) uniform Params{mat4 m; vec3 v; float f;};\nvoid main(){color=(texture(a,uv)+texture(b,uv))*m[0]+vec4(v,f);}",
     "plain": "layout(location=3) uniform float scale;\nvoid main(){color=(texture(a,uv)+texture(b,uv))*scale;}",
+    "initializer": "layout(location=3) uniform float scale=2.0;\nvoid main(){color=(texture(a,uv)+texture(b,uv))*scale;}",
 }
 REJECTED = {
     "gather": "void main(){color=textureGather(a,uv)+texture(b,uv);}",
@@ -95,7 +96,7 @@ with tempfile.TemporaryDirectory(prefix="mgl-depth-msl-") as tmp:
     c = tmp / "compiler_adapter.c"
     exe = tmp / "compiler_adapter"
     c.write_text(HARNESS)
-    run("clang", c, "-o", exe, "-I" + str(ROOT / "MGL/include"),
+    run("clang", "-DMGL_GL_CORE", c, "-o", exe, "-I" + str(ROOT / "MGL/include"),
         "-I" + str(ROOT / "MGL/include/GL"),
         "-I" + str(ROOT / "external/glslang/glslang/Include"),
         "-I" + str(ROOT / "external/SPIRV-Cross"),

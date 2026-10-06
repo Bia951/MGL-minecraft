@@ -50,6 +50,7 @@
 #import "mgl_byte_hash.h"
 #import "mgl_msl_compiler.h"
 #import "mgl_metal_bridge.h"
+#import "mgl_uniform_snapshot.h"
 
 #define TRACE_FUNCTION()    DEBUG_PRINT("%s\n", __FUNCTION__);
 
@@ -3738,6 +3739,7 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
 - (Buffer *)packedStructBufferWithData:(const void *)data
                                   size:(size_t)size
                            snapshotKey:(NSArray *)snapshotKey
+                        immutableBytes:(NSData *)immutableBytes
                                 offset:(GLintptr *)outOffset
 {
     if (!data || size == 0u || !outOffset || !_device || !_currentCommandBuffer) {
@@ -3777,7 +3779,9 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
     NSArray *contentKey = nil;
     NSArray *cachedRange = nil;
     if (_packedUniformReuseEnabled && snapshotKey) {
-        contentKey = @[snapshotKey, [NSData dataWithBytes:data length:size]];
+        NSData *content = immutableBytes && immutableBytes.length == size
+            ? immutableBytes : [NSData dataWithBytes:data length:size];
+        contentKey = @[snapshotKey, content];
         cachedRange = [_packedUniformRangeCache objectForKey:contentKey];
     }
     id<MTLBuffer> selectedArena = cachedRange ? cachedRange[0] : nil;
@@ -4038,9 +4042,8 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
                     size_t struct_size = resource->required_size;
                     MGLLooseMetalMember metalMembers[128];
                     size_t metalMemberCount = 0;
-                    bool useMetalLayout = mglLooseMetalLayout(
-                        program->spirv[stage].msl_str, resource->name,
-                        metalMembers, &metalMemberCount, &struct_size);
+                    bool useMetalLayout = false;
+                    bool metalLayoutResolved = false;
                     bool allowFallback = fallbackBuffers &&
                         mglPlainUniformAllowsGlobalFallback(resource);
 
@@ -4050,14 +4053,40 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
                         GLuint elem_loc_end = (element + 1u) * loc_step;
                         GLuint elem_byte_start = element * (GLuint)struct_size;
 
+                        /* Epochs reject normal updates cheaply; exact source
+                         * witnesses also guard legacy fallback/binding changes
+                         * and writes that did not go through glUniform. */
+                        NSArray *cpuKey = _packedUniformReuseEnabled && !_parallelEncodeActive &&
+                            program->msl_texture_cache_instance_id && resource->_id &&
+                            program->plain_uniform_generation != UINT64_MAX &&
+                            ctx->plain_uniform_fallback_generation != UINT64_MAX
+                            ? @[@(program->msl_texture_cache_instance_id),
+                                @(program->msl_texture_cache_generation),
+                                @(program->plain_uniform_generation),
+                                @(ctx->plain_uniform_fallback_generation), @(stage),
+                                @(resource->_id), @(element), @(metal_binding), @(resource->required_size)] : nil;
+                        MGLPackedUniformSnapshot *cpuSnapshot = cpuKey ? _packedUniformCPUSnapshots[cpuKey] : nil;
+                        BufferBaseTarget *snapshotFallback = allowFallback ? fallbackBuffers : NULL;
+                        if (cpuSnapshot && ![cpuSnapshot matchesBuffers:buffers
+                                                       fallbackBuffers:snapshotFallback context:ctx]) {
+                            _packedUniformCPUSnapshotBytes -= cpuSnapshot.retainedBytes;
+                            [_packedUniformCPUSnapshots removeObjectForKey:cpuKey];
+                            cpuSnapshot = nil;
+                        }
+                        if (cpuSnapshot) struct_size = cpuSnapshot.bytes.length;
+                        else if (!metalLayoutResolved) {
+                            struct_size = resource->required_size;
+                            useMetalLayout = mglLooseMetalLayout(program->spirv[stage].msl_str,
+                                resource->name, metalMembers, &metalMemberCount, &struct_size);
+                            metalLayoutResolved = true;
+                        }
                         uint8_t stack_packed[256];
-                        uint8_t *packed = (struct_size <= sizeof(stack_packed))
-                                          ? stack_packed
-                                          : (uint8_t *)calloc(1, struct_size);
+                        uint8_t *packed = cpuSnapshot ? (uint8_t *)cpuSnapshot.bytes.bytes
+                            : (struct_size <= sizeof(stack_packed) ? stack_packed : (uint8_t *)calloc(1, struct_size));
                         if (!packed) continue;
-                        memset(packed, 0, struct_size);
+                        if (!cpuSnapshot) memset(packed, 0, struct_size);
 
-                        for (GLuint m = 0; m < resource->ubo_member_count; m++) {
+                        for (GLuint m = 0; !cpuSnapshot && m < resource->ubo_member_count; m++) {
                             SpirvUBOMember *member = &resource->ubo_members[m];
 
                             /* member->location_offset is relative to the
@@ -4192,6 +4221,25 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
                             }
                         }
 
+                        NSData *immutablePackedBytes = cpuSnapshot.bytes;
+                        if (cpuKey && !cpuSnapshot && struct_size <= 256u * 1024u) {
+                            MGLPackedUniformSnapshot *created = [[MGLPackedUniformSnapshot alloc]
+                                initWithBytes:[NSData dataWithBytes:packed length:struct_size]
+                                resource:resource element:element baseLocation:base_loc locationStep:loc_step
+                                buffers:buffers fallbackBuffers:snapshotFallback context:ctx];
+                            if (created) {
+                                immutablePackedBytes = created.bytes;
+                                if (!_packedUniformCPUSnapshots) _packedUniformCPUSnapshots = [NSMutableDictionary new];
+                                if (_packedUniformCPUSnapshots.count >= 128u ||
+                                    _packedUniformCPUSnapshotBytes + created.retainedBytes > 8u * 1024u * 1024u) {
+                                    [_packedUniformCPUSnapshots removeAllObjects];
+                                    _packedUniformCPUSnapshotBytes = 0;
+                                }
+                                _packedUniformCPUSnapshots[cpuKey] = created;
+                                _packedUniformCPUSnapshotBytes += created.retainedBytes;
+                            }
+                        }
+
                         if (getenv("MGL_DEBUG_STRUCT_PACK")) {
                             const float *fv = (const float *)packed;
                             NSLog(@"MGL STRUCTDUMP prog=%u stage=%d res=%s elem=%u loc=%d metal=%u size=%lu",
@@ -4215,8 +4263,9 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
                         Buffer *packedBuf = [self packedStructBufferWithData:packed
                                                                        size:struct_size
                                                                 snapshotKey:snapshotKey
+                                                             immutableBytes:immutablePackedBytes
                                                                      offset:&packedOffset];
-                        if (packed != stack_packed) {
+                        if (!cpuSnapshot && packed != stack_packed) {
                             free(packed);
                         }
                         if (!packedBuf) {
@@ -11892,7 +11941,7 @@ void* CppCreateMGLRendererAndBindToContext (void *glm_ctx)
     /* Parallel workers do not own native resource transaction snapshots. */
     _nativeDepthSamplingEnabled = mglEnvFlagEnabled("MGL_NATIVE_DEPTH_SAMPLING") &&
         !mglEnvFlagEnabled("MGL_PARALLEL_ENCODE");
-    _packedUniformReuseEnabled = mglEnvFlagEnabled("MGL_PACKED_UNIFORM_REUSE");
+    _packedUniformReuseEnabled = mglPackedUniformReuseEnabled();
     // Bounded per-Program MSL texture type lookup cache (always on; no env var).
     // Keys include a process-unique Program lifetime ID and link generation.
     _mslTextureTypeCache = [NSCache new];

@@ -495,6 +495,19 @@ GLboolean mglResourceBindingPlanEnabled(void)
     return enabled;
 }
 
+GLboolean mglPackedUniformReuseEnabled(void)
+{
+    static GLboolean enabled;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        const char *value = getenv("MGL_PACKED_UNIFORM_REUSE");
+        enabled = value && *value && strcmp(value, "0") &&
+            strcasecmp(value, "false") && strcasecmp(value, "no") &&
+            strcasecmp(value, "off");
+    });
+    return enabled;
+}
+
 void mglBuildResourceBindingPlan(Program *program)
 {
     if (!program || !mglResourceBindingPlanEnabled()) return;

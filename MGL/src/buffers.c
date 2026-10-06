@@ -374,6 +374,8 @@ Buffer *getBuffer(GLMContext ctx, GLenum target, GLuint buffer)
         insertHashElement(&STATE(buffer_table), buffer, ptr);
     }
 
+    /* getBuffer is a public name/binding resolver, not a glUniform path. */
+    ptr->plain_uniform_snapshot_private = GL_FALSE;
     return ptr;
 }
 
@@ -404,7 +406,9 @@ Buffer *findBuffer(GLMContext ctx, GLuint buffer)
         return NULL;
     }
 
-    return (Buffer *)searchHashTable(&STATE(buffer_table), buffer);
+    Buffer *ptr = (Buffer *)searchHashTable(&STATE(buffer_table), buffer);
+    if (ptr) ptr->plain_uniform_snapshot_private = GL_FALSE;
+    return ptr;
 }
 
 bool checkTarget(GLMContext ctx, GLenum target)

@@ -268,6 +268,8 @@ typedef struct Program_t {
      * renderer's bounded MSL texture type cache. */
     uint64_t msl_texture_cache_instance_id;
     uint64_t msl_texture_cache_generation;
+    /* Changes only after pending draws using the previous values flush. */
+    uint64_t plain_uniform_generation;
     GLboolean program_separable;
     BufferBaseTarget plain_uniform_buffers[MAX_BINDABLE_BUFFERS];
     char *attrib_location_names[MAX_ATTRIBS];
@@ -296,6 +298,7 @@ typedef struct Program_t {
 
 GLboolean mglResourceBindingPlanEnabled(void);
 void mglBuildResourceBindingPlan(Program *program);
+GLboolean mglPackedUniformReuseEnabled(void);
 
 GLint mglProgramActiveUniformCount(Program *program);
 GLint mglProgramActiveUniformMaxNameLength(Program *program);

@@ -3705,6 +3705,9 @@ void mglApplyPlainUniformInitializers(GLMContext ctx, Program *program, int stag
         if (!slot->buf) {
             continue;
         }
+        slot->buf->plain_uniform_snapshot_private = mglPackedUniformReuseEnabled();
+        if (mglPackedUniformReuseEnabled() && program->plain_uniform_generation != UINT64_MAX)
+            program->plain_uniform_generation++;
         insertHashElement(&ctx->state.buffer_table, internalName, slot->buf);
         initBufferData(ctx, slot->buf, size, value, true);
         slot->buffer = slot->buf->name;
