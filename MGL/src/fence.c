@@ -51,6 +51,27 @@ int isSync(GLMContext ctx, GLsync sync)
     return 0;
 }
 
+static uint64_t mglElapsedMonotonicNanoseconds(struct timespec start,
+                                              struct timespec end)
+{
+    time_t seconds = end.tv_sec - start.tv_sec;
+    long nanoseconds = end.tv_nsec - start.tv_nsec;
+    if (nanoseconds < 0) {
+        seconds--;
+        nanoseconds += 1000000000L;
+    }
+    if (seconds < 0) {
+        return 0u;
+    }
+
+    uint64_t sec = (uint64_t)seconds;
+    uint64_t nsec = (uint64_t)nanoseconds;
+    if (sec > (UINT64_MAX - nsec) / 1000000000ull) {
+        return UINT64_MAX;
+    }
+    return sec * 1000000000ull + nsec;
+}
+
 GLsync mglFenceSync(GLMContext ctx, GLenum condition, GLbitfield flags)
 {
     Sync *ptr;
@@ -156,13 +177,17 @@ GLenum  mglClientWaitSync(GLMContext ctx, GLsync sync, GLbitfield flags, GLuint6
      * fence does not complete in time. */
     if (ctx->mtl_funcs.mtlGetSyncStatus)
     {
-        const uint64_t poll_interval_ns = 500000; /* 0.5 ms */
-        uint64_t elapsed_ns = 0;
+        const uint64_t poll_interval_ns = 50000; /* 50 us */
+        struct timespec start_time;
+        clock_gettime(CLOCK_MONOTONIC, &start_time);
 
-        while (elapsed_ns < timeout)
+        for (;;)
         {
             if (ctx->mtl_funcs.mtlGetSyncStatus(ctx, sync) == GL_SIGNALED)
             {
+                struct timespec now;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                uint64_t elapsed_ns = mglElapsedMonotonicNanoseconds(start_time, now);
                 mglTraceLogExternal("MGL TRACE ClientWaitSync sync=%u timeout=%llu result=CONDITION_SATISFIED pollNs=%llu cb=%p prior=%p",
                                     sync->name, (unsigned long long)timeout,
                                     (unsigned long long)elapsed_ns,
@@ -170,15 +195,26 @@ GLenum  mglClientWaitSync(GLMContext ctx, GLsync sync, GLbitfield flags, GLuint6
                 return GL_CONDITION_SATISFIED;
             }
 
-            struct timespec ts;
-            ts.tv_sec = 0;
-            ts.tv_nsec = (long)poll_interval_ns;
-            nanosleep(&ts, NULL);
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            uint64_t elapsed_ns = mglElapsedMonotonicNanoseconds(start_time, now);
+            if (elapsed_ns >= timeout) {
+                break;
+            }
 
-            elapsed_ns += poll_interval_ns;
+            uint64_t remaining_ns = timeout - elapsed_ns;
+            uint64_t sleep_ns = remaining_ns < poll_interval_ns
+                ? remaining_ns : poll_interval_ns;
+            struct timespec sleep_time = {
+                .tv_sec = (time_t)(sleep_ns / 1000000000ull),
+                .tv_nsec = (long)(sleep_ns % 1000000000ull)
+            };
+            nanosleep(&sleep_time, NULL);
+            /* EINTR returns to the loop so both status and the real deadline
+             * are checked again; requested sleep is never counted as elapsed. */
         }
 
-        /* Final check after the timeout has elapsed. */
+        /* Final completion check at/after the monotonic deadline. */
         if (ctx->mtl_funcs.mtlGetSyncStatus(ctx, sync) == GL_SIGNALED)
         {
             mglTraceLogExternal("MGL TRACE ClientWaitSync sync=%u timeout=%llu result=CONDITION_SATISFIED final=1 cb=%p prior=%p",
@@ -292,7 +328,11 @@ void mglTextureBarrier(GLMContext ctx)
         return;
     }
 
-    mglFlushCommandBuffer(ctx);
+    if (ctx->mtl_funcs.mtlMemoryBarrier) {
+        ctx->mtl_funcs.mtlMemoryBarrier(ctx);
+    } else {
+        mglFlushCommandBuffer(ctx);
+    }
 }
 
 void mglMemoryBarrier(GLMContext ctx, GLbitfield barriers)
@@ -323,30 +363,32 @@ void mglMemoryBarrier(GLMContext ctx, GLbitfield barriers)
         return;
     }
 
-    /*
-     * Metal command buffers provide the actual visibility boundary for compute
-     * writes consumed by later GL reads or draws. This conservative barrier
-     * gives SSBO/image/texture updates GL ordering semantics until finer-grain
-     * encoder hazards are implemented.
-     *
-     * Compute encoder coverage: MGL does NOT keep a long-lived compute encoder
-     * across GL calls — every glDispatchCompute / tessellation dispatch creates
-     * a local MTLComputeCommandEncoder via [_currentCommandBuffer
-     * computeCommandEncoder] and calls endEncoding() before returning (see
-     * mtlDispatchCompute and the TCS/TES dispatch paths in MGLRenderer.m). Thus
-     * no open compute encoder exists when mglMemoryBarrier is reached, and the
-     * flush path below (mglFlushCommandBuffer -> mtlFlush -> flushCommandBuffer:
-     * -> endRenderEncoding + commit + waitUntilCompleted) is sufficient: it
-     * commits the current CB (which already contains all encoded compute
-     * dispatches) and waits for completion, making compute writes visible to
-     * subsequent GL draws/reads. No explicit endComputeEncoding is needed here.
-     */
-    mglFlushCommandBuffer(ctx);
-    if (ctx->mtl_funcs.mtlFlush) {
-        ctx->mtl_funcs.mtlFlush(ctx, true);
+    if (barriers == 0) {
+        return;
     }
-    /* MGL_SYNC_STRICT: 此处已执行 mglFlushCommandBuffer + mtlFlush(ctx, true)
-     * (commit + waitUntilCompleted)，属于保守路径，无需额外 strict 分支。 */
+
+    /* Client-mapped visibility is consumed by CPU access, so retain the
+     * synchronous path for it (and for the explicit diagnostic strict mode).
+     * GL_ALL_BARRIER_BITS includes the client-mapped bit and remains on the
+     * same conservative path. Other barriers need only order GPU work: the
+     * Metal bridge flushes queued draws and ends the render encoder while
+     * leaving the command buffer uncommitted for later GPU commands. */
+    if (ctx->sync_strict || barriers == GL_ALL_BARRIER_BITS ||
+        (barriers & GL_CLIENT_MAPPED_BUFFER_BARRIER_BIT)) {
+        mglFlushCommandBuffer(ctx);
+        if (ctx->mtl_funcs.mtlFlush) {
+            ctx->mtl_funcs.mtlFlush(ctx, true);
+        }
+    } else if (ctx->mtl_funcs.mtlMemoryBarrier) {
+        ctx->mtl_funcs.mtlMemoryBarrier(ctx);
+    } else {
+        /* Preserve correctness if a backend has not installed the nonblocking
+         * encoder-boundary entry point. */
+        mglFlushCommandBuffer(ctx);
+        if (ctx->mtl_funcs.mtlFlush) {
+            ctx->mtl_funcs.mtlFlush(ctx, true);
+        }
+    }
 
     /* Storage image (imageStore) writes go directly to the GPU Metal texture.
      * Without marking the texture/level as metal_data_authoritative, subsequent
@@ -384,4 +426,6 @@ void mglMemoryBarrierByRegion(GLMContext ctx, GLbitfield barriers)
         // extra bits...
         ERROR_RETURN(GL_INVALID_VALUE);
     }
+
+    mglMemoryBarrier(ctx, barriers);
 }

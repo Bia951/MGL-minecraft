@@ -52,6 +52,12 @@ static inline bool mglMetalPixelFormatIsDepthOrStencil(MTLPixelFormat format)
            format == MTLPixelFormatStencil8;
 }
 
+/* Formats with a depth aspect usable by a depth texture shader. */
+static inline bool mglMetalPixelFormatHasDepth(MTLPixelFormat format)
+{
+    return mglMetalPixelFormatIsDepthOrStencil(format) && format != MTLPixelFormatStencil8;
+}
+
 /* Returns true if `format` is a packed depth-stencil Metal pixel format
  * (Depth24Unorm_Stencil8 or Depth32Float_Stencil8).  Used to decide whether
  * depth and stencil attachments must share the same texture. */

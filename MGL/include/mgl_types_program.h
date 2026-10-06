@@ -26,6 +26,7 @@
 #include <glslang_c_shader_types.h>
 #include "mgl_types_buffer.h"
 #include "mgl_types_texture.h"
+#include "mgl_spirv_sample_flip.h"
 
 typedef struct GLMContextRec_t *GLMContext;
 
@@ -108,6 +109,9 @@ typedef struct Spirv_t {
     GLboolean mgl_injected_framebuffer_yflip; /* true if MGL injected a
                                                * texCoord Y-flip for sampled
                                                * framebuffer in this shader */
+    GLboolean sample_flip_attempted;
+    GLuint sample_flip_resource_count;
+    MGLSpirvSampleFlipResource sample_flip_resources[MGL_SPIRV_SAMPLE_FLIP_MAX_RESOURCES];
     GLboolean needs_buffer_size_buffer; /* true if SPIRV-Cross MSL uses
                                          * spvBufferSizeConstants for
                                          * runtime-sized SSBO arrays */
@@ -184,6 +188,8 @@ typedef struct SpirvResource_t {
     GLint   sampler_unit;
     GLboolean sampler_unit_explicit;
     size_t  required_size;
+    GLboolean is_opaque_uniform; /* SPIR-V image/sampler type, independent of its name or dimension. */
+    GLboolean has_image_type; /* Distinguishes an image from a pure sampler; dim 0 is valid 1D. */
     GLuint  image_dim;
     GLuint  image_arrayed;
     GLuint  image_multisampled;
@@ -196,6 +202,15 @@ typedef struct SpirvResource_t {
     GLboolean binding_plan_skip_sampler;
     GLuint binding_plan_texture_type;
     GLuint binding_plan_texture_kind;
+    /* Cached MSL texture expectations for this reflected resource. The
+     * instance/generation pair invalidates both values when Program MSL is
+     * relinked or a Program allocation is reused. */
+    uint64_t msl_texture_expectation_cache_instance_id;
+    uint64_t msl_texture_expectation_cache_generation;
+    uint32_t msl_expected_texture_type;
+    uint32_t msl_expected_texture_data_kind;
+    uint8_t msl_expected_texture_type_valid;
+    uint8_t msl_expected_texture_data_kind_valid;
     /* True for tessellation patch variables (SpvDecorationPatch). */
     GLboolean is_per_patch;
     /* UBO member uniforms (only valid for SPVC_RESOURCE_TYPE_UNIFORM_BUFFER). */
@@ -210,6 +225,33 @@ typedef struct SpirvResourceList_t {
     GLuint  count;
     SpirvResource   *list;
 } SpirvResourceList;
+
+/* Immutable CPU snapshot of the per-location buffers used by plain uniforms.
+ * The Program owns one reference while current; recorded batches retain
+ * additional references until replay teardown. */
+typedef struct MGLPlainUniformVersion_t {
+    uint64_t generation;
+    uint32_t refcount;
+    Buffer *buffers;
+    GLuint buffer_count;
+    void *data_bytes;
+    BufferBaseTarget slots[MAX_BINDABLE_BUFFERS];
+} MGLPlainUniformVersion;
+
+#define MGL_SAMPLER_UNIFORM_CACHE_CAPACITY 64u
+typedef struct MGLSamplerUniformMatch_t {
+    SpirvResource *resource;
+    GLint array_element;
+    uint8_t stage;
+    uint8_t resource_type;
+} MGLSamplerUniformMatch;
+
+typedef struct MGLSamplerUniformCacheEntry_t {
+    GLint location;
+    GLuint match_count;
+    MGLSamplerUniformMatch *matches;
+    GLboolean valid;
+} MGLSamplerUniformCacheEntry;
 
 #define MAX_ATTACHED_SHADERS_PER_STAGE 8
 #define MGL_MSL_NAMED_ARGUMENT_CACHE_CAPACITY 64u
@@ -247,6 +289,15 @@ typedef struct Program_t {
     GLint sampler_units_by_stage[_MAX_SHADER_TYPES][TEXTURE_UNITS];
     GLboolean sampler_units_explicit[TEXTURE_UNITS];
     GLboolean sampler_units_explicit_by_stage[_MAX_SHADER_TYPES][TEXTURE_UNITS];
+    /* Final GL texture-target mask per sampler unit, derived from reflected
+     * resources and current sampler-unit state. Invalidated by relink or a
+     * sampler uniform update. */
+    uint16_t sampler_texture_target_masks[_MAX_SHADER_TYPES][TEXTURE_UNITS];
+    GLboolean sampler_texture_target_masks_valid[_MAX_SHADER_TYPES];
+    GLboolean sampler_metal_slot_shared[TEXTURE_UNITS];
+    GLboolean sampler_metal_slot_shared_valid[TEXTURE_UNITS];
+    MGLSamplerUniformCacheEntry sampler_uniform_cache[MGL_SAMPLER_UNIFORM_CACHE_CAPACITY];
+    uint8_t sampler_uniform_cache_next;
     GLboolean uses_vertex_id;
     GLboolean uses_primitive_id;
     /* MSL query result cache (env-gated by MGL_MSL_CACHE, default ON; =0 off).
@@ -258,6 +309,7 @@ typedef struct Program_t {
     GLboolean mslCacheValid;
     GLboolean usesFragCoordParams;   /* FS: gl_FragCoord params present?  */
     uint32_t vertexAttribUsageMask;  /* VS: bit N set => [[attribute(N)]] */
+    uint32_t pointSizeStageUsageMask; /* Stage bit => MSL uses point-size params. */
     MGLMSLNamedArgumentCacheEntry
         msl_named_argument_cache[MGL_MSL_NAMED_ARGUMENT_CACHE_CAPACITY];
     uint8_t msl_named_argument_cache_next;
@@ -268,9 +320,13 @@ typedef struct Program_t {
      * renderer's bounded MSL texture type cache. */
     uint64_t msl_texture_cache_instance_id;
     uint64_t msl_texture_cache_generation;
-    /* Changes only after pending draws using the previous values flush. */
     uint64_t plain_uniform_generation;
+    MGLPlainUniformVersion *plain_uniform_current_version;
     GLboolean program_separable;
+    /* Per-stage source slots for draw buffer dependency tracking. Resource
+     * classes are UBO, plain uniform, SSBO, and atomic counter. */
+    uint64_t draw_buffer_slot_masks[_MAX_SHADER_TYPES][4][(MAX_BINDABLE_BUFFERS + 63) / 64];
+    GLboolean draw_buffer_slot_masks_valid[_MAX_SHADER_TYPES];
     BufferBaseTarget plain_uniform_buffers[MAX_BINDABLE_BUFFERS];
     char *attrib_location_names[MAX_ATTRIBS];
     GLboolean attrib_location_name_owned[MAX_ATTRIBS];

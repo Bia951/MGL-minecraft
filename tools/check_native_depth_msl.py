@@ -38,6 +38,7 @@ int main(int argc, char **argv) {
     applyMSLUniformBufferPacking(p, _FRAGMENT_SHADER);
     Program *before = malloc(sizeof(*p)); memcpy(before, p, sizeof(*p));
     Shader shader_before = *s;
+    bytes = p->spirv[_FRAGMENT_SHADER].size * sizeof(uint32_t);
     uint32_t *ir_before = malloc(bytes); memcpy(ir_before, p->spirv[_FRAGMENT_SHADER].ir, bytes);
     SpirvUBOMember **member_copies[_MAX_SPIRV_RES] = {0};
     GLuint **binding_copies[_MAX_SPIRV_RES] = {0};
@@ -66,7 +67,12 @@ int main(int argc, char **argv) {
     for (GLuint i = 0; i < images->count && i < 64; i++)
         if (images->list[i].name && !strcmp(images->list[i].name, "a")) mask |= UINT64_C(1) << i;
     if (!mask) return 4;
-    char *variant = mglNativeDepthMSL(ctx, p, mask, atoi(argv[5]) ? mask : 0);
+    uint64_t flip_mask = atoi(argv[5]) ? mask : 0;
+    if (atoi(argv[5]) == 3) {
+        for (GLuint i = 0; i < images->count && i < 64; i++)
+            if (images->list[i].name && !strcmp(images->list[i].name, "b")) flip_mask |= UINT64_C(1) << i;
+    }
+    char *variant = mglNativeDepthMSL(ctx, p, mask, flip_mask);
     if (memcmp(p, before, sizeof(*p)) || memcmp(s, &shader_before, sizeof(*s)) ||
         memcmp(ir_before, p->spirv[_FRAGMENT_SHADER].ir, bytes)) return 5;
     for (int type = 0; type < _MAX_SPIRV_RES; type++) {
@@ -116,6 +122,12 @@ REJECTED = {
     "helper": "vec4 sample_it(sampler2D s,vec2 p){return texture(s,p);}\nvoid main(){color=sample_it(a,uv)+texture(b,uv);}",
 }
 
+# The optimized sample-flip pass inlines opaque-resource helpers first.
+# Once inlined, native depth must accept this fixture and still compile Metal.
+flip_setting = os.environ.get("MGL_RT_SAMPLE_FLIP", "").lower()
+if flip_setting and flip_setting not in ("0", "false", "no", "off"):
+    CASES["inlined_helper"] = REJECTED.pop("helper")
+
 def run(*args, env=None):
     if env is None:
         env = dict(os.environ, MGL_ARGUMENT_BUFFERS="0")
@@ -140,7 +152,7 @@ with tempfile.TemporaryDirectory(prefix="mgl-depth-msl-") as tmp:
         spirv = source.with_suffix(".spv")
         source.write_text(HEADER + body)
         run(ROOT / "external/glslang/build/StandAlone/glslang", "-G", "-o", spirv, source)
-        for flip in (0, 1):
+        for flip in ((0, 1, 3) if name in ("sample", "grad", "fetch") else (0, 1)):
             variant = tmp / f"{name}-{flip}.metal"
             base = tmp / f"{name}-base.metal"
             run(exe, source, spirv, variant, base, flip)

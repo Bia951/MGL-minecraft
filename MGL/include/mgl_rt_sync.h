@@ -38,6 +38,12 @@
 extern "C" {
 #endif
 
+#ifdef __OBJC__
+/* Shared mip-window/cache checks used by generation and draw preflight. */
+NSUInteger mglGLSampledCopyLevelCount(Texture *tex, id<MTLTexture> source);
+bool mglGLSampledCopyIsFresh(Texture *tex, id<MTLTexture> source);
+#endif
+
 /* Returns true if `tex` is a 2D render target that needs a Y-flipped
  * sampled copy maintained by RT Sync.
  *
@@ -59,7 +65,8 @@ static inline bool mglTextureCanUseGLSampledRenderTargetCopy(Texture *tex)
  * given framebuffer.  Used to guard lazy Y-flip copy refresh: Metal does
  * not allow reading a texture that is simultaneously a render-pass
  * attachment (read-after-write hazard).  When this returns true the lazy
- * refresh must be deferred (the end_render_pass path will refresh it). */
+ * refresh must wait until the encoder has ended; draw preflight prepares
+ * the sampled copy before replaying bindings. */
 bool mglTextureIsAttachmentOfFramebuffer(Framebuffer *fbo, Texture *tex);
 
 /* Returns true if `fbo` looks like a "GL sampled copy" render target:

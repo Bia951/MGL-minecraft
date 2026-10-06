@@ -106,6 +106,5 @@ BOOL mglRendererVertexAttribUsesCurrentValue(VertexArray *vao, GLuint attribute)
 {
     return vao &&
            attribute < MAX_ATTRIBS &&
-           vao->enabled_attribs != 0u &&
            (vao->enabled_attribs & (0x1u << attribute)) == 0u;
 }

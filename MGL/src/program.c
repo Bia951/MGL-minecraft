@@ -42,9 +42,28 @@
 #include "mgl_metal_ref.h"
 #include "mgl_uniform_reflection.h"
 #include "mgl_spirv_compile.h"
+#include "draw_command.h"
 
 
 static _Atomic uint64_t mglNextMSLTextureCacheInstanceID = 1u;
+
+static void mglClearSamplerUniformCache(Program *program)
+{
+    if (!program) {
+        return;
+    }
+
+    for (GLuint i = 0; i < MGL_SAMPLER_UNIFORM_CACHE_CAPACITY; i++) {
+        free(program->sampler_uniform_cache[i].matches);
+        memset(&program->sampler_uniform_cache[i], 0,
+               sizeof(program->sampler_uniform_cache[i]));
+    }
+    program->sampler_uniform_cache_next = 0u;
+    memset(program->sampler_metal_slot_shared, 0,
+           sizeof(program->sampler_metal_slot_shared));
+    memset(program->sampler_metal_slot_shared_valid, 0,
+           sizeof(program->sampler_metal_slot_shared_valid));
+}
 
 static GLboolean mglPointerLooksMallocOwned(const void *ptr)
 {
@@ -301,7 +320,10 @@ void mglFreeProgram(GLMContext ctx, Program *ptr)
      * program.  The real glslang_program_t is deleted at the end of
      * mglLinkProgram.  Do NOT call glslang_program_delete here — it would
      * dereference the marker as if it were a glslang object. */
+    mglInvalidateProgramPlainUniformVersion(ctx, ptr);
     ptr->linked_glsl_program = NULL;
+
+    mglClearSamplerUniformCache(ptr);
 
     mglSafeReleaseMetalObj((void **)&ptr->mtl_data);
 
@@ -468,14 +490,25 @@ void mglRetainProgramReference(GLMContext ctx, Program *program)
         return;
     }
 
-    GLuint programName = 0u;
-    if (mglObjectPointerLooksPlausible(program) &&
-        mglPointerRangeIsReadable(program, sizeof(*program))) {
-        programName = program->name;
+    if (!mglObjectPointerLooksPlausible(program)) {
+        return;
     }
 
-    if (programName == 0u ||
-        !mglProgramPointerUsableForName(ctx, program, programName)) {
+    if (mglHashTableContainsData(&ctx->state.program_table, program)) {
+        if (program->name != 0u) {
+            program->refcount++;
+        }
+        return;
+    }
+
+    /* Deleted-but-retained Programs are not table members. Keep the VM probe
+     * before reading their fields, then apply the same liveness conditions as
+     * mglProgramPointerUsableForName without probing the same memory twice. */
+    if (!mglPointerRangeIsReadable(program, sizeof(*program)) ||
+        program->name == 0u ||
+        !program->delete_status ||
+        program->refcount <= 0 ||
+        program->linked_glsl_program == NULL) {
         return;
     }
 
@@ -484,8 +517,13 @@ void mglRetainProgramReference(GLMContext ctx, Program *program)
 
 void mglReleaseProgramReference(GLMContext ctx, Program *program)
 {
-    if (!ctx || !program ||
-        !mglObjectPointerLooksPlausible(program) ||
+    if (!ctx || !program || !mglObjectPointerLooksPlausible(program)) {
+        return;
+    }
+
+    /* Table membership is enough to establish the allocation's identity and
+     * lifetime. Removed-but-retained Programs use the VM-checked slow path. */
+    if (!mglHashTableContainsData(&ctx->state.program_table, program) &&
         !mglPointerRangeIsReadable(program, sizeof(*program))) {
         return;
     }
@@ -516,6 +554,8 @@ void mglDeleteProgram(GLMContext ctx, GLuint program)
     }
 
     mglFlushPendingDraws(ctx);
+
+    mglClearSamplerUniformCache(ptr);
 
     deleteHashElement(&STATE(program_table), program);
     
@@ -826,6 +866,13 @@ void mglLinkProgram(GLMContext ctx, GLuint program)
 
     mglFlushPendingDraws(ctx);
 
+    mglInvalidateProgramPlainUniformVersion(ctx, pptr);
+    pptr->plain_uniform_generation++;
+
+    /* Cached sampler locations hold pointers into reflection lists. Drop them
+     * before relinking can replace those lists, including failed relinks. */
+    mglClearSamplerUniformCache(pptr);
+
     pptr->uses_vertex_id = GL_FALSE;
     pptr->uses_primitive_id = GL_FALSE;
     /* Invalidate MSL query cache; repopulated from the freshly generated MSL
@@ -833,6 +880,11 @@ void mglLinkProgram(GLMContext ctx, GLuint program)
     pptr->mslCacheValid = GL_FALSE;
     pptr->usesFragCoordParams = GL_FALSE;
     pptr->vertexAttribUsageMask = 0u;
+    pptr->pointSizeStageUsageMask = 0u;
+    memset(pptr->sampler_texture_target_masks_valid, 0,
+           sizeof(pptr->sampler_texture_target_masks_valid));
+    memset(pptr->draw_buffer_slot_masks_valid, 0,
+           sizeof(pptr->draw_buffer_slot_masks_valid));
     memset(pptr->msl_named_argument_cache, 0, sizeof(pptr->msl_named_argument_cache));
     pptr->msl_named_argument_cache_next = 0u;
     for (int stage = 0; stage < _MAX_SHADER_TYPES; stage++) {
@@ -1131,6 +1183,15 @@ void mglLinkProgram(GLMContext ctx, GLuint program)
             }
         }
         pptr->vertexAttribUsageMask = attr_mask;
+
+        uint32_t point_size_stage_mask = 0u;
+        for (int stage = 0; stage < _MAX_SHADER_TYPES; stage++) {
+            const char *stage_msl = pptr->spirv[stage].msl_str;
+            if (stage_msl && strstr(stage_msl, "_mgl_point_size_params")) {
+                point_size_stage_mask |= (1u << stage);
+            }
+        }
+        pptr->pointSizeStageUsageMask = point_size_stage_mask;
         pptr->mslCacheValid = GL_TRUE;
         mglBuildResourceBindingPlan(pptr);
     }

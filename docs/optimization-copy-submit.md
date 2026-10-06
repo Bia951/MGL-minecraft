@@ -1,6 +1,45 @@
 # Copy/CPU submission optimization implementation status
 
-Working baseline: `23e618f` (not `cd165bc`). No history reset or deployment was performed.
+Current integration: merge the nine commits through `a8c34ff` with optimized
+baseline `cd165bc`, preserving both histories. The notes below originally
+covered the `23e618f` branch; the following integration changes supersede its
+lifetime, cache and fallback descriptions.
+
+## Optimized baseline integration (2026-10-06)
+
+- Restore all 43 optimization commits between `23e618f` and `cd165bc`, including
+  drawable scheduling, compact state, uniform versions, arena leases, vertex
+  conversion caches, sampled-copy batching, sample-flip and native texel buffers.
+- Keep plain uniforms Program-owned. Remove the obsolete cross-Program global
+  upload path; it is incompatible with compact buffer-base state and was already
+  removed from the optimized baseline.
+- CPU struct snapshot keys identify Program/link/stage/resource/element/layout.
+  Exact source witnesses invalidate affected structs; unrelated uniform updates
+  no longer create a fresh cache namespace. Allocate source records for actual
+  distinct locations and avoid duplicate VM probes on private MGL allocations.
+- Reuse immutable packed ranges within the optimized command-buffer arena lease
+  pool. Completion returns leases to the pool; range metadata never crosses CBs.
+- Prepare uploads and sampled copies before collecting bindings. Preserve the
+  optimized map produced on the current CB, and retry only texture binding on
+  encoder restarts. Restore avoids a duplicate buffer collection. A CB rotation
+  after collection rejects the plan and remaps through the legacy path.
+- Argument descriptors still validate live buffers/offsets/sizes/usage per draw;
+  unchanged descriptors reuse the immutable table without rebuilding its arrays
+  and exact keys. Residency deduplicates by resource identity and unions usage
+  within one encoder, with strong ownership preventing pointer reuse.
+- Bounded shader/PSO/sampler/descriptor/range/snapshot caches evict individual
+  entries instead of clearing all entries at the capacity boundary. Depth mip
+  windows use the existing source-retaining texture-view cache.
+- Native-depth variants preserve the base pipeline's selected color flips; base
+  sample-flip PSO changes reset and reselect the private depth variant.
+- Wire the three experiment switches into the JVM `-D` configuration bridge.
+  All remain default-off and independently configurable.
+
+Validation: Core/ES/GLFW build; existing immutable uniform, binding replay,
+argument descriptor and native-depth MSL checks (sample flip disabled/enabled).
+The MSL checks include mixed color/depth flips and compile generated Metal.
+No game FPS or visual claim follows from these checks.
+
 
 ## Resource binding metadata (first CPU increment)
 

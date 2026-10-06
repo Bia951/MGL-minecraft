@@ -24,11 +24,13 @@
  * the header.
  */
 
+#include "mgl_trace_log.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <ctype.h>
 #include <malloc/malloc.h>
 #include <CoreFoundation/CoreFoundation.h>
@@ -48,6 +50,25 @@
 #include "mgl_metal_ref.h"
 #include "mgl_uniform_reflection.h"
 #include "mgl_spirv_compile.h"
+#include "mgl_spirv_generate.h"
+#include "mgl_texel_buffer.h"
+
+int mglNativeTexelBufferEnabled(void)
+{
+    static atomic_int cached = ATOMIC_VAR_INIT(-1);
+    int enabled = atomic_load_explicit(&cached, memory_order_acquire);
+    if (enabled < 0) {
+        mglLoadEnvFileNextToDylibOnce();
+        const char *value = getenv("MGL_NATIVE_TEXEL_BUFFER");
+        int requested = value && strcmp(value, "1") == 0;
+        int unset = -1;
+        atomic_compare_exchange_strong_explicit(&cached, &unset, requested,
+                                                memory_order_release,
+                                                memory_order_relaxed);
+        enabled = atomic_load_explicit(&cached, memory_order_acquire);
+    }
+    return enabled;
+}
 
 bool mglMSLIdentifierChar(char c)
 {
@@ -330,14 +351,16 @@ void applyMSLResourceBindings(Program *pptr, int stage, char **msl_ptr)
             }
 
             if (res->binding != metal_index) {
-                fprintf(stderr,
-                        "MGL RESOURCE FIX: program=%u stage=%d type=%d %s texture binding %u -> %u\n",
-                        pptr->name,
-                        stage,
-                        res_type,
-                        res->name,
-                        (unsigned)res->binding,
-                        (unsigned)metal_index);
+                if (mglTraceEnvFlagEnabled("MGL_DEBUG_RESOURCE_ABI")) {
+                    fprintf(stderr,
+                            "MGL RESOURCE FIX: program=%u stage=%d type=%d %s texture binding %u -> %u\n",
+                            pptr->name,
+                            stage,
+                            res_type,
+                            res->name,
+                            (unsigned)res->binding,
+                            (unsigned)metal_index);
+                }
                 res->binding = metal_index;
             }
             GLint msl_array_size =
@@ -527,15 +550,17 @@ void applyMSLResourceBindings(Program *pptr, int stage, char **msl_ptr)
             }
 
             if (res->binding != metal_index) {
-                fprintf(stderr,
-                        "MGL RESOURCE FIX: program=%u stage=%d type=%d %s buffer binding %u -> %u (gl=%u)\n",
-                        pptr->name,
-                        stage,
-                        res_type,
-                        res->name,
-                        (unsigned)res->binding,
-                        (unsigned)metal_index,
-                        (unsigned)res->gl_binding);
+                if (mglTraceEnvFlagEnabled("MGL_DEBUG_RESOURCE_ABI")) {
+                    fprintf(stderr,
+                            "MGL RESOURCE FIX: program=%u stage=%d type=%d %s buffer binding %u -> %u (gl=%u)\n",
+                            pptr->name,
+                            stage,
+                            res_type,
+                            res->name,
+                            (unsigned)res->binding,
+                            (unsigned)metal_index,
+                            (unsigned)res->gl_binding);
+                }
                 res->binding = metal_index;
             }
         }
@@ -551,14 +576,16 @@ void applyMSLResourceBindings(Program *pptr, int stage, char **msl_ptr)
             continue;
         }
         if (res->binding != metal_index) {
-            fprintf(stderr,
-                    "MGL RESOURCE FIX: program=%u stage=%d type=%d %s sampler binding %u -> %u\n",
-                    pptr->name,
-                    stage,
-                    SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS,
-                    res->name,
-                    (unsigned)res->binding,
-                    (unsigned)metal_index);
+            if (mglTraceEnvFlagEnabled("MGL_DEBUG_RESOURCE_ABI")) {
+                fprintf(stderr,
+                        "MGL RESOURCE FIX: program=%u stage=%d type=%d %s sampler binding %u -> %u\n",
+                        pptr->name,
+                        stage,
+                        SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS,
+                        res->name,
+                        (unsigned)res->binding,
+                        (unsigned)metal_index);
+            }
             res->binding = metal_index;
         }
     }
@@ -3464,7 +3491,7 @@ void applyMSLUniformBufferPacking(Program *pptr, int stage)
     unsigned struct_dep_count = 0;
     char patch_struct_names[256][128];
     unsigned patch_struct_count = 0;
-    GLboolean debug_pack = getenv("MGL_DEBUG_MSL_PACK") ? GL_TRUE : GL_FALSE;
+    GLboolean debug_pack = mglTraceEnvFlagEnabled("MGL_DEBUG_MSL_PACK") ? GL_TRUE : GL_FALSE;
 
     mglMSLCollectStructDeps(src,
                             struct_deps,
@@ -4179,7 +4206,7 @@ static GLboolean mglConfigureArgumentBuffers(Program *program,
         &program->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT];
     for (GLuint i = 0; i < uniformConstants->count; i++) {
         SpirvResource *resource = &uniformConstants->list[i];
-        if (resource->image_dim != 0u || resource->uniform_location >= 0) {
+        if (mglProgramResourceLooksSamplerLike(resource, SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT)) {
             spvc_compiler_set_decoration(compiler, resource->_id,
                                          SpvDecorationDescriptorSet, 2u);
             resource->set = 2u;
@@ -4269,6 +4296,38 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
         ERROR_RETURN_VALUE(GL_INVALID_OPERATION, NULL);
     }
 
+    /* Private specialization constants preserve the public GL uniform ABI.
+     * Only publish a transformed module after its complete validation; an
+     * unsupported resource continues to use the existing sampled mirror. */
+    mglLoadEnvFileNextToDylibOnce();
+    Spirv *stageState = &ptr->spirv[stage];
+    if (stage == _FRAGMENT_SHADER && !stageState->sample_flip_attempted &&
+        mglTraceEnvFlagEnabled("MGL_RT_SAMPLE_FLIP")) {
+        stageState->sample_flip_attempted = GL_TRUE;
+        uint32_t *replacement = NULL;
+        size_t replacementCount = 0u;
+        size_t resourceCount = 0u;
+        MGLSpirvSampleFlipStats stats = {0};
+        if (mglTransformSPIRVSampleFlip(spirv, word_count, &replacement, &replacementCount,
+                                      stageState->sample_flip_resources,
+                                      MGL_SPIRV_SAMPLE_FLIP_MAX_RESOURCES,
+                                      &resourceCount, &stats) && resourceCount) {
+            free(stageState->ir);
+            stageState->ir = replacement;
+            stageState->size = replacementCount;
+            stageState->sample_flip_resource_count = (GLuint)resourceCount;
+            spirv = replacement;
+            word_count = replacementCount;
+        } else {
+            free(replacement);
+            memset(stageState->sample_flip_resources, 0, sizeof(stageState->sample_flip_resources));
+        }
+        if (mglTraceEnvFlagEnabled("MGL_SAMPLE_FLIP_TRACE")) {
+            fprintf(stderr, "MGL SAMPLE FLIP IR program=%u stage=%d accepted=%u words=%zu\n",
+                    ptr->name, stage, stageState->sample_flip_resource_count, word_count);
+        }
+    }
+
     /* SPIRV-Cross throws "Metal does not support isoline tessellation" for
      * TES with SpvExecutionModeIsolines.  Patch the SPIR-V to replace
      * Isolines with Triangles so SPIRV-Cross can generate MSL.  The original
@@ -4344,6 +4403,21 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
         ERROR_RETURN_VALUE(GL_INVALID_OPERATION, NULL);
     }
 
+    if (mglNativeTexelBufferEnabled()) {
+        spvc_bool hasStorageTexelBuffer = SPVC_FALSE;
+        spvc_result scanResult = mglSPVCFindStorageTexelBufferImage(compiler_msl,
+                                                                     &hasStorageTexelBuffer);
+        if (scanResult != SPVC_SUCCESS || hasStorageTexelBuffer) {
+            fprintf(stderr,
+                    "MGL ERROR: native texel-buffer MSL does not support storage image buffers (program=%u stage=%d scan=%d)\n",
+                    ptr->name,
+                    stage,
+                    scanResult);
+            spvc_context_destroy(context);
+            ERROR_RETURN_VALUE(GL_INVALID_OPERATION, NULL);
+        }
+    }
+
     // Start discrete; auto/forced argument-buffer mode is selected after reflection.
     if (spvc_compiler_options_set_bool(options, SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS, SPVC_FALSE) != SPVC_SUCCESS) {
         fprintf(stderr, "MGL Error: spvc_compiler_options_set_bool(SPVC_COMPILER_OPTION_MSL_ARGUMENT_BUFFERS) failed\n");
@@ -4368,6 +4442,14 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
                                        SPVC_COMPILER_OPTION_MSL_TEXEL_BUFFER_TEXTURE_WIDTH,
                                        MGL_TEXEL_BUFFER_TEXTURE_WIDTH) != SPVC_SUCCESS) {
         fprintf(stderr, "MGL Error: spvc_compiler_options_set_uint(SPVC_COMPILER_OPTION_MSL_TEXEL_BUFFER_TEXTURE_WIDTH) failed\n");
+        spvc_context_destroy(context);
+        ERROR_RETURN_VALUE(GL_INVALID_OPERATION, NULL);
+    }
+
+    if (spvc_compiler_options_set_bool(options,
+                                       SPVC_COMPILER_OPTION_MSL_TEXTURE_BUFFER_NATIVE,
+                                       mglNativeTexelBufferEnabled() ? SPVC_TRUE : SPVC_FALSE) != SPVC_SUCCESS) {
+        fprintf(stderr, "MGL Error: spvc_compiler_options_set_bool(SPVC_COMPILER_OPTION_MSL_TEXTURE_BUFFER_NATIVE) failed\n");
         spvc_context_destroy(context);
         ERROR_RETURN_VALUE(GL_INVALID_OPERATION, NULL);
     }
@@ -4640,8 +4722,7 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
 
             bool uniform_constant_sampler_like =
                 (res_type == SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT) &&
-                (mglUniformConstantBaseTypeIsSamplerLike(reflected_basetype) ||
-                 mglUniformNameLooksSamplerLike(list[i].name));
+                mglUniformConstantBaseTypeIsSamplerLike(reflected_basetype);
 
             ptr->spirv_resources_list[stage][res_type].list[i]._id = list[i].id;
             ptr->spirv_resources_list[stage][res_type].list[i].base_type_id = list[i].base_type_id;
@@ -4686,7 +4767,10 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
                 GLuint ac_offset = spvc_compiler_get_decoration(compiler_msl, list[i].id, SpvDecorationOffset);
                 ptr->spirv_resources_list[stage][res_type].list[i].location = ac_offset;
             }
-            ptr->spirv_resources_list[stage][res_type].list[i].gl_type = mglGLTypeFromSPVCType(reflected_type);
+            ptr->spirv_resources_list[stage][res_type].list[i].gl_type =
+                mglUniformConstantBaseTypeIsSamplerLike(reflected_basetype)
+                ? mglGLImageTypeFromSPVCType(compiler_msl, reflected_type)
+                : mglGLTypeFromSPVCType(reflected_type);
             ptr->spirv_resources_list[stage][res_type].list[i].gl_array_size = mglGLArraySizeFromSPVCType(reflected_type);
             ptr->spirv_resources_list[stage][res_type].list[i].is_array =
                 (reflected_type && spvc_type_get_num_array_dimensions(reflected_type) > 0) ? GL_TRUE : GL_FALSE;
@@ -4709,7 +4793,10 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
             ptr->spirv_resources_list[stage][res_type].list[i].sampler_unit = -1;
             ptr->spirv_resources_list[stage][res_type].list[i].sampler_unit_explicit = GL_FALSE;
             ptr->spirv_resources_list[stage][res_type].list[i].required_size = 0;
+            ptr->spirv_resources_list[stage][res_type].list[i].is_opaque_uniform =
+                mglUniformConstantBaseTypeIsSamplerLike(reflected_basetype);
             ptr->spirv_resources_list[stage][res_type].list[i].image_dim = 0;
+            ptr->spirv_resources_list[stage][res_type].list[i].has_image_type = GL_FALSE;
             ptr->spirv_resources_list[stage][res_type].list[i].image_arrayed = 0;
             ptr->spirv_resources_list[stage][res_type].list[i].image_multisampled = 0;
 
@@ -4764,6 +4851,7 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
                 spvc_type image_type = reflected_type;
 
                 if (image_type) {
+                    ptr->spirv_resources_list[stage][res_type].list[i].has_image_type = GL_TRUE;
                     ptr->spirv_resources_list[stage][res_type].list[i].image_dim =
                         (GLuint)spvc_type_get_image_dimension(image_type);
                     ptr->spirv_resources_list[stage][res_type].list[i].image_arrayed =
@@ -5052,7 +5140,7 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
                 continue;
             }
 
-            if (getenv("MGL_DEBUG_UBO_REFLECT")) {
+            if (mglTraceEnvFlagEnabled("MGL_DEBUG_UBO_REFLECT")) {
                 fprintf(stderr,
                         "MGL UBO REFLECT program=%u stage=%d ubo=%s id=%u type=%u base=%u structType=%u structName=%s\n",
                         ptr->name,
@@ -5145,8 +5233,7 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
 
             /* Skip samplers/images that happen to live in the uniform-constant
              * list; only genuine structs are reflected here. */
-            if (mglUniformConstantBaseTypeIsSamplerLike(spvc_type_get_basetype(elem_type)) ||
-                mglUniformNameLooksSamplerLike(res->name)) {
+            if (mglProgramResourceLooksSamplerLike(res, SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT)) {
                 continue;
             }
 
@@ -5192,16 +5279,7 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
              * the start of the variable, not the start of a single element).
              * Also store the struct size in required_size for render-time
              * struct buffer packing. */
-            size_t elem_byte_size = 0;
-            spvc_compiler_get_declared_struct_size(compiler_msl,
-                                                   elem_type,
-                                                   &elem_byte_size);
-            if (elem_byte_size == 0) {
-                /* Plain struct uniforms lack Offset decorations, so
-                 * spvc_compiler_get_declared_struct_size returns 0.
-                 * Compute the size using Metal/C alignment rules. */
-                elem_byte_size = mglComputeMSLStructSize(compiler_msl, elem_type);
-            }
+            size_t elem_byte_size = mglComputeMSLStructSize(compiler_msl, elem_type);
             res->required_size = elem_byte_size;
 
             res->ubo_members = NULL;
@@ -5514,7 +5592,7 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
     }
     mglFinalizeArgumentBufferBindings(ptr, stage, compiler_msl);
 
-    if (getenv("MGL_DUMP_MSL")) {
+    if (mglTraceEnvFlagEnabled("MGL_DUMP_MSL")) {
         fprintf(stderr, "MGL DBG MSL DUMP (program=%u stage=%d):\n%.8000s\n", ptr->name, stage, result);
     }
     DEBUG_PRINT("\n%s\n", result);
@@ -5548,7 +5626,7 @@ char *parseSPIRVShaderToMetal(GLMContext ctx, Program *ptr, int stage)
             mslPipelineDestroy(&pipeline);
         }
 
-        if (getenv("MGL_DUMP_MSL") && str_ret) {
+        if (mglTraceEnvFlagEnabled("MGL_DUMP_MSL") && str_ret) {
             char dumpPath[512];
             snprintf(dumpPath, sizeof(dumpPath),
                      "/tmp/mgl_program_%u_stage_%d.msl",
@@ -5648,11 +5726,33 @@ char *mglCompileMSLCaptureVariant(GLMContext ctx, Program *ptr, int stage)
         return NULL;
     }
 
+    if (mglNativeTexelBufferEnabled()) {
+        spvc_bool hasStorageTexelBuffer = SPVC_FALSE;
+        spvc_result scanResult = mglSPVCFindStorageTexelBufferImage(compiler_msl,
+                                                                     &hasStorageTexelBuffer);
+        if (scanResult != SPVC_SUCCESS || hasStorageTexelBuffer) {
+            fprintf(stderr,
+                    "MGL ERROR: mglCompileMSLCaptureVariant: native texel-buffer MSL does not support storage image buffers (program=%u stage=%d scan=%d)\n",
+                    ptr ? ptr->name : 0u,
+                    stage,
+                    scanResult);
+            spvc_context_destroy(context);
+            return NULL;
+        }
+    }
+
     /* Mirror the base MSL options set in parseSPIRVShaderToMetal so the
      * capture variant is otherwise consistent with the render variant. */
     (void)spvc_compiler_options_set_bool(options,
                                          SPVC_COMPILER_OPTION_MSL_TEXTURE_1D_AS_2D,
                                          SPVC_TRUE);
+    if (spvc_compiler_options_set_bool(options,
+                                       SPVC_COMPILER_OPTION_MSL_TEXTURE_BUFFER_NATIVE,
+                                       mglNativeTexelBufferEnabled() ? SPVC_TRUE : SPVC_FALSE) != SPVC_SUCCESS) {
+        fprintf(stderr, "MGL Error: mglCompileMSLCaptureVariant: set TEXTURE_BUFFER_NATIVE failed\n");
+        spvc_context_destroy(context);
+        return NULL;
+    }
     (void)spvc_compiler_options_set_uint(options,
                                          SPVC_COMPILER_OPTION_MSL_VERSION,
                                          SPVC_MAKE_MSL_VERSION(3,1,0));
@@ -5709,6 +5809,10 @@ char *mglCompileMSLCaptureVariant(GLMContext ctx, Program *ptr, int stage)
 }
 void clearStageCompileState(Program *pptr, int stage)
 {
+    pptr->spirv[stage].sample_flip_attempted = GL_FALSE;
+    pptr->spirv[stage].sample_flip_resource_count = 0u;
+    memset(pptr->spirv[stage].sample_flip_resources, 0,
+           sizeof(pptr->spirv[stage].sample_flip_resources));
     if (pptr->spirv[stage].ir) {
         free(pptr->spirv[stage].ir);
         pptr->spirv[stage].ir = NULL;
@@ -6009,7 +6113,7 @@ void applyVertexInputLocations(Program *pptr)
                  vs_in->name, (unsigned)desiredLocation);
 
         if (strstr(pptr->spirv[_VERTEX_SHADER].msl_str, from)) {
-            fprintf(stderr,
+            mglTraceLogExternal(
                     "MGL ATTRIB FIX: program=%u vertex input %s loc %u -> %d\n",
                     pptr->name,
                     vs_in->name,
@@ -6018,7 +6122,7 @@ void applyVertexInputLocations(Program *pptr)
             replace_all_substr(&pptr->spirv[_VERTEX_SHADER].msl_str, from, to);
             vs_in->location = (GLuint)desiredLocation;
         } else {
-            fprintf(stderr,
+            mglTraceLogExternal(
                     "MGL ATTRIB WARNING: program=%u wanted %s loc %u -> %d but MSL pattern was not found\n",
                     pptr->name,
                     vs_in->name,
@@ -6213,7 +6317,7 @@ void alignFragmentInputLocationsToVertexOutputs(Program *pptr)
                                                          desired_location,
                                                          fs_msl_name,
                                                          sizeof(fs_msl_name))) {
-                fprintf(stderr,
+                mglTraceLogExternal(
                         "MGL IFACE FIX: program=%u fragment input %s/%s loc %u -> %u to match vertex output %s/%s\n",
                         pptr->name,
                         fs_in->name,
@@ -6224,7 +6328,7 @@ void alignFragmentInputLocationsToVertexOutputs(Program *pptr)
                         vs_msl_name[0] ? vs_msl_name : vs_out->name);
                 fs_in->location = desired_location;
             } else {
-                fprintf(stderr,
+                mglTraceLogExternal(
                         "MGL IFACE WARNING: program=%u wanted to align %s loc %u -> %u but MSL pattern was not found\n",
                         pptr->name,
                         fs_in->name,
@@ -6403,7 +6507,7 @@ void mglBridgeSkippedGeometryShaderVaryings(Program *pptr)
                                               fs_name,
                                               vs_name);
             if (renamed) {
-                fprintf(stderr,
+                mglTraceLogExternal(
                         "MGL GS SKIP IFACE NAME FIX: program=%u fragment input %s -> %s via skipped GS %s\n",
                         pptr->name,
                         fs_name,
@@ -6427,7 +6531,7 @@ void mglBridgeSkippedGeometryShaderVaryings(Program *pptr)
                                                       vs_out->location,
                                                       fs_msl_name,
                                                       sizeof(fs_msl_name))) {
-            fprintf(stderr,
+            mglTraceLogExternal(
                     "MGL GS SKIP IFACE WARNING: program=%u wanted FS %s loc %u -> %u to match VS %s but MSL pattern was not found\n",
                     pptr->name,
                     fs_in->name,
@@ -6437,7 +6541,7 @@ void mglBridgeSkippedGeometryShaderVaryings(Program *pptr)
             continue;
         }
 
-        fprintf(stderr,
+        mglTraceLogExternal(
                 "MGL GS SKIP IFACE FIX: program=%u align FS %s/%s loc %u -> %u to VS %s/%s via skipped GS %s\n",
                 pptr->name,
                 fs_in->name,
@@ -6464,7 +6568,7 @@ bool compileStageFromLinkedProgram(GLMContext ctx, Program *pptr, glslang_progra
     if (MGL_VERBOSE_PROGRAM_LOGS) {
         fprintf(stderr, "MGL DEBUG: Generating SPIRV for stage %d\n", stage);
     }
-    glslang_program_SPIRV_generate(glsl_program, stage);
+    mglGenerateProgramSPIRV(glsl_program, stage);
     if (MGL_VERBOSE_PROGRAM_LOGS) {
         fprintf(stderr, "MGL DEBUG: SPIRV generated\n");
     }
@@ -6505,6 +6609,11 @@ bool compileStageFromLinkedProgram(GLMContext ctx, Program *pptr, glslang_progra
         fprintf(stderr, "MGL DEBUG: Getting SPIRV IR\n");
     }
     glslang_program_SPIRV_get(glsl_program, pptr->spirv[stage].ir);
+    if (!mglOptimizeGeneratedSPIRV(&pptr->spirv[stage].ir,
+                                  &pptr->spirv[stage].size, stage)) {
+        ERROR_RETURN(GL_INVALID_OPERATION);
+        return false;
+    }
     if (MGL_VERBOSE_PROGRAM_LOGS) {
         fprintf(stderr, "MGL DEBUG: SPIRV IR obtained\n");
     }
@@ -6524,7 +6633,7 @@ bool compileStageFromLinkedProgram(GLMContext ctx, Program *pptr, glslang_progra
         return true;
     }
     applyMSLUniformBufferPacking(pptr, stage);
-    if (getenv("MGL_DUMP_MSL_POST_PACK") && pptr->spirv[stage].msl_str) {
+    if (mglTraceEnvFlagEnabled("MGL_DUMP_MSL_POST_PACK") && pptr->spirv[stage].msl_str) {
         char dump_path[256];
         snprintf(dump_path, sizeof(dump_path),
                  "/tmp/mgl_program_%u_stage_%d_post_pack.msl",

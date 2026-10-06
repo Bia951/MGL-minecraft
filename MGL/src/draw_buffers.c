@@ -239,6 +239,7 @@ static void mglDropCurrentVAO(GLMContext ctx)
 static VertexArray *mglGetSafeCurrentVAO(GLMContext ctx, const char *caller)
 {
     VertexArray *vao;
+    bool tableMember;
 
     if (!ctx)
         return NULL;
@@ -247,9 +248,22 @@ static VertexArray *mglGetSafeCurrentVAO(GLMContext ctx, const char *caller)
     if (!vao)
         return NULL;
 
-    if (!mglObjectPointerLooksPlausible(vao) ||
-        !mglHashTableContainsData(&STATE(vao_table), vao) ||
-        !mglPointerRangeIsReadable(vao, sizeof(*vao)))
+    if (!mglObjectPointerLooksPlausible(vao))
+    {
+        static uint64_t invalid_vao_count = 0;
+        if (should_log_throttled(&invalid_vao_count, 8, 1000)) {
+            fprintf(stderr,
+                    "MGL WARNING: %s: dropping invalid current VAO pointer %p\n",
+                    caller ? caller : "draw",
+                    (void *)vao);
+        }
+        mglDropCurrentVAO(ctx);
+        return NULL;
+    }
+
+    /* A table member is still owned by vao_table, so its allocation is live. */
+    tableMember = mglHashTableContainsData(&STATE(vao_table), vao);
+    if (!tableMember)
     {
         static uint64_t invalid_vao_count = 0;
         if (should_log_throttled(&invalid_vao_count, 8, 1000)) {
@@ -447,9 +461,11 @@ bool validate_program(GLMContext ctx)
 
     if (program) {
         GLuint expectedName = 0u;
-        GLboolean pointerReadable =
-            mglObjectPointerLooksPlausible(program) &&
-            mglPointerRangeIsReadable(program, sizeof(*program));
+        GLboolean pointerPlausible = mglObjectPointerLooksPlausible(program);
+        GLboolean tableMember = pointerPlausible &&
+            mglHashTableContainsData(&STATE(program_table), program);
+        GLboolean pointerReadable = tableMember ||
+            (pointerPlausible && mglPointerRangeIsReadable(program, sizeof(*program)));
         if (pointerReadable) {
             expectedName = ctx->state.program_name ? ctx->state.program_name : program->name;
         }
@@ -870,7 +886,7 @@ static bool mglCPUFeedbackResolveXFBSlot(GLMContext ctx,
     if (slotIndex >= MAX_BINDABLE_BUFFERS) {
         return false;
     }
-    BufferBaseTarget *slot = &ctx->state.buffer_base[_TRANSFORM_FEEDBACK_BUFFER].buffers[slotIndex];
+    BufferBaseTarget *slot = &mglStateBufferBaseTargets(&ctx->state, _TRANSFORM_FEEDBACK_BUFFER)[slotIndex];
     Buffer *buffer = slot->buf;
     if (!buffer || !buffer->data.buffer_data || buffer->size <= 0) {
         return false;
@@ -1943,6 +1959,8 @@ void mglMultiDrawArrays(GLMContext ctx, GLenum mode, const GLint *first, const G
     ERROR_CHECK_RETURN(validate_program(ctx), GL_INVALID_OPERATION);
 
     if (ctx->draw_defer_enabled) {
+        MGLStateKey cachedKey;
+        bool keyValid = false;
         for (GLsizei i = 0; i < drawcount; i++) {
             if (count[i] == 0) {
                 continue;
@@ -1955,7 +1973,7 @@ void mglMultiDrawArrays(GLMContext ctx, GLenum mode, const GLint *first, const G
             cmd.first = first[i];
             cmd.count = count[i];
             cmd.instanceCount = 1;
-            mglRecordDrawCommand(ctx, &cmd);
+            mglRecordDrawCommandWithStateKey(ctx, &cmd, &cachedKey, &keyValid);
         }
         return;
     }
@@ -1991,6 +2009,8 @@ void mglMultiDrawElements(GLMContext ctx, GLenum mode, const GLsizei *count, GLe
 
     if (ctx->draw_defer_enabled) {
         Buffer *elementBuffer = mglCurrentElementBuffer(ctx, __func__);
+        MGLStateKey cachedKey;
+        bool keyValid = false;
         for (GLsizei i = 0; i < drawcount; i++) {
             if (count[i] == 0) {
                 continue;
@@ -2005,7 +2025,7 @@ void mglMultiDrawElements(GLMContext ctx, GLenum mode, const GLsizei *count, GLe
             cmd.indexBufferOffset = (GLuint)(uintptr_t)indices[i];
             cmd.elementBuffer = elementBuffer;
             cmd.instanceCount = 1;
-            mglRecordDrawCommand(ctx, &cmd);
+            mglRecordDrawCommandWithStateKey(ctx, &cmd, &cachedKey, &keyValid);
         }
         return;
     }
@@ -2041,6 +2061,8 @@ void mglMultiDrawElementsBaseVertex(GLMContext ctx, GLenum mode, const GLsizei *
 
     if (ctx->draw_defer_enabled) {
         Buffer *elementBuffer = mglCurrentElementBuffer(ctx, __func__);
+        MGLStateKey cachedKey;
+        bool keyValid = false;
         for (GLsizei i = 0; i < drawcount; i++) {
             if (count[i] == 0) {
                 continue;
@@ -2056,7 +2078,7 @@ void mglMultiDrawElementsBaseVertex(GLMContext ctx, GLenum mode, const GLsizei *
             cmd.elementBuffer = elementBuffer;
             cmd.baseVertex = basevertex[i];
             cmd.instanceCount = 1;
-            mglRecordDrawCommand(ctx, &cmd);
+            mglRecordDrawCommandWithStateKey(ctx, &cmd, &cachedKey, &keyValid);
         }
         return;
     }

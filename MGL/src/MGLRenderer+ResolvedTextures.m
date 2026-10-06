@@ -6,7 +6,20 @@
 
 - (void)useResource:(id<MTLResource>)resource usage:(MTLResourceUsage)usage
 {
-    [_currentRenderEncoder useResource:resource usage:usage];
+    id<MTLRenderCommandEncoder> encoder = _currentRenderEncoder;
+    if (!encoder || !resource) return;
+    if (_resolvedResourceEncoder != encoder) {
+        _resolvedResourceEncoder = encoder;
+        _resolvedResourceUsageByEncoder = [[NSMapTable alloc]
+            initWithKeyOptions:NSPointerFunctionsStrongMemory | NSPointerFunctionsObjectPointerPersonality
+                  valueOptions:NSPointerFunctionsStrongMemory
+                      capacity:64u];
+    }
+    NSNumber *oldUsage = [_resolvedResourceUsageByEncoder objectForKey:resource];
+    MTLResourceUsage combinedUsage = usage | (MTLResourceUsage)oldUsage.unsignedIntegerValue;
+    if (oldUsage && combinedUsage == (MTLResourceUsage)oldUsage.unsignedIntegerValue) return;
+    [_resolvedResourceUsageByEncoder setObject:@(combinedUsage) forKey:resource];
+    [encoder useResource:resource usage:combinedUsage];
 }
 
 - (id<MGLResolvedBufferBindingSink>)bufferBindingSink
@@ -71,6 +84,11 @@
 
 - (bool)prepareResolvedTextureBindingsForDraw
 {
+    return [self prepareResolvedTextureBindingsForDrawWithMappedCommandBuffer:nil];
+}
+
+- (bool)prepareResolvedTextureBindingsForDrawWithMappedCommandBuffer:(id<MTLCommandBuffer>)mappedCommandBuffer
+{
     [self discardResolvedTextureBindings];
     if (_resolvedArgumentBufferCommandBuffer != _currentCommandBuffer) {
         [_resolvedArgumentBufferCache removeAllObjects];
@@ -92,26 +110,56 @@
         savedFragment[i] = _lastBoundFragmentBuffers[i];
     }
     @try {
-        // Upload mapped buffers before texture copies. Native depth's earlier
-        // selection is a preflight: its shader/PSO/views must already be usable
-        // before the normal resolver is permitted to bypass a depth copy.
-        BOOL buffersReady = [self mapBuffersToMTL] &&
-            [self updateDirtyBaseBufferList:&ctx->state.vertex_buffer_map_list] &&
-            [self updateDirtyBaseBufferList:&ctx->state.fragment_buffer_map_list];
-        if (buffersReady && [self bindActiveTexturesToMTL]) {
+        /* Reuse the map produced by dirty-state sync only while its command
+         * buffer remains current. Texture upload and sampled-copy preflight can
+         * rotate it, so compare identity rather than relying on dirty bits. */
+        BOOL buffersReady = YES;
+        if (!mappedCommandBuffer || mappedCommandBuffer != _currentCommandBuffer) {
+            buffersReady = [self mapBuffersToMTL];
+            if (buffersReady) mappedCommandBuffer = _currentCommandBuffer;
+        }
+        if (buffersReady) {
+            buffersReady = [self updateDirtyBaseBufferList:&ctx->state.vertex_buffer_map_list] &&
+                [self updateDirtyBaseBufferList:&ctx->state.fragment_buffer_map_list];
+        }
+        if (buffersReady) {
+            _resolvedTextureBindings = [MGLResolvedTextureBindings new];
             _resolvedTextureBindingsPreparing = YES;
             g_mglRecordingBufferBindings = 1;
-            // Encoder-ending copies require a bounded restart. Partial slot
-            // collections are discarded, never published or reused next draw.
-            for (NSUInteger attempt = 0; attempt < 3; attempt++) {
-                _resolvedTextureBindings = [MGLResolvedTextureBindings new];
-                if (![self restoreRenderEncoderAfterTextureUploadForDraw:"resolve-textures-before-final-pipeline"])
-                    break;
+
+            /* Resolve ordinary uploads and render-target copies before any
+             * bindings are captured. This prevents retries from rescanning all
+             * resources, and makes the prepared replay include the final state. */
+            BOOL texturesUploaded = [self bindActiveTexturesToMTL];
+            BOOL copiesPrepared = texturesUploaded && [self prepareSampledCopiesForDraw];
+            Program *sampleFlipProgram = mglResolveProgramForStageFromState(ctx, _FRAGMENT_SHADER);
+            if (copiesPrepared && mglEnvFlagEnabled("MGL_RT_SAMPLE_FLIP") && sampleFlipProgram &&
+                sampleFlipProgram->spirv[_FRAGMENT_SHADER].sample_flip_resource_count) {
+                uint64_t mask = [self fragmentSampleFlipMaskForProgram:sampleFlipProgram];
+                if (_pipelineSampleFlipMask != mask ||
+                    _pipelineSampleFlipProgramInstance != sampleFlipProgram->msl_texture_cache_instance_id ||
+                    _pipelineSampleFlipProgramGeneration != sampleFlipProgram->msl_texture_cache_generation) {
+                    BOOL hadNativeDepth = _nativeDepthReady;
+                    if (hadNativeDepth) [self resetNativeDepthDraw];
+                    copiesPrepared = [self syncPipelineStateWithDeferredBufferMap:NO mappedCommandBuffer:NULL];
+                    if (copiesPrepared && hadNativeDepth)
+                        copiesPrepared = [self selectNativeDepthPipelineForDraw];
+                    if (copiesPrepared && _currentRenderEncoder && _pipelineState) {
+                        [_currentRenderEncoder setRenderPipelineState:_pipelineState];
+                        _lastPipelineState = _pipelineState;
+                    }
+                }
+            }
+            if (copiesPrepared && mappedCommandBuffer != _currentCommandBuffer) {
+                copiesPrepared = [self mapBuffersToMTL] &&
+                    [self updateDirtyBaseBufferList:&ctx->state.vertex_buffer_map_list] &&
+                    [self updateDirtyBaseBufferList:&ctx->state.fragment_buffer_map_list];
+            }
+            if (copiesPrepared &&
+                [self restoreRenderEncoderAfterTextureUploadForDraw:"resolve-textures-before-bind-collection"]) {
                 _currentDrawUsesRTSampledCopy = NO;
-                // Resolve every buffer/conversion/inline snapshot once too.
-                // Force collection without poisoning the real encoder's dedup
-                // state; restore that state after collection below.
                 _lastBoundValid = NO;
+                id<MTLCommandBuffer> collectionCommandBuffer = _currentCommandBuffer;
                 BOOL vertexReady = [self bindVertexBuffersToCurrentRenderEncoder];
                 _lastBoundValid = NO;
                 BOOL fragmentReady = vertexReady && [self bindFragmentBuffersToCurrentRenderEncoder];
@@ -121,8 +169,26 @@
                     [self bindArgumentBuffersForProgram:fragment stage:_FRAGMENT_SHADER context:ctx
                                          renderEncoder:_currentRenderEncoder computeEncoder:nil];
                 BOOL sizesReady = argumentsReady && [self bindBufferSizeConstantsForRenderEncoder];
-                if (sizesReady && [self bindTexturesToCurrentRenderEncoder] && _currentRenderEncoder &&
-                    _currentCommandBuffer && [_resolvedTextureBindings seal]) {
+
+                /* A sampled-copy update can still interrupt texture binding.
+                 * Retry only that texture pass: the captured buffers and
+                 * argument tables are unchanged and remain valid for replay. */
+                BOOL texturesReady = NO;
+                for (NSUInteger attempt = 0; sizesReady && attempt < 3u; attempt++) {
+                    texturesReady = [self bindTexturesToCurrentRenderEncoder];
+                    if (texturesReady) break;
+                    /* Arena ranges and descriptor cache leases cannot migrate
+                     * to a different CB; let the legacy path remap there. */
+                    if (_currentCommandBuffer != collectionCommandBuffer) break;
+                    if (_nativeDepthReady && ![self nativeDepthBindingsRemainUsable]) {
+                        [self resetNativeDepthDraw];
+                    }
+                    if (attempt + 1u >= 3u ||
+                        ![self restoreRenderEncoderAfterTextureUploadForDraw:"resolve-textures-retry"]) break;
+                }
+                if (texturesReady && _currentRenderEncoder &&
+                    _currentCommandBuffer == collectionCommandBuffer &&
+                    [_resolvedTextureBindings seal]) {
                     _resolvedTextureCommandBuffer = _currentCommandBuffer;
                     _resolvedTextureEncoder = _currentRenderEncoder;
                     const Program *programs[2] = {vertex, fragment};
@@ -131,12 +197,7 @@
                         _resolvedTextureLinkGenerations[i] = programs[i]->msl_texture_cache_generation;
                     }
                     complete = YES;
-                    break;
                 }
-                // A benign color-copy/encoder interruption need not discard
-                // a usable native shader/view combination. A rejected backing
-                // or changed program/unit does: retry all bindings with base.
-                if (_nativeDepthReady && ![self nativeDepthBindingsRemainUsable]) [self resetNativeDepthDraw];
             }
         }
     } @catch (NSException *exception) {

@@ -34,11 +34,10 @@
     id existing = cache[key];
     if (existing == [NSNull null]) return nil;
     if (existing) return ((NSArray *)existing)[1];
-    // Strict renderer-wide bound, including failures. Drop dependent PSOs
-    // when evicting so they do not keep an unbounded set of shader variants.
+    // Strict renderer-wide bound, including failures. PSOs independently own
+    // their compiled functions and use lifetime/generation-complete keys.
     if (cache.count >= 128u) {
         [cache removeObjectForKey:cache.allKeys.firstObject];
-        [_nativeDepthPipelineCache removeAllObjects];
     }
     char *source = mglNativeDepthMSL(ctx, program, depth, flip);
     id<MTLLibrary> library = nil;
@@ -74,7 +73,8 @@
         sampler = [self createMTLSamplerForTexParam:&copy target:GL_TEXTURE_2D];
         if (sampler) {
             if (!_nativeDepthSamplerCache) _nativeDepthSamplerCache = [NSMutableDictionary new];
-            if (_nativeDepthSamplerCache.count >= 128u) [_nativeDepthSamplerCache removeAllObjects];
+            if (_nativeDepthSamplerCache.count >= 128u)
+                [_nativeDepthSamplerCache removeObjectForKey:_nativeDepthSamplerCache.allKeys.firstObject];
             _nativeDepthSamplerCache[key] = sampler;
         }
     }
@@ -117,16 +117,8 @@
             backing.textureType != MTLTextureType2D || backing.sampleCount != 1u ||
             !(backing.usage & MTLTextureUsageShaderRead) || backing.parentTexture ||
             [self currentRenderPassUsesTexture:backing]) continue;
-        NSUInteger base = tex->params.base_level;
-        NSUInteger max = MIN((NSUInteger)tex->params.max_level, backing.mipmapLevelCount - 1u);
-        if (base >= backing.mipmapLevelCount || max < base) continue;
-        id<MTLTexture> view = backing;
-        if (base || max + 1u != backing.mipmapLevelCount) {
-            view = [backing newTextureViewWithPixelFormat:backing.pixelFormat
-                    textureType:MTLTextureType2D levels:NSMakeRange(base, max - base + 1u)
-                    slices:NSMakeRange(0, 1)];
-            if (!view) continue; // Never bind a wrong mip range on view failure.
-        }
+        id<MTLTexture> view = [self sampleFlipTextureViewForObject:tex];
+        if (!view) continue; // Never bind a wrong mip range on view failure.
         id<MTLSamplerState> sampler = [self nativeDepthSamplerForParameters:params];
         if (!sampler) continue;
         _nativeDepthGLTextures[i] = tex;
@@ -145,6 +137,23 @@
     if (!_currentRenderEncoder && ![self restoreRenderEncoderAfterTextureUploadForDraw:"native-depth-prepare"])
         return false;
     if (!depth) return true;
+    /* The private module is compiled with default-false sample-flip constants.
+     * Preserve the base PSO's direct color sampling by lowering its selected
+     * flips into this module too; depth flips were already selected above. */
+    if (_pipelineSampleFlipProgramInstance == program->msl_texture_cache_instance_id &&
+        _pipelineSampleFlipProgramGeneration == program->msl_texture_cache_generation) {
+        Spirv *fragment = &program->spirv[_FRAGMENT_SHADER];
+        for (GLuint fi = 0u; fi < fragment->sample_flip_resource_count && fi < 64u; fi++) {
+            if (!((_pipelineSampleFlipMask >> fi) & 1u)) continue;
+            for (GLuint ri = 0u; ri < images->count; ri++) {
+                if (images->list[ri]._id == fragment->sample_flip_resources[fi].resource_id &&
+                    !(depth & (UINT64_C(1) << ri))) {
+                    flip |= UINT64_C(1) << ri;
+                    break;
+                }
+            }
+        }
+    }
     id<MTLFunction> function = [self nativeDepthFunctionForProgram:program depth:depth flip:flip];
     if (!function) return true;
     MTLRenderPipelineDescriptor *descriptor = [self generatePipelineDescriptor];
@@ -162,7 +171,8 @@
     if (cached == [NSNull null]) return true;
     id<MTLRenderPipelineState> pipeline = cached;
     if (!pipeline) {
-        if (_nativeDepthPipelineCache.count >= 128u) [_nativeDepthPipelineCache removeAllObjects];
+        if (_nativeDepthPipelineCache.count >= 128u)
+            [_nativeDepthPipelineCache removeObjectForKey:_nativeDepthPipelineCache.allKeys.firstObject];
         NSError *error = nil;
         @try { pipeline = [_device newRenderPipelineStateWithDescriptor:descriptor error:&error]; }
         @catch (NSException *exception) { pipeline = nil; }
@@ -188,7 +198,7 @@
     [self discardResolvedTextureBindings];
     if (!_pipelineState) _pipelineState = base;
     ctx->state.dirty_bits |= DIRTY_PROGRAM | DIRTY_VAO | DIRTY_FBO | DIRTY_RENDER_STATE;
-    if (![self syncPipelineStateWithDeferredBufferMap:NO]) return false;
+    if (![self syncPipelineStateWithDeferredBufferMap:NO mappedCommandBuffer:NULL]) return false;
     if (!_currentRenderEncoder && ![self restoreRenderEncoderAfterTextureUploadForDraw:"native-pipeline-fallback"]) return false;
     if (_resolvedTexturePlanEnabled && ![self prepareResolvedTextureBindingsForDraw]) return false;
     [self updateCurrentRenderEncoder];

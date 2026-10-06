@@ -50,6 +50,22 @@
 extern "C" {
 #endif
 
+typedef enum {
+    MGLVertexConversionNone,
+    MGLVertexConversionFloat,
+    MGLVertexConversionInt,
+    MGLVertexConversionUInt
+} MGLVertexConversion;
+
+typedef struct {
+    MTLVertexFormat format;
+    MGLVertexConversion conversion;
+} MGLVertexAttributePlan;
+
+MTLVertexFormat glTypeSizeToMtlType(GLuint type, GLuint size, bool normalized);
+MGLVertexAttributePlan mglVertexAttributePlan(const VertexAttrib *attrib,
+                                             GLuint shaderType, bool currentValue);
+
 /* === Vertex format mapping (static inline, hot-path) === */
 
 /* GL vertex attribute component size in bytes (1/2/4/8).  Returns 0 for
@@ -183,6 +199,12 @@ double mglDecodeVertexAttribComponent(const uint8_t *src,
 
 /* FNV-1a hash of a MTLVertexDescriptor for pipeline cache keys. */
 uint64_t mglVertexDescriptorSignature(MTLVertexDescriptor *vertexDescriptor);
+
+/* FNV-1a hash of only the selected descriptor entries. Attribute bits are
+ * limited to MAX_ATTRIBS and layout bits to Metal slots 0..30. */
+uint64_t mglVertexDescriptorSignatureForMasks(MTLVertexDescriptor *vertexDescriptor,
+                                              uint32_t attributeMask,
+                                              uint32_t layoutMask);
 
 /* FNV-1a hash of a MTLRenderPipelineDescriptor for pipeline cache keys. */
 uint64_t mglPipelineDescriptorSignature(MTLRenderPipelineDescriptor *pipelineStateDescriptor);

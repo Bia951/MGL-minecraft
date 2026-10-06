@@ -109,6 +109,9 @@ struct GLMMetalFuncs {
     void (*mtlReleaseSync)(GLMContext glm_ctx, Sync *sync);
 
     void (*mtlFlush)(GLMContext glm_ctx, bool finish);
+    /* End the current render encoder after flushing deferred draws, without
+     * committing the command buffer or waiting for GPU completion. */
+    void (*mtlMemoryBarrier)(GLMContext glm_ctx);
     void (*mtlSwapBuffers)(GLMContext glm_ctx);
     void (*mtlFlushDrawBuffer)(GLMContext glm_ctx);
     void (*mtlInvalidateRenderPass)(GLMContext glm_ctx);
@@ -213,6 +216,10 @@ typedef struct GLMContextRec_t {
     BufferData  *temp_element_buffer;
 
     MGLCommandBuffer draw_command_buffer;
+    /* Non-NULL only while ctx->state.vao points at a live, owned replay
+     * snapshot. Used as an identity fast path before pointer validation. */
+    VertexArray    *trusted_replay_vao;
+    struct MGLPlainUniformVersion_t *trusted_replay_uniform_versions[2];
     bool            draw_defer_enabled;
     bool            sync_strict;
 

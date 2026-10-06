@@ -4,8 +4,8 @@
  *
  * SPIR-V Resource Helper Subsystem: pure helpers for mapping SPIR-V
  * reflected resources (SpirvResource) to GL client buffer bindings and
- * Metal argument slots.  These helpers encode the Minecraft-specific
- * plain-uniform binding table and the UBO/SSBO array element expansion
+ * Metal argument slots. These helpers encode plain-uniform locations
+ * and the UBO/SSBO array element expansion
  * rules shared across the vertex/fragment/compute binding paths.
  *
  * All functions here are pure: they operate only on the SpirvResource
@@ -23,10 +23,8 @@ extern "C" {
 #endif
 
 /* Resolve the GL client buffer binding (UBO/SSBO/plain-uniform index) for
- * a SPIR-V reflected resource.  For plain uniforms (SPVC_RESOURCE_TYPE_
- * UNIFORM_CONSTANT) this consults the Minecraft plain-uniform binding
- * table (ModelViewMat=0, ProjMat=1, ...) and falls back to
- * uniform_location / location / gl_binding.  For UBOs/SSBOs this returns
+ * a SPIR-V reflected resource. Plain uniforms use uniform_location,
+ * location, then gl_binding. For UBOs/SSBOs this returns
  * res->gl_binding. */
 GLuint mglClientBufferBindingForResource(int resourceType,
                                          const SpirvResource *res);
@@ -54,12 +52,14 @@ GLuint mglClientBufferBindingForResourceElement(int resourceType,
 GLuint mglMetalResourceSlotForElement(const SpirvResource *res,
                                       GLuint element);
 
-/* Returns true if a plain uniform resource may fall back to the global
- * (Minecraft legacy) binding table.  Mojang/Iris u_* uniforms are
- * excluded because their numeric locations collide with legacy slots
- * but mean different things — falling back corrupts first-person items
- * and inventory icons. */
+/* Plain uniform values belong to their linked Program. This policy helper
+ * currently forbids context-wide fallback for all plain uniforms. */
 bool mglPlainUniformAllowsGlobalFallback(const SpirvResource *res);
+
+/* Visit each selected GL client binding once, including plain struct leaves
+ * owned by every active graphics-stage Program. */
+typedef void (*MGLDrawBufferBindingVisitor)(GLMContext, const BufferBaseTarget *, uint64_t, void *);
+void mglVisitDrawBufferBindings(GLMContext ctx, MGLDrawBufferBindingVisitor visit, void *data);
 
 /* Human-readable name for a SPVC_RESOURCE_TYPE_* constant, or "resource"
  * for unknown types.  Used by diagnostic/logging paths. */

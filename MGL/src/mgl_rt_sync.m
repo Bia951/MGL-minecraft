@@ -100,3 +100,45 @@ bool mglFramebufferLooksLikeGLSampledCopyRenderTarget(GLMContext glctx,
     }
     return true;
 }
+
+NSUInteger mglGLSampledCopyLevelCount(Texture *tex, id<MTLTexture> source)
+{
+    NSUInteger copyLevelCount = 1u;
+    if (source.mipmapLevelCount > 1u) {
+        GLuint highestGLLevel = tex->num_levels > 0u ? tex->num_levels - 1u : 0u;
+        if (tex->mipmap_levels > 0u && highestGLLevel >= tex->mipmap_levels) {
+            highestGLLevel = tex->mipmap_levels - 1u;
+        }
+
+        GLuint maxParamLevel = tex->params.max_level;
+        if (maxParamLevel != 1000u && maxParamLevel < highestGLLevel) {
+            highestGLLevel = maxParamLevel;
+        }
+
+        NSUInteger highestSourceLevel = source.mipmapLevelCount - 1u;
+        if (tex->params.base_level > highestGLLevel &&
+            (NSUInteger)tex->params.base_level <= highestSourceLevel) {
+            highestGLLevel = tex->params.base_level;
+        }
+        if ((NSUInteger)highestGLLevel > highestSourceLevel) {
+            highestGLLevel = (GLuint)highestSourceLevel;
+        }
+
+        copyLevelCount = (NSUInteger)highestGLLevel + 1u;
+    }
+
+    return copyLevelCount;
+}
+
+bool mglGLSampledCopyIsFresh(Texture *tex, id<MTLTexture> source)
+{
+    NSUInteger levels = mglGLSampledCopyLevelCount(tex, source);
+    uint32_t windowMask = levels >= 32u ? UINT32_MAX : ((1u << levels) - 1u);
+    return tex->mtl_gl_sampled_data &&
+        tex->mtl_gl_sampled_width == source.width &&
+        tex->mtl_gl_sampled_height == source.height &&
+        tex->mtl_gl_sampled_format == source.pixelFormat &&
+        tex->mtl_gl_sampled_levels == levels &&
+        tex->mtl_gl_sampled_write_version == tex->mtl_render_target_write_version &&
+        !(tex->mtl_gl_sampled_dirty_mip_mask & windowMask);
+}

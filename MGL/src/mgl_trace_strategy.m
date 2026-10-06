@@ -199,7 +199,8 @@ bool mglProgramNeedsTraceLog(Program *program)
 {
     return mglTraceLogIsEnabled() &&
            program &&
-           (mglProgramExplicitlyTraced(program) ||
+           (mglTraceLogResourcesVerbose() ||
+            mglProgramExplicitlyTraced(program) ||
             mglProgramNeedsBindingTrace(program));
 }
 

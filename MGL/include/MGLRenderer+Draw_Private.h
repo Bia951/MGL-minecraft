@@ -143,11 +143,6 @@ static inline const char *mglYFlipDecisionName(MGLYFlipDecision decision)
 /* === C functions defined in MGLRenderer.m, used by MGLRenderer+Draw.m === */
 Program *mglTraceResolveDrawProgram(GLMContext traceCtx);
 bool mglTraceShouldLogReplay(GLMContext traceCtx, Program *program);
-BOOL mglRendererTextureLooksRecoverableSampled2D(GLMContext glctx,
-                                                  Texture *tex,
-                                                  MTLTextureType expectedType,
-                                                  MGLTextureDataKind expectedKind);
-BOOL mglRendererTextureLooksLikeSampledColor2D(GLMContext glctx, Texture *tex);
 MTLIndexType getMTLIndexType(GLenum type);
 Buffer *getElementBuffer(GLMContext ctx);
 Buffer *getIndirectBuffer(GLMContext ctx);
@@ -156,25 +151,12 @@ MTLPrimitiveType getMTLPrimitiveType(GLenum mode);
 void mglRestoreProgramPipelinePair(GLMContext ctx, GLuint programName, GLuint pipelineName);
 void mglRendererSyncFramebufferBindingNames(GLMContext ctx);
 Texture *mglTraceFramebufferAttachmentTexture(GLMContext glctx, FBOAttachment *attachment);
-BOOL mglRendererGLSampledCopyLooksUsable(Texture *tex,
-                                                MTLTextureType expectedType,
-                                                MGLTextureDataKind expectedKind,
-                                                BOOL allowPreviousWriteVersion,
-                                                id<MTLTexture> *copyOut,
-                                                BOOL *usedPreviousWriteVersionOut);
 void mglLogDrawWithoutSwapWatchdog(const char *kind,
                                           uint64_t drawCall,
                                           GLMContext ctx,
                                           id<MTLCommandBuffer> commandBuffer,
                                           id<MTLRenderCommandEncoder> renderEncoder,
                                           MTLRenderPassDescriptor *renderPassDescriptor);
-Texture *mglFindFramebufferColorTexturePairedWithDepth(GLMContext glctx,
-                                                              Texture *depthTexture,
-                                                              GLuint *fboNameOut);
-BOOL mglCurrentDrawFramebufferUsesColorTexture(GLMContext glctx,
-                                                      Texture *texture,
-                                                      GLuint expectedFboName,
-                                                      NSUInteger *attachmentIndexOut);
 Buffer *mglRendererGetValidatedBuffer(GLMContext ctx, Buffer *candidate, const char *where, NSUInteger slot);
 NSUInteger mglRendererBuildCurrentVertexAttribBytes(GLMContext ctx,
                                                            GLuint attribute,
@@ -225,11 +207,15 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
 - (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index;
 - (void)discardResolvedTextureBindings;
 - (bool)prepareResolvedTextureBindingsForDraw;
+- (bool)prepareResolvedTextureBindingsForDrawWithMappedCommandBuffer:(id<MTLCommandBuffer>)mappedCommandBuffer;
 - (bool)replayResolvedTextureBindingsForDraw;
 - (bool)resolvedTextureBindingsMatchCurrentDraw;
 @end
 
 @interface MGLRenderer ()
+- (id<MTLTexture>)depthReadTextureForObject:(Texture *)object program:(Program *)program;
+- (BOOL)updateDepthReadCopiesForTexture:(Texture *)object orientationMask:(unsigned)requestedMask;
+
 
 // === Draw batch scheduling and execution ===
 - (MGLBatchPath)scheduleDrawBatch:(MGLDrawBatch *)batch context:(GLMContext)glm_ctx;
@@ -246,10 +232,12 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
                                              offset:(NSUInteger *)offsetOut;
 
 // === Resource binding sync ===
-- (bool)syncResourceBindingsForContext:(GLMContext)glm_ctx;
+- (bool)syncResourceBindingsForContext:(GLMContext)glm_ctx
+       mappedCommandBufferForStateSync:(id<MTLCommandBuffer>)mappedCommandBufferForStateSync;
 - (bool)bindVertexBuffersToCurrentRenderEncoder;
 - (bool)bindFragmentBuffersToCurrentRenderEncoder;
 - (bool)bindActiveTexturesToMTL;
+- (bool)prepareSampledCopiesForDraw;
 
 // === Stage 5.3: Parallel command recording infrastructure ===
 - (void)saveDedupStateToWorker:(MGLWorkerContext *)worker;

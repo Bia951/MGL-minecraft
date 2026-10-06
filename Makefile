@@ -56,6 +56,13 @@ CFLAGS += -IMGL/src        # "mgl_safety.h" lives in MGL/src/, used by MGLRender
 CFLAGS += -IMGL/SPIRV/SPIRV-Cross
 CFLAGS += -DENABLE_OPT=0 -DSPIRV_CROSS_C_API_MSL=1 -DSPIRV_CROSS_C_API_GLSL=1 -DSPIRV_CROSS_C_API_CPP=1 -DSPIRV_CROSS_C_API_REFLECT=1
 
+# MGL's SPIRV-Tools optimizer helper is C++17 (the bundled SPIRV-Tools
+# requires C++17). Keep its include path and deployment target aligned with
+# the C compilation above.
+CXXFLAGS += -Wall -gfull -O2 -arch $(shell uname -m) -std=c++17
+CXXFLAGS += -I$(spirv_tools_include_path) -IMGL/include
+CXXFLAGS += -I./external/SPIRV-Tools/external/SPIRV-Headers/include
+
 # GLFW configuration for shared library build
 CFLAGS += -I./external/glfw/include -I./external/glfw/src
 CXXFLAGS += -I./external/glfw/include -I./external/glfw/src
@@ -152,6 +159,7 @@ brew_prefix := $(shell brew --prefix)
 # mgl
 #mgl_srcs_c := $(wildcard MGL/src/*.c)
 mgl_srcs_c := $(filter-out %/gl_core.c  %/gl_es.c, $(wildcard MGL/src/*.c))
+mgl_srcs_cpp := $(wildcard MGL/src/*.cpp)
 
 mgl_srcs_objc := $(wildcard MGL/src/*.m)
 
@@ -248,7 +256,8 @@ deps += $(glfw_objs:.o=.d)
 mgl_lib := $(build_dir)/libmgl.dylib
 mgl_es_lib := $(build_dir)/libmgl_es.dylib
 
-mgl_toolchain_obj := $(build_dir)/MGL/src/mgl_toolchain.o
+mgl_toolchain_obj := $(build_core_dir)/MGL/src/mgl_toolchain.o
+mgl_toolchain_optimizer_obj := $(build_core_dir)/MGL/src/mgl_spirv_optimize.o
 mgl_toolchain_lib := $(build_dir)/libmgl_toolchain.a
 
 $(mgl_lib): $(mgl_core_objs) $(mgl_core_arc_objs) $(mgl_core_obj)
@@ -264,12 +273,19 @@ $(mgl_es_lib): $(mgl_es_objs) $(mgl_es_arc_objs) $(mgl_es_obj)
 	ln -fs $(mgl_es_lib) .
 
 
-$(mgl_toolchain_lib): $(mgl_toolchain_obj)
+$(mgl_toolchain_lib): $(mgl_toolchain_obj) $(mgl_toolchain_optimizer_obj)
 	@mkdir -p $(dir $@)
 	ar rcs $@ $^
 
-# Build GLFW shared library from pre-built static library
-$(build_dir)/libglfw.dylib: external/glfw/build/src/libglfw3.a $(mgl_lib)
+# Build GLFW from this checkout; cached archives can point at a different worktree.
+glfw_build_dir := $(build_dir)/glfw
+glfw_static_lib := $(glfw_build_dir)/src/libglfw3.a
+$(glfw_static_lib): $(wildcard external/glfw/src/*.[chm]) external/glfw/CMakeLists.txt external/glfw/src/CMakeLists.txt $(wildcard MGL/include/*.h)
+	cmake -S external/glfw -B $(glfw_build_dir) -DGLFW_BUILD_EXAMPLES=OFF -DGLFW_BUILD_TESTS=OFF -DGLFW_BUILD_DOCS=OFF -DBUILD_SHARED_LIBS=OFF -DCMAKE_OSX_ARCHITECTURES=$(shell uname -m)
+	cmake --build $(glfw_build_dir) --parallel 8
+
+# Build GLFW shared library from this checkout's static archive
+$(build_dir)/libglfw.dylib: $(glfw_static_lib) $(mgl_lib)
 	@echo "Creating GLFW shared library from static library..."
 	@mkdir -p $(dir $@)
 	$(CC) -shared -fPIC -dynamiclib \
@@ -309,7 +325,7 @@ $(build_core_dir)/%.o: %.c
 #-std=gnu17 
 $(build_core_dir)/%.o: %.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) -MMD $(CXXFLAGS_GL_CORE) -c $< -o $@
+	$(APPLE_CLANGXX) -MMD $(CXXFLAGS_GL_CORE) -isysroot $(SDK_ROOT) -c $< -o $@
 
 #-std=c++14
 $(build_core_dir)/arc/%.o: %.m
@@ -335,7 +351,7 @@ $(build_es_dir)/%.o: %.c
 #-std=gnu17
 $(build_es_dir)/%.o: %.cpp
 	@mkdir -p $(dir $@)
-	$(CXX) -MMD $(CXXFLAGS_GL_ES) -c $< -o $@
+	$(APPLE_CLANGXX) -MMD $(CXXFLAGS_GL_ES) -isysroot $(SDK_ROOT) -c $< -o $@
 
 #-std=c++14
 $(build_es_dir)/arc/%.o: %.m

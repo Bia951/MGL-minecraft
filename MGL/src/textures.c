@@ -341,6 +341,18 @@ void mglReleaseGLSampledTextureCopy(GLMContext ctx, Texture *tex, const char *re
         }
         tex->mtl_gl_sampled_data = NULL;
     }
+    for (unsigned orientation = 0; orientation < 2; orientation++) {
+        if (tex->mtl_depth_read_data[orientation] && ctx && ctx->mtl_funcs.mtlDeleteMTLObj) {
+            ctx->mtl_funcs.mtlDeleteMTLObj(ctx, tex->mtl_depth_read_data[orientation]);
+        }
+        tex->mtl_depth_read_data[orientation] = NULL;
+        tex->mtl_depth_read_version[orientation] = 0u;
+    }
+    if (tex->mtl_depth_compare_data && ctx && ctx->mtl_funcs.mtlDeleteMTLObj) {
+        ctx->mtl_funcs.mtlDeleteMTLObj(ctx, tex->mtl_depth_compare_data);
+    }
+    tex->mtl_depth_compare_data = NULL;
+    tex->mtl_depth_compare_version = 0u;
     tex->mtl_gl_sampled_width = 0u;
     tex->mtl_gl_sampled_height = 0u;
     tex->mtl_gl_sampled_format = 0u;
@@ -1056,9 +1068,8 @@ void mglDeleteTextures(GLMContext ctx, GLsizei n, const GLuint *textures)
             /* OpenGL spec: when a texture is deleted, it is detached from any
              * framebuffer it is bound to.  MGL stores raw Texture* pointers in
              * FBOAttachment.buf.tex; without clearing them here the pointers
-             * become dangling after free(tex) below, causing use-after-free
-             * crashes in later draw calls that scan FBO attachments (e.g.
-             * mglFindFramebufferColorTexturePairedWithDepth). */
+             * become dangling after free(tex) below and can cause use-after-free
+             * crashes in later framebuffer attachment scans. */
             mglHashTableForEach(&STATE(framebuffer_table),
                                 mglDetachTextureFromFramebuffers, tex);
 
@@ -5159,7 +5170,8 @@ void mglCopyTexImage2D(GLMContext ctx, GLenum target, GLint level, GLenum intern
     }
 
     // Copy from framebuffer to texture
-    mglFlushPendingDrawsBeforeTextureWrite(ctx, tex);
+    /* Framebuffer copy also reads pending source render-target writes. */
+    mglFlushPendingDraws(ctx);
 
     /* MGL_SYNC_STRICT: 强制 full flush + commit + waitUntilCompleted，用于排查回归 */
     if (ctx->sync_strict) {
@@ -5192,7 +5204,8 @@ void mglCopyTexSubImage1D(GLMContext ctx, GLenum target, GLint level, GLint xoff
         return;
     }
 
-    mglFlushPendingDrawsBeforeTextureWrite(ctx, tex);
+    /* Framebuffer copy also reads pending source render-target writes. */
+    mglFlushPendingDraws(ctx);
 
     /* MGL_SYNC_STRICT: 强制 full flush + commit + waitUntilCompleted，用于排查回归 */
     if (ctx->sync_strict) {
@@ -5253,7 +5266,8 @@ void mglCopyTexSubImage2D(GLMContext ctx, GLenum target, GLint level, GLint xoff
     }
 
     // This copies from the current read framebuffer to the texture
-    mglFlushPendingDrawsBeforeTextureWrite(ctx, tex);
+    /* Framebuffer copy also reads pending source render-target writes. */
+    mglFlushPendingDraws(ctx);
 
     /* MGL_SYNC_STRICT: 强制 full flush + commit + waitUntilCompleted，用于排查回归 */
     if (ctx->sync_strict) {
@@ -5292,7 +5306,8 @@ void mglCopyTexSubImage3D(GLMContext ctx, GLenum target, GLint level, GLint xoff
         return;
     }
 
-    mglFlushPendingDrawsBeforeTextureWrite(ctx, tex);
+    /* Framebuffer copy also reads pending source render-target writes. */
+    mglFlushPendingDraws(ctx);
 
     /* MGL_SYNC_STRICT: 强制 full flush + commit + waitUntilCompleted，用于排查回归 */
     if (ctx->sync_strict) {
@@ -5329,7 +5344,8 @@ void mglCopyTextureSubImage1D(GLMContext ctx, GLuint texture, GLint level, GLint
         return;
     }
 
-    mglFlushPendingDrawsBeforeTextureWrite(ctx, tex);
+    /* Framebuffer copy also reads pending source render-target writes. */
+    mglFlushPendingDraws(ctx);
 
     /* MGL_SYNC_STRICT: 强制 full flush + commit + waitUntilCompleted，用于排查回归 */
     if (ctx->sync_strict) {
@@ -5371,7 +5387,8 @@ void mglCopyTextureSubImage2D(GLMContext ctx, GLuint texture, GLint level, GLint
             ERROR_RETURN(GL_INVALID_OPERATION);
             return;
         }
-        mglFlushPendingDrawsBeforeTextureWrite(ctx, tex);
+        /* Framebuffer copy also reads pending source render-target writes. */
+        mglFlushPendingDraws(ctx);
 
         /* MGL_SYNC_STRICT: 强制 full flush + commit + waitUntilCompleted，用于排查回归 */
         if (ctx->sync_strict) {
@@ -5418,7 +5435,8 @@ void mglCopyTextureSubImage3D(GLMContext ctx, GLuint texture, GLint level, GLint
         return;
     }
 
-    mglFlushPendingDrawsBeforeTextureWrite(ctx, tex);
+    /* Framebuffer copy also reads pending source render-target writes. */
+    mglFlushPendingDraws(ctx);
 
     /* MGL_SYNC_STRICT: 强制 full flush + commit + waitUntilCompleted，用于排查回归 */
     if (ctx->sync_strict) {
@@ -5542,6 +5560,9 @@ void mglGetTexImage(GLMContext ctx, GLenum target, GLint level, GLenum format, G
         ERROR_RETURN(GL_INVALID_ENUM);
         return;
     }
+
+    /* Resolve deferred texture writes before choosing CPU/GPU readback. */
+    mglFlushPendingDrawsForTexture(ctx, tex);
 
     TextureLevel *lvl = &tex->faces[slice].levels[level];
     if (!lvl || !lvl->complete) {

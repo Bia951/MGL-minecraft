@@ -24,6 +24,9 @@
  */
 
 #import "mgl_sampler_compat.h"
+#include "mgl_uniform_reflection.h"
+#include "mgl_msl_compat.h"
+#include "mgl_trace_strategy.h"
 #import <Foundation/Foundation.h>
 #import "spirv_cross_c.h"
 #include <string.h>
@@ -126,39 +129,15 @@ bool mglProgramNeedsBindingTrace(Program *program)
         return false;
     }
 
-    return mglProgramHasAnyResourceName(program, "ChunkSection") ||
-           mglProgramHasAnyResourceName(program, "Sampler1") ||
-           mglProgramHasAnyResourceName(program, "Sampler2");
+    return mglTraceLogIsEnabled() &&
+           (mglTraceLogResourcesVerbose() || mglTraceLogProgramListContains(program->name));
 }
 
 /* === Sampler-like resource classification === */
 
-bool mglRendererSamplerNameLooksSamplerLike(const char *name)
+bool mglRendererResourceLooksSamplerLike(const SpirvResource *res, int type)
 {
-    return name &&
-           (strstr(name, "Sampler") ||
-            !strcmp(name, "CloudFaces"));
-}
-
-bool mglRendererResourceLooksSamplerLike(const SpirvResource *res, int resType)
-{
-    if (!res) {
-        return false;
-    }
-
-    switch (resType) {
-        case SPVC_RESOURCE_TYPE_SAMPLED_IMAGE:
-        case SPVC_RESOURCE_TYPE_SEPARATE_IMAGE:
-        case SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS:
-        case SPVC_RESOURCE_TYPE_STORAGE_IMAGE:
-            return true;
-        case SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT:
-            return res->image_dim != 0u ||
-                   res->uniform_location >= 0x4000 ||
-                   mglRendererSamplerNameLooksSamplerLike(res->name);
-        default:
-            return false;
-    }
+    return mglProgramResourceLooksSamplerLike(res, type);
 }
 
 SpirvResource *mglFindSamplerResourceForMetalBinding(Program *program,
@@ -192,26 +171,28 @@ SpirvResource *mglFindSamplerResourceForMetalBinding(Program *program,
     return NULL;
 }
 
-/* Resolves the GL texture unit that `res` (in `stage` of `program`) samples,
- * mirroring MGLRenderer -textureUnitForSampledResource:metalBinding:stage:
- * but operating purely on the Program struct.  Returns the resolved unit
- * (0-based), or -1 if the resource is not sampler-like. */
-static GLint mglResolveSamplerResourceUnit(Program *program,
-                                           SpirvResource *res,
-                                           int stage,
-                                           int resType)
+/* Shared unit precedence for draw-time binding and hazard tracking. */
+GLint mglResolveSamplerTextureUnit(Program *program,
+                                  const SpirvResource *resource,
+                                  GLuint metalBinding,
+                                  int stage)
 {
-    if (!program || !res) return -1;
-    if (!mglRendererResourceLooksSamplerLike(res, resType)) return -1;
-
-    /* 1. Per-resource explicit assignment (glUniform1i). */
-    if (res->sampler_unit_explicit &&
-        res->sampler_unit >= 0 &&
-        res->sampler_unit < (GLint)TEXTURE_UNITS) {
-        return res->sampler_unit;
+    if (!program) {
+        return resource && resource->sampler_unit >= 0 &&
+               resource->sampler_unit < (GLint)TEXTURE_UNITS
+            ? resource->sampler_unit
+            : (GLint)metalBinding;
     }
 
-    GLuint metalBinding = res->binding;
+    /* Explicit glUniform1i state on the resource wins over binding-level
+     * defaults. Non-explicit reflected sampler values are only a fallback,
+     * after stage/global sampler-unit state, matching the draw-time resolver. */
+    if (resource && resource->sampler_unit_explicit &&
+        resource->sampler_unit >= 0 &&
+        resource->sampler_unit < (GLint)TEXTURE_UNITS) {
+        return resource->sampler_unit;
+    }
+
     if (metalBinding >= TEXTURE_UNITS) {
         return (GLint)metalBinding;
     }
@@ -222,7 +203,7 @@ static GLint mglResolveSamplerResourceUnit(Program *program,
         : false;
     bool globalExplicit = (program->sampler_units_explicit[metalBinding] == GL_TRUE);
 
-    /* 2. Stage array explicit. */
+    /* 2. Explicit stage array. */
     GLint unit = stageValid
         ? program->sampler_units_by_stage[stage][metalBinding]
         : program->sampler_units[metalBinding];
@@ -230,13 +211,13 @@ static GLint mglResolveSamplerResourceUnit(Program *program,
         return unit;
     }
 
-    /* 3. Global array explicit. */
+    /* 3. Explicit global array. */
     unit = program->sampler_units[metalBinding];
     if (globalExplicit && unit >= 0 && unit < (GLint)TEXTURE_UNITS) {
         return unit;
     }
 
-    /* 4. Default unit (stage then global fallback). */
+    /* 4. Non-explicit defaults (stage then global fallback). */
     GLint defaultUnit = stageValid
         ? program->sampler_units_by_stage[stage][metalBinding]
         : program->sampler_units[metalBinding];
@@ -245,10 +226,10 @@ static GLint mglResolveSamplerResourceUnit(Program *program,
     }
 
     /* 5. Per-resource non-explicit (set by reflection, not glUniform1i). */
-    if (!res->sampler_unit_explicit &&
-        res->sampler_unit >= 0 &&
-        res->sampler_unit < (GLint)TEXTURE_UNITS) {
-        return res->sampler_unit;
+    if (resource && !resource->sampler_unit_explicit &&
+        resource->sampler_unit >= 0 &&
+        resource->sampler_unit < (GLint)TEXTURE_UNITS) {
+        return resource->sampler_unit;
     }
 
     if (defaultUnit >= 0 && defaultUnit < (GLint)TEXTURE_UNITS) {
@@ -257,6 +238,19 @@ static GLint mglResolveSamplerResourceUnit(Program *program,
 
     /* 6. OpenGL default is unit 0. */
     return 0;
+}
+
+/* Resolves the GL texture unit that `res` samples after applying sampler-like
+ * resource filtering for the hazard tracker. */
+GLint mglSamplerResourceTextureUnit(Program *program,
+                                   const SpirvResource *res,
+                                   int stage,
+                                   int resType)
+{
+    if (!program || !res || !mglRendererResourceLooksSamplerLike(res, resType)) {
+        return -1;
+    }
+    return mglResolveSamplerTextureUnit(program, res, res->binding, stage);
 }
 
 bool mglProgramSamplesTextureUnit(Program *program, GLuint unit)
@@ -277,7 +271,7 @@ bool mglProgramSamplesTextureUnit(Program *program, GLuint unit)
             if (resType < 0 || resType >= _MAX_SPIRV_RES) continue;
             SpirvResourceList *resources = &program->spirv_resources_list[stage][resType];
             for (GLuint i = 0; resources->list && i < resources->count; i++) {
-                GLint resolved = mglResolveSamplerResourceUnit(program,
+                GLint resolved = mglSamplerResourceTextureUnit(program,
                                                                &resources->list[i],
                                                                stage,
                                                                resType);
@@ -289,4 +283,81 @@ bool mglProgramSamplesTextureUnit(Program *program, GLuint unit)
     }
 
     return false;
+}
+
+static uint16_t mglResourceTextureTargetMask(const SpirvResource *res, int type)
+{
+    const uint16_t allTargets = (1u << _MAX_TEXTURE_TYPES) - 1u;
+    /* Storage images have a different GL binding namespace. Keep the old
+     * conservative texture-unit treatment until image hazards are unified. */
+    if (type == SPVC_RESOURCE_TYPE_STORAGE_IMAGE ||
+        (type == SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT && !res->has_image_type)) {
+        return allTargets;
+    }
+    int target;
+    switch ((SpvDim)res->image_dim) {
+        case SpvDim1D:
+            target = res->image_arrayed ? _TEXTURE_1D_ARRAY : _TEXTURE_1D;
+            break;
+        case SpvDim2D:
+            target = res->image_multisampled
+                ? (res->image_arrayed ? _TEXTURE_2D_MULTISAMPLE_ARRAY : _TEXTURE_2D_MULTISAMPLE)
+                : (res->image_arrayed ? _TEXTURE_2D_ARRAY : _TEXTURE_2D);
+            break;
+        case SpvDim3D: target = _TEXTURE_3D; break;
+        case SpvDimCube:
+            target = res->image_arrayed ? _TEXTURE_CUBE_MAP_ARRAY : _TEXTURE_CUBE_MAP;
+            break;
+        case SpvDimRect: target = _TEXTURE_RECTANGLE; break;
+        case SpvDimBuffer: target = _TEXTURE_BUFFER_TARGET; break;
+        default: return allTargets;
+    }
+    return (uint16_t)(1u << target);
+}
+
+static void mglBuildProgramTextureTargetMasks(Program *program, int stage,
+                                             uint16_t masks[TEXTURE_UNITS])
+{
+    static const int types[] = {
+        SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT, SPVC_RESOURCE_TYPE_SAMPLED_IMAGE,
+        SPVC_RESOURCE_TYPE_SEPARATE_IMAGE, SPVC_RESOURCE_TYPE_STORAGE_IMAGE
+    };
+    /* Separate sampler objects carry filtering state, not a texture target.
+     * Their image resources supply the texture dependencies. */
+    for (size_t t = 0; t < sizeof(types) / sizeof(types[0]); t++) {
+        int type = types[t];
+        SpirvResourceList *list = &program->spirv_resources_list[stage][type];
+        for (GLuint i = 0; list->list && i < list->count; i++) {
+            SpirvResource *res = &list->list[i];
+            if (!mglRendererResourceLooksSamplerLike(res, type)) continue;
+            /* Match the draw-time binding decision: a reflected resource
+             * removed from the executable MSL cannot read its GL binding. */
+            if (mglShouldSkipStageTextureResource(program, stage, type, res)) continue;
+            uint16_t targets = mglResourceTextureTargetMask(res, type);
+            GLuint count = res->gl_array_size > 1 ? (GLuint)res->gl_array_size : 1u;
+            for (GLuint element = 0; element < count && element < TEXTURE_UNITS; element++) {
+                GLuint binding = res->binding + element;
+                if (binding >= TEXTURE_UNITS) break;
+                GLint unit = mglResolveSamplerTextureUnit(program, element ? NULL : res, binding, stage);
+                if (unit >= 0 && unit < TEXTURE_UNITS) masks[unit] |= targets;
+            }
+        }
+    }
+}
+
+void mglAccumulateProgramTextureTargetMasks(Program *program, int stage,
+                                            uint16_t masks[TEXTURE_UNITS])
+{
+    if (!program || stage < 0 || stage >= _MAX_SHADER_TYPES) return;
+
+    if (!program->sampler_texture_target_masks_valid[stage]) {
+        uint16_t *cached = program->sampler_texture_target_masks[stage];
+        memset(cached, 0, sizeof(program->sampler_texture_target_masks[stage]));
+        mglBuildProgramTextureTargetMasks(program, stage, cached);
+        program->sampler_texture_target_masks_valid[stage] = GL_TRUE;
+    }
+
+    for (GLuint unit = 0; unit < TEXTURE_UNITS; unit++) {
+        masks[unit] |= program->sampler_texture_target_masks[stage][unit];
+    }
 }

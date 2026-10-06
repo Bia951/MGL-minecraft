@@ -48,6 +48,9 @@ static JavaVM *mglGetJVM(void)
 /* All MGL_ config keys that can be set via -D JVM flags.  Keep in sync
  * with getenv("MGL_...") call sites.  Real env vars take priority. */
 static const char *kMGLConfigKeys[] = {
+    "MGL_RESOURCE_BINDING_PLAN",
+    "MGL_PACKED_UNIFORM_REUSE",
+    "MGL_NATIVE_DEPTH_SAMPLING",
     "MGL_PERF_SUMMARY",
     "MGL_PERF_SUMMARY_EVERY",
     "MGL_PERF_SUMMARY_UNSAFE_EVERY_FRAME",

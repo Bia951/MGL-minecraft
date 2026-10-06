@@ -42,6 +42,7 @@
 #include <dispatch/dispatch.h>
 
 #import "MGLRenderer_Private.h"
+#include "mgl_texel_buffer.h"
 #import "MGLRenderer+ArgumentBuffer_Private.h"
 #import "mgl.h"
 #import "mgl_sampler_compat.h"
@@ -122,6 +123,141 @@ static MTLPixelFormat mglMetalLayerPixelFormatForContext(GLMContext drawCtx)
     return fallback;
 }
 
+#define MGL_MAX_PACKED_STRUCT_BUFFERS 256
+static Buffer s_packedStructBuffers[MGL_MAX_PACKED_STRUCT_BUFFERS];
+static int s_packedStructBufferIdx = 0;
+
+#define MGL_PACKED_ARENA_POOL_MAX_ENTRIES 8u
+#define MGL_PACKED_ARENA_POOL_MAX_BYTES (32u * 1024u * 1024u)
+
+@implementation MGLPackedUniformArenaLease
+- (instancetype)init
+{
+    self = [super init];
+    if (self) atomic_init(&available, false);
+    return self;
+}
+@end
+
+@implementation MGLPackedUniformArenaLeaseGroup
+- (instancetype)init
+{
+    self = [super init];
+    if (self) {
+        entries = [NSMutableArray array];
+        atomic_init(&returned, false);
+    }
+    return self;
+}
+
+- (void)addLease:(MGLPackedUniformArenaLease *)lease
+{
+    if (!lease) return;
+    @synchronized (self) {
+        if (!atomic_load_explicit(&returned, memory_order_acquire)) {
+            [entries addObject:lease];
+        }
+    }
+}
+
+- (void)returnLeases
+{
+    bool expected = false;
+    if (!atomic_compare_exchange_strong_explicit(&returned, &expected, true,
+                                                  memory_order_acq_rel,
+                                                  memory_order_acquire)) {
+        return;
+    }
+    @synchronized (self) {
+        for (MGLPackedUniformArenaLease *lease in entries) {
+            if (lease.pooled) {
+                atomic_store_explicit(&lease->available, true, memory_order_release);
+            }
+        }
+        [entries removeAllObjects];
+    }
+}
+
+- (void)dealloc
+{
+    [self returnLeases];
+}
+@end
+
+static BOOL mglPackedArenaTraceEnabled(void)
+{
+    static dispatch_once_t onceToken;
+    static BOOL enabled = NO;
+    dispatch_once(&onceToken, ^{
+        const char *value = getenv("MGL_PACKED_ARENA_TRACE");
+        enabled = value && value[0] && strcmp(value, "0") != 0;
+    });
+    return enabled;
+}
+
+static BOOL mglPlainUniformArenaEnabled(void)
+{
+    static dispatch_once_t once;
+    static BOOL enabled = NO;
+    dispatch_once(&once, ^{
+        const char *value = getenv("MGL_PLAIN_UNIFORM_ARENA");
+        enabled = value && value[0] && strcmp(value, "0") != 0;
+    });
+    return enabled;
+}
+
+static void mglPackedArenaRecordEvent(BOOL reused, NSUInteger capacity)
+{
+    if (!mglPerfSummaryEnabled() && !mglPackedArenaTraceEnabled()) return;
+    static _Atomic(uint64_t) reuseCount = 0;
+    static _Atomic(uint64_t) allocationCount = 0;
+    uint64_t reuse = atomic_load_explicit(&reuseCount, memory_order_relaxed);
+    uint64_t allocations = atomic_load_explicit(&allocationCount, memory_order_relaxed);
+    if (reused) reuse = atomic_fetch_add_explicit(&reuseCount, 1u, memory_order_relaxed) + 1u;
+    else allocations = atomic_fetch_add_explicit(&allocationCount, 1u, memory_order_relaxed) + 1u;
+    uint64_t total = reuse + allocations;
+    if (total <= 8u || (total % 256u) == 0u) {
+        if (mglPerfSummaryEnabled()) {
+            NSLog(@"MGL PERF: packed_arena event=%s reuse=%llu new=%llu capacity=%lu",
+                  reused ? "reuse" : "new",
+                  (unsigned long long)reuse,
+                  (unsigned long long)allocations,
+                  (unsigned long)capacity);
+        } else {
+            fprintf(stderr, "MGL PACKED ARENA event=%s reuse=%llu new=%llu capacity=%lu\n",
+                        reused ? "reuse" : "new",
+                        (unsigned long long)reuse,
+                        (unsigned long long)allocations,
+                        (unsigned long)capacity);
+        }
+    }
+}
+
+static void mglPlainUniformCacheRecordEvent(BOOL hit)
+{
+    if (!mglPerfSummaryEnabled() && !mglPackedArenaTraceEnabled()) return;
+    static _Atomic(uint64_t) hitCount = 0;
+    static _Atomic(uint64_t) missCount = 0;
+    uint64_t hits = atomic_load_explicit(&hitCount, memory_order_relaxed);
+    uint64_t misses = atomic_load_explicit(&missCount, memory_order_relaxed);
+    if (hit) hits = atomic_fetch_add_explicit(&hitCount, 1u, memory_order_relaxed) + 1u;
+    else misses = atomic_fetch_add_explicit(&missCount, 1u, memory_order_relaxed) + 1u;
+    uint64_t total = hits + misses;
+    if (total <= 8u || (total % 65536u) == 0u) {
+        if (mglPerfSummaryEnabled()) {
+            NSLog(@"MGL PERF: plain_uniform_arena_cache event=%s hits=%llu misses=%llu",
+                  hit ? "hit" : "miss",
+                  (unsigned long long)hits,
+                  (unsigned long long)misses);
+        } else {
+            fprintf(stderr, "MGL PLAIN UNIFORM ARENA CACHE event=%s hits=%llu misses=%llu\n",
+                        hit ? "hit" : "miss",
+                        (unsigned long long)hits,
+                        (unsigned long long)misses);
+        }
+    }
+}
+
 /* mglMetalCopyTextureBytesToBGRA8 moved to mgl_readback.m */
 void mglMetalCopyRows(const uint8_t *src,
                       NSUInteger srcBytesPerRow,
@@ -161,27 +297,6 @@ static void mglRendererDiagnosticBuildMarker(void)
     mglTraceLog("MGL DIAG BUILD marker=gui-rt-cull-v8-20260608 built=%s %s renderer-loaded",
                 __DATE__,
                 __TIME__);
-}
-
-// CRITICAL SECURITY: Safe Metal object validation helper
-static inline id<NSObject> SafeMetalBridge(void *ptr, Class expectedClass, const char *objectName) {
-    if (!ptr) {
-        NSLog(@"MGL SECURITY ERROR: NULL pointer for %s", objectName);
-        return nil;
-    }
-
-    id<NSObject> obj = (__bridge id<NSObject>)(ptr);
-    if (!obj) {
-        NSLog(@"MGL SECURITY ERROR: Metal bridge cast returned nil for %s", objectName);
-        return nil;
-    }
-
-    if (expectedClass && [obj isKindOfClass:expectedClass] == NO) {
-        NSLog(@"MGL SECURITY ERROR: Metal object is not valid %s (got %@)", objectName, NSStringFromClass([obj class]));
-        return nil;
-    }
-
-    return obj;
 }
 
 NSRange mglRendererFindMSLEntryParameterClose(NSString *msl, const char *entryPoint)
@@ -1108,121 +1223,6 @@ void mglNormalizePipelineDepthStencilFormats(MTLRenderPipelineDescriptor *desc, 
  * mglTextureDataKindName, and mglRendererGLInternalFormatLooksDepthOrStencil
  * now live in mgl_texture_compat.m — see mgl_texture_compat.h. */
 
-BOOL mglRendererTextureLooksRecoverableSampled2D(GLMContext glctx,
-                                                        Texture *tex,
-                                                        MTLTextureType expectedType,
-                                                        MGLTextureDataKind expectedKind)
-{
-    if (!glctx || !tex) {
-        return NO;
-    }
-    if (expectedType != 0 && expectedType != MTLTextureType2D) {
-        return NO;
-    }
-    if (!mglRendererObjectPointerLikelyValid(tex) ||
-        !mglRendererPointerInHashTable(&glctx->state.texture_table, tex) ||
-        !mglPointerRangeIsReadable(tex, sizeof(*tex))) {
-        return NO;
-    }
-    if (tex->target != GL_TEXTURE_2D ||
-        tex->index != _TEXTURE_2D ||
-        tex->is_render_target ||
-        mglRendererGLInternalFormatLooksDepthOrStencil(tex->internalformat)) {
-        return NO;
-    }
-
-    TextureLevel *level0 = mglTraceTextureBaseLevel(tex);
-    if (!level0 ||
-        !level0->complete ||
-        (!level0->ever_written && !level0->has_initialized_data)) {
-        return NO;
-    }
-
-    id<MTLTexture> mtlTexture = tex->mtl_data ? (__bridge id<MTLTexture>)(tex->mtl_data) : nil;
-    if (mtlTexture) {
-        if (mglMetalPixelFormatIsDepthOrStencil(mtlTexture.pixelFormat) ||
-            !mglTexturePixelFormatCompatibleWithExpectedDataKind(mtlTexture.pixelFormat, expectedKind)) {
-            return NO;
-        }
-        if (expectedType != 0 && mtlTexture.textureType != expectedType) {
-            return NO;
-        }
-    }
-
-    return YES;
-}
-
-BOOL mglRendererTextureLooksLikeSampledColor2D(GLMContext glctx,
-                                                      Texture *tex)
-{
-    if (!glctx || !tex) {
-        return NO;
-    }
-    if (!mglRendererObjectPointerLikelyValid(tex) ||
-        !mglRendererPointerInHashTable(&glctx->state.texture_table, tex) ||
-        !mglPointerRangeIsReadable(tex, sizeof(*tex))) {
-        return NO;
-    }
-    if (tex->target != GL_TEXTURE_2D ||
-        tex->index != _TEXTURE_2D ||
-        mglRendererGLInternalFormatLooksDepthOrStencil(tex->internalformat)) {
-        return NO;
-    }
-
-    return YES;
-}
-
-BOOL mglRendererGLSampledCopyLooksUsable(Texture *tex,
-                                                MTLTextureType expectedType,
-                                                MGLTextureDataKind expectedKind,
-                                                BOOL allowPreviousWriteVersion,
-                                                id<MTLTexture> *copyOut,
-                                                BOOL *usedPreviousWriteVersionOut)
-{
-    if (copyOut) {
-        *copyOut = nil;
-    }
-    if (usedPreviousWriteVersionOut) {
-        *usedPreviousWriteVersionOut = NO;
-    }
-    if (!tex || !tex->mtl_gl_sampled_data) {
-        return NO;
-    }
-
-    id<MTLTexture> sampledCopy = (__bridge id<MTLTexture>)(tex->mtl_gl_sampled_data);
-    if (!sampledCopy ||
-        mglMetalPixelFormatIsDepthOrStencil(sampledCopy.pixelFormat) ||
-        !mglTexturePixelFormatCompatibleWithExpectedDataKind(sampledCopy.pixelFormat, expectedKind) ||
-        (expectedType != 0 && sampledCopy.textureType != expectedType)) {
-        return NO;
-    }
-    if (tex->mtl_gl_sampled_width != (GLuint)sampledCopy.width ||
-        tex->mtl_gl_sampled_height != (GLuint)sampledCopy.height ||
-        tex->mtl_gl_sampled_format != (GLuint)sampledCopy.pixelFormat) {
-        return NO;
-    }
-
-    BOOL exactVersion =
-        tex->mtl_gl_sampled_write_version != 0u &&
-        tex->mtl_gl_sampled_write_version == tex->mtl_render_target_write_version;
-    BOOL previousVersion =
-        allowPreviousWriteVersion &&
-        tex->mtl_gl_sampled_write_version != 0u &&
-        tex->mtl_render_target_write_version != 0u &&
-        tex->mtl_gl_sampled_write_version + 1u == tex->mtl_render_target_write_version;
-    if (!exactVersion && !previousVersion) {
-        return NO;
-    }
-
-    if (copyOut) {
-        *copyOut = sampledCopy;
-    }
-    if (usedPreviousWriteVersionOut) {
-        *usedPreviousWriteVersionOut = previousVersion;
-    }
-    return YES;
-}
-
 /* mglNowSeconds moved to MGLRenderer_Private.h as static inline */
 
 void mglLogLoopHeartbeat(const char *tag,
@@ -1555,171 +1555,6 @@ BOOL mglRendererPointerInHashTable(HashTable *table, const void *ptr)
            mglHashTableContainsData(table, ptr);
 }
 
-Texture *mglFindFramebufferColorTexturePairedWithDepth(GLMContext glctx,
-                                                              Texture *depthTexture,
-                                                              GLuint *fboNameOut)
-{
-    if (fboNameOut) {
-        *fboNameOut = 0u;
-    }
-    if (!glctx || !depthTexture) {
-        return NULL;
-    }
-
-    Framebuffer *currentFbo = glctx->state.framebuffer;
-    if (currentFbo &&
-        mglRendererObjectPointerLikelyValid(currentFbo) &&
-        mglPointerRangeIsReadable(currentFbo, sizeof(*currentFbo))) {
-        BOOL depthMatches =
-            currentFbo->depth.buf.tex == depthTexture ||
-            currentFbo->stencil.buf.tex == depthTexture ||
-            currentFbo->depth.texture == depthTexture->name ||
-            currentFbo->stencil.texture == depthTexture->name;
-        if (depthMatches && (currentFbo->color_attachment_bitfield & 1u) != 0u) {
-            FBOAttachment *colorAttachment = &currentFbo->color_attachments[0];
-            Texture *colorTexture = colorAttachment->buf.tex;
-            if (!colorTexture && colorAttachment->texture != 0u) {
-                colorTexture = (Texture *)searchHashTable(&glctx->state.texture_table,
-                                                          colorAttachment->texture);
-            }
-            /* Validate raw pointer is still registered (see table-scan path). */
-            if (colorTexture) {
-                Texture *verified = (Texture *)searchHashTable(&glctx->state.texture_table,
-                                                                colorTexture->name);
-                if (verified != colorTexture) {
-                    colorAttachment->buf.tex = NULL;
-                    colorAttachment->texture = 0u;
-                    colorTexture = NULL;
-                }
-            }
-            if (colorTexture &&
-                colorTexture != depthTexture &&
-                mglRendererObjectPointerLikelyValid(colorTexture) &&
-                mglPointerRangeIsReadable(colorTexture, sizeof(*colorTexture)) &&
-                (!colorTexture->mtl_data ||
-                 !mglMetalPixelFormatIsDepthOrStencil([(__bridge id<MTLTexture>)colorTexture->mtl_data pixelFormat]))) {
-                if (fboNameOut) {
-                    *fboNameOut = currentFbo->name;
-                }
-                return colorTexture;
-            }
-        }
-    }
-
-    HashTable *table = &glctx->state.framebuffer_table;
-    if (!mglHashTableValidateStorage(table, "findPairedFramebufferColor") ||
-        !table->keys || !table->states || table->size == 0u) {
-        return NULL;
-    }
-
-    for (size_t slot = 0; slot < table->size; slot++) {
-        if (table->states[slot] != 1u || !table->keys[slot].data) {
-            continue;
-        }
-
-        Framebuffer *fbo = (Framebuffer *)table->keys[slot].data;
-        if (!mglRendererObjectPointerLikelyValid(fbo) ||
-            !mglPointerRangeIsReadable(fbo, sizeof(*fbo))) {
-            continue;
-        }
-
-        BOOL depthMatches =
-            fbo->depth.buf.tex == depthTexture ||
-            fbo->stencil.buf.tex == depthTexture ||
-            fbo->depth.texture == depthTexture->name ||
-            fbo->stencil.texture == depthTexture->name;
-        if (!depthMatches) {
-            continue;
-        }
-
-        FBOAttachment *colorAttachment = &fbo->color_attachments[0];
-        Texture *colorTexture = colorAttachment->buf.tex;
-        if (!colorTexture && colorAttachment->texture != 0u) {
-            colorTexture = (Texture *)searchHashTable(&glctx->state.texture_table,
-                                                      colorAttachment->texture);
-        }
-
-        /* Validate that the raw pointer is still registered in the texture
-         * table.  glDeleteTextures frees the Texture struct but stale raw
-         * pointers can survive in FBO attachments (and mglPointerRangeIsReadable
-         * cannot reliably detect freed-but-mapped malloc memory). */
-        if (colorTexture) {
-            Texture *verified = (Texture *)searchHashTable(&glctx->state.texture_table,
-                                                            colorTexture->name);
-            if (verified != colorTexture) {
-                /* Stale pointer — clear it and skip. */
-                colorAttachment->buf.tex = NULL;
-                colorAttachment->texture = 0u;
-                continue;
-            }
-        }
-
-        if (!colorTexture ||
-            colorTexture == depthTexture ||
-            !mglRendererObjectPointerLikelyValid(colorTexture) ||
-            !mglPointerRangeIsReadable(colorTexture, sizeof(*colorTexture))) {
-            continue;
-        }
-
-        if (colorTexture->mtl_data &&
-            mglMetalPixelFormatIsDepthOrStencil([(__bridge id<MTLTexture>)colorTexture->mtl_data pixelFormat])) {
-            continue;
-        }
-
-        if (fboNameOut) {
-            *fboNameOut = fbo->name;
-        }
-        return colorTexture;
-    }
-
-    return NULL;
-}
-
-BOOL mglCurrentDrawFramebufferUsesColorTexture(GLMContext glctx,
-                                                      Texture *texture,
-                                                      GLuint expectedFboName,
-                                                      NSUInteger *attachmentIndexOut)
-{
-    if (attachmentIndexOut) {
-        *attachmentIndexOut = MAX_COLOR_ATTACHMENTS;
-    }
-    if (!glctx || !texture) {
-        return NO;
-    }
-
-    Framebuffer *fbo = glctx->state.framebuffer;
-    if (!fbo ||
-        !mglRendererObjectPointerLikelyValid(fbo) ||
-        !mglPointerRangeIsReadable(fbo, sizeof(*fbo))) {
-        return NO;
-    }
-    if (expectedFboName != 0u && fbo->name != expectedFboName) {
-        return NO;
-    }
-
-    GLsizei drawBufferCount = mglMetalDrawBufferCount(glctx);
-    for (GLsizei i = 0; i < drawBufferCount; i++) {
-        GLuint attachmentIndex = MAX_COLOR_ATTACHMENTS;
-        if (!mglMetalResolveFboDrawAttachmentIndex(glctx,
-                                                   mglMetalDrawBufferAt(glctx, (GLuint)i),
-                                                   &attachmentIndex) ||
-            attachmentIndex >= MAX_COLOR_ATTACHMENTS ||
-            ((fbo->color_attachment_bitfield >> attachmentIndex) & 1u) == 0u) {
-            continue;
-        }
-
-        FBOAttachment *attachment = &fbo->color_attachments[attachmentIndex];
-        if (attachment->buf.tex == texture || attachment->texture == texture->name) {
-            if (attachmentIndexOut) {
-                *attachmentIndexOut = attachmentIndex;
-            }
-            return YES;
-        }
-    }
-
-    return NO;
-}
-
 static void mglRendererDropCurrentVAO(GLMContext ctx)
 {
     if (!ctx) {
@@ -1742,6 +1577,20 @@ VertexArray *mglRendererGetValidatedVAO(GLMContext ctx, const char *where)
     VertexArray *vao = ctx->state.vao;
     if (!vao) {
         return NULL;
+    }
+
+    /* Replay snapshots are allocated and owned by the active command batch.
+     * Equality is checked before touching the candidate; only this exact
+     * context-owned pointer may bypass table and VM-range validation. */
+    if (vao == ctx->trusted_replay_vao) {
+        if (vao->magic != MGL_VAO_MAGIC) {
+            NSLog(@"MGL VAO INVALID in %s: trusted replay vao=%p magic=0x%x",
+                  where ? where : "unknown", vao, vao->magic);
+            ctx->trusted_replay_vao = NULL;
+            mglRendererDropCurrentVAO(ctx);
+            return NULL;
+        }
+        return vao;
     }
 
     if (!mglRendererObjectPointerLikelyValid(vao)) {
@@ -1803,8 +1652,37 @@ Buffer *mglRendererGetValidatedBuffer(GLMContext ctx, Buffer *candidate, const c
         return NULL;
     }
 
+    /* Packed struct wrappers live in a renderer-owned static object pool,
+     * outside buffer_table. Confirm pool identity using the pointer value
+     * before reading the object, then avoid vm_region_64 for these known-safe
+     * wrappers. */
+    uintptr_t candidateAddress = (uintptr_t)candidate;
+    uintptr_t packedPoolStart = (uintptr_t)&s_packedStructBuffers[0];
+    uintptr_t packedPoolOffset = candidateAddress - packedPoolStart;
+    if (candidateAddress >= packedPoolStart &&
+        packedPoolOffset < sizeof(s_packedStructBuffers) &&
+        packedPoolOffset % sizeof(Buffer) == 0u) {
+        if (candidate->transient_batch_buffer) {
+            return candidate;
+        }
+        NSLog(@"MGL BUFFER INVALID in %s: slot=%lu candidate=%p (uninitialized packed wrapper)",
+              where ? where : "unknown", (unsigned long)slot, candidate);
+        return NULL;
+    }
+
     /* Fast path: hashtable membership implies memory is valid (table holds
      * a live reference), so we can skip the vm_region_64 syscall. */
+    /* Recorded uniform versions own contiguous wrapper pools. Confirm their
+     * identity without dereferencing an untrusted candidate pointer. */
+    for (unsigned i = 0; ctx && i < 2u; i++) {
+        MGLPlainUniformVersion *version = ctx->trusted_replay_uniform_versions[i];
+        if (!version || !version->buffers) continue;
+        uintptr_t start = (uintptr_t)version->buffers;
+        uintptr_t offset = candidateAddress - start;
+        if (candidateAddress >= start &&
+            offset < (size_t)version->buffer_count * sizeof(Buffer) &&
+            offset % sizeof(Buffer) == 0u) return candidate;
+    }
     if (ctx && mglRendererPointerInHashTable(&ctx->state.buffer_table, candidate)) {
         return candidate;
     }
@@ -1945,84 +1823,16 @@ NSUInteger mglRendererBuildCurrentVertexAttribBytes(GLMContext ctx,
         return 0u;
     }
 
-    bzero(bytes, 16);
     const CurrentVertexAttrib *current = &ctx->state.current_vertex_attrib[attribute];
-    Program *vertexProgram = mglResolveProgramForStageFromState(ctx, _VERTEX_SHADER);
-    SpirvResource *input = mglRendererProgramVertexAttribResource(vertexProgram, attribute);
-    if (input && input->gl_type == GL_INT_VEC3 && attrib->type == GL_FLOAT) {
-        memcpy(bytes, current->i, sizeof(current->i));
-        return sizeof(current->i);
-    }
-    GLuint size = attrib->size;
-    if (size == 0u || size > 4u) {
-        size = 4u;
-    }
-
-    switch (attrib->type) {
-        case GL_BYTE:
-        case GL_SHORT:
-        case GL_INT:
-        {
-            size_t componentBytes = (attrib->type == GL_BYTE) ? sizeof(int8_t) :
-                                    (attrib->type == GL_SHORT) ? sizeof(int16_t) :
-                                    sizeof(int32_t);
-            if (componentBytes == 0u || componentBytes * size > 16u) {
-                return 0u;
-            }
-            for (GLuint i = 0; i < size; i++) {
-                GLint value = current->i[i];
-                if (attrib->type == GL_BYTE) {
-                    int8_t packed = (int8_t)value;
-                    memcpy(bytes + i * componentBytes, &packed, componentBytes);
-                } else if (attrib->type == GL_SHORT) {
-                    int16_t packed = (int16_t)value;
-                    memcpy(bytes + i * componentBytes, &packed, componentBytes);
-                } else {
-                    int32_t packed = (int32_t)value;
-                    memcpy(bytes + i * componentBytes, &packed, componentBytes);
-                }
-            }
-            return 16u;
-        }
-        case GL_UNSIGNED_BYTE:
-        case GL_UNSIGNED_SHORT:
-        case GL_UNSIGNED_INT:
-        {
-            size_t componentBytes = (attrib->type == GL_UNSIGNED_BYTE) ? sizeof(uint8_t) :
-                                    (attrib->type == GL_UNSIGNED_SHORT) ? sizeof(uint16_t) :
-                                    sizeof(uint32_t);
-            if (componentBytes == 0u || componentBytes * size > 16u) {
-                return 0u;
-            }
-            for (GLuint i = 0; i < size; i++) {
-                GLuint value = current->u[i];
-                if (attrib->type == GL_UNSIGNED_BYTE) {
-                    uint8_t packed = (uint8_t)value;
-                    memcpy(bytes + i * componentBytes, &packed, componentBytes);
-                } else if (attrib->type == GL_UNSIGNED_SHORT) {
-                    uint16_t packed = (uint16_t)value;
-                    memcpy(bytes + i * componentBytes, &packed, componentBytes);
-                } else {
-                    uint32_t packed = (uint32_t)value;
-                    memcpy(bytes + i * componentBytes, &packed, componentBytes);
-                }
-            }
-            return 16u;
-        }
-        case GL_DOUBLE:
-        case GL_FLOAT:
-        default:
-        {
-            GLfloat packed[4] = {
-                current->f[0],
-                current->f[1],
-                current->f[2],
-                current->f[3],
-            };
-            memcpy(bytes, packed, sizeof(packed));
-            return sizeof(packed);
-        }
-    }
+    Program *program = mglResolveProgramForStageFromState(ctx, _VERTEX_SHADER);
+    SpirvResource *input = mglRendererProgramVertexAttribResource(program, attribute);
+    MGLVertexAttributePlan plan = mglVertexAttributePlan(attrib,
+        input ? input->gl_type : 0, true);
+    const void *values = plan.format == MTLVertexFormatInt4 ? (const void *)current->i :
+                         plan.format == MTLVertexFormatUInt4 ? (const void *)current->u :
+                         (const void *)current->f;
+    memcpy(bytes, values, 16);
+    return 16;
 }
 
 typedef enum MGLTCSStageInBaseType_t {
@@ -2507,156 +2317,232 @@ int mglRendererResolveVertexAttributeBufferIndex(GLMContext ctx,
 // Main class performing the rendering
 @implementation MGLRenderer
 
-MTLVertexFormat glTypeSizeToMtlType(GLuint type, GLuint size, bool normalized)
+- (id<MTLTexture>)depthReadTextureForObject:(Texture *)object program:(Program *)program
 {
-    switch(type)
-    {
-        case GL_UNSIGNED_BYTE:
-            if (normalized)
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatUCharNormalized;
-                    case 2: return MTLVertexFormatUChar2Normalized;
-                    case 3: return MTLVertexFormatUChar3Normalized;
-                    case 4: return MTLVertexFormatUChar4Normalized;
-                }
-            }
-            else
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatUChar;
-                    case 2: return MTLVertexFormatUChar2;
-                    case 3: return MTLVertexFormatUChar3;
-                    case 4: return MTLVertexFormatUChar4;
-                }
-            }
-            break;
+    if (!object || !object->mtl_data) {
+        return nil;
+    }
 
-        case GL_BYTE:
-            if (normalized)
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatCharNormalized;
-                    case 2: return MTLVertexFormatChar2Normalized;
-                    case 3: return MTLVertexFormatChar3Normalized;
-                    case 4: return MTLVertexFormatChar4Normalized;
-                }
-            }
-            else
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatChar;
-                    case 2: return MTLVertexFormatChar2;
-                    case 3: return MTLVertexFormatChar3;
-                    case 4: return MTLVertexFormatChar4;
-                }
-            }
-            break;
+    id<MTLTexture> source = (__bridge id<MTLTexture>)object->mtl_data;
+    if (!source ||
+        (source.textureType != MTLTextureType2D && source.textureType != MTLTextureType2DArray) ||
+        source.sampleCount != 1 ||
+        !mglMetalPixelFormatHasDepth(source.pixelFormat)) {
+        return nil;
+    }
 
-        case GL_UNSIGNED_SHORT:
-            if (normalized)
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatUShortNormalized;
-                    case 2: return MTLVertexFormatUShort2Normalized;
-                    case 3: return MTLVertexFormatUShort3Normalized;
-                    case 4: return MTLVertexFormatUShort4Normalized;
-                }
-            }
-            else
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatUShort;
-                    case 2: return MTLVertexFormatUShort2;
-                    case 3: return MTLVertexFormatUShort3;
-                    case 4: return MTLVertexFormatUShort4;
-                }
-            }
-            break;
-
-        case GL_SHORT:
-            if (normalized)
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatShortNormalized;
-                    case 2: return MTLVertexFormatShort2Normalized;
-                    case 3: return MTLVertexFormatShort3Normalized;
-                    case 4: return MTLVertexFormatShort4Normalized;
-                }
-            }
-            else
-            {
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatShort;
-                    case 2: return MTLVertexFormatShort2;
-                    case 3: return MTLVertexFormatShort3;
-                    case 4: return MTLVertexFormatShort4;
-                }
-            }
-            break;
-
-            case GL_HALF_FLOAT:
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatHalf;
-                    case 2: return MTLVertexFormatHalf2;
-                    case 3: return MTLVertexFormatHalf3;
-                    case 4: return MTLVertexFormatHalf4;
-                }
-                break;
-
-            case GL_FLOAT:
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatFloat;
-                    case 2: return MTLVertexFormatFloat2;
-                    case 3: return MTLVertexFormatFloat3;
-                    case 4: return MTLVertexFormatFloat4;
-                }
-                break;
-
-            case GL_INT:
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatInt;
-                    case 2: return MTLVertexFormatInt2;
-                    case 3: return MTLVertexFormatInt3;
-                    case 4: return MTLVertexFormatInt4;
-                }
-                break;
-
-            case GL_UNSIGNED_INT:
-                switch(size)
-                {
-                    case 1: return MTLVertexFormatUInt;
-                    case 2: return MTLVertexFormatUInt2;
-                    case 3: return MTLVertexFormatUInt3;
-                    case 4: return MTLVertexFormatUInt4;
-                }
-                break;
-
-            case GL_RGB10:
-                if (normalized)
-                    return MTLVertexFormatInt1010102Normalized;
-                break;
-
-            case GL_UNSIGNED_INT_10_10_10_2:
-            case GL_UNSIGNED_INT_2_10_10_10_REV:
-                if (normalized)
-                    return MTLVertexFormatUInt1010102Normalized;
-                break;
-        }
-
-    return MTLVertexFormatInvalid;
+    unsigned orientation = object->is_render_target &&
+        mglDecideYFlipForSampledRT(object, program) == MGL_YFLIP_USE_SAMPLED_COPY;
+    NSUInteger copyLevelCount = mglGLSampledCopyLevelCount(object, source);
+    id<MTLTexture> cached = (__bridge id<MTLTexture>)object->mtl_depth_read_data[orientation];
+    if (!cached ||
+        object->mtl_depth_read_version[orientation] != object->mtl_render_target_write_version ||
+        cached.width != source.width ||
+        cached.height != source.height ||
+        cached.textureType != source.textureType ||
+        cached.arrayLength != source.arrayLength ||
+        cached.mipmapLevelCount != copyLevelCount) {
+        return nil;
+    }
+    return cached;
 }
+
+- (BOOL)updateDepthReadCopiesForTexture:(Texture *)object orientationMask:(unsigned)requestedMask
+{
+    if (!object || !object->mtl_data || !requestedMask) {
+        return NO;
+    }
+
+    id<MTLTexture> source = (__bridge id<MTLTexture>)object->mtl_data;
+    if (!source ||
+        (source.textureType != MTLTextureType2D && source.textureType != MTLTextureType2DArray) ||
+        source.sampleCount != 1 ||
+        !mglMetalPixelFormatHasDepth(source.pixelFormat)) {
+        return NO;
+    }
+    NSUInteger copyLevelCount = mglGLSampledCopyLevelCount(object, source);
+
+    /* This updater is intentionally restricted to a render-pass boundary.
+     * Starting a compute encoder from texture binding tears down the active
+     * draw encoder in the middle of state replay and corrupts post-processing. */
+    if (_currentRenderEncoder) {
+        return NO;
+    }
+
+    BOOL allFresh = YES;
+    for (unsigned orientation = 0; orientation < 2; orientation++) {
+        if (!(requestedMask & (1u << orientation))) continue;
+        id<MTLTexture> cached = (__bridge id<MTLTexture>)object->mtl_depth_read_data[orientation];
+        BOOL shapeMatches = cached &&
+            cached.width == source.width &&
+            cached.height == source.height &&
+            cached.textureType == source.textureType &&
+            cached.arrayLength == source.arrayLength &&
+            cached.mipmapLevelCount == copyLevelCount;
+        if (cached && !shapeMatches) {
+            mglSafeReleaseMetalObj(&object->mtl_depth_read_data[orientation]);
+            object->mtl_depth_read_version[orientation] = 0u;
+            cached = nil;
+        }
+        if (!cached || object->mtl_depth_read_version[orientation] != object->mtl_render_target_write_version) {
+            allFresh = NO;
+        }
+    }
+    if (allFresh) {
+        return YES;
+    }
+
+    if (!_depthReadCopyPipeline || !_depthReadArrayCopyPipeline) {
+        NSString *code = @"#include <metal_stdlib>\nusing namespace metal;\n"
+            "kernel void depth_read_copy(depth2d<float, access::read> src [[texture(0)]], "
+            "texture2d<float, access::write> dst [[texture(1)]], "
+            "constant uint& flip [[buffer(0)]], uint2 pos [[thread_position_in_grid]]) { "
+            "if (any(pos >= uint2(dst.get_width(), dst.get_height()))) return; "
+            "uint2 q = uint2(pos.x, flip ? src.get_height() - 1 - pos.y : pos.y); "
+            "dst.write(float4(src.read(q), 0.0, 0.0, 1.0), pos); }\n"
+            "kernel void depth_read_copy_array(depth2d_array<float, access::read> src [[texture(0)]], "
+            "texture2d_array<float, access::write> dst [[texture(1)]], "
+            "constant uint& flip [[buffer(0)]], uint3 pos [[thread_position_in_grid]]) { "
+            "if (pos.x >= dst.get_width() || pos.y >= dst.get_height() || pos.z >= dst.get_array_size()) return; "
+            "uint2 q = uint2(pos.x, flip ? src.get_height() - 1 - pos.y : pos.y); "
+            "dst.write(float4(src.read(q, pos.z), 0.0, 0.0, 1.0), uint2(pos.xy), pos.z); }";
+        NSError *error = nil;
+        id<MTLLibrary> library = [self newMetalLibraryWithSource:code
+                                                        options:nil
+                                                          label:@"MGL depth read copy"
+                                                          error:&error];
+        id<MTLFunction> function = [library newFunctionWithName:@"depth_read_copy"];
+        if (function) {
+            _depthReadCopyPipeline = [_device newComputePipelineStateWithFunction:function error:&error];
+        }
+        id<MTLFunction> arrayFunction = [library newFunctionWithName:@"depth_read_copy_array"];
+        if (arrayFunction) {
+            _depthReadArrayCopyPipeline = [_device newComputePipelineStateWithFunction:arrayFunction error:&error];
+        }
+        if (!_depthReadCopyPipeline || !_depthReadArrayCopyPipeline) {
+            NSLog(@"MGL depth read copy compile failed: %@", error);
+            return NO;
+        }
+    }
+
+    for (unsigned orientation = 0; orientation < 2; orientation++) {
+        if (!(requestedMask & (1u << orientation))) continue;
+        if (object->mtl_depth_read_data[orientation]) {
+            continue;
+        }
+        MTLTextureDescriptor *descriptor = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Float
+                                                                                              width:source.width
+                                                                                             height:source.height
+                                                                                          mipmapped:copyLevelCount > 1];
+        descriptor.textureType = source.textureType;
+        descriptor.arrayLength = source.arrayLength;
+        descriptor.mipmapLevelCount = copyLevelCount;
+        descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        descriptor.storageMode = MTLStorageModePrivate;
+        id<MTLTexture> destination = [_device newTextureWithDescriptor:descriptor];
+        if (!destination) {
+            return NO;
+        }
+        object->mtl_depth_read_data[orientation] = (void *)CFBridgingRetain(destination);
+    }
+
+    if (![self ensureWritableCommandBuffer:"depth_read_sample_preflight"]) {
+        return NO;
+    }
+    id<MTLComputeCommandEncoder> encoder = mglProfileCompute(_currentCommandBuffer, __func__, __LINE__);
+    if (!encoder) {
+        return NO;
+    }
+    BOOL isArray = source.textureType == MTLTextureType2DArray;
+    [encoder setComputePipelineState:isArray ? _depthReadArrayCopyPipeline : _depthReadCopyPipeline];
+
+    for (unsigned orientation = 0; orientation < 2; orientation++) {
+        if (!(requestedMask & (1u << orientation))) continue;
+        if (object->mtl_depth_read_version[orientation] == object->mtl_render_target_write_version &&
+            object->mtl_render_target_write_version != 0u) continue;
+        id<MTLTexture> destination = (__bridge id<MTLTexture>)object->mtl_depth_read_data[orientation];
+        uint32_t flip = orientation;
+        [encoder setBytes:&flip length:sizeof(flip) atIndex:0];
+        BOOL encodedAllLevels = YES;
+        for (NSUInteger level = 0; level < copyLevelCount; level++) {
+            @autoreleasepool {
+                id<MTLTexture> input = source;
+                id<MTLTexture> output = destination;
+                if (source.mipmapLevelCount > 1) {
+                    MTLTextureType viewType = isArray ? MTLTextureType2DArray : MTLTextureType2D;
+                    NSRange slices = NSMakeRange(0, isArray ? source.arrayLength : 1u);
+                    input = [source newTextureViewWithPixelFormat:source.pixelFormat textureType:viewType
+                        levels:NSMakeRange(level, 1) slices:slices];
+                    output = [destination newTextureViewWithPixelFormat:destination.pixelFormat textureType:viewType
+                        levels:NSMakeRange(level, 1) slices:slices];
+                }
+                if (!input || !output) { encodedAllLevels = NO; break; }
+                [encoder setTexture:input atIndex:0];
+                [encoder setTexture:output atIndex:1];
+                id<MTLComputePipelineState> pipeline = isArray ? _depthReadArrayCopyPipeline : _depthReadCopyPipeline;
+                NSUInteger width = MIN((NSUInteger)8, pipeline.maxTotalThreadsPerThreadgroup);
+                NSUInteger height = MAX((NSUInteger)1, MIN((NSUInteger)8,
+                    pipeline.maxTotalThreadsPerThreadgroup / MAX(width, (NSUInteger)1)));
+                [encoder dispatchThreads:MTLSizeMake(output.width, output.height, isArray ? output.arrayLength : 1u)
+                    threadsPerThreadgroup:MTLSizeMake(width, height, 1)];
+            }
+        }
+        if (!encodedAllLevels) { [encoder endEncoding]; return NO; }
+        object->mtl_depth_read_version[orientation] = object->mtl_render_target_write_version;
+        if (mglTraceLogIsEnabled()) {
+            mglTraceLog("DEPTH_READ_COPY tex=%u orientation=%u version=%u", object->name,
+                orientation, object->mtl_render_target_write_version);
+        }
+    }
+    [encoder endEncoding];
+    unsigned captureOrientation = (requestedMask & 1u) ? 0u : 1u;
+    id<MTLTexture> sampled = (__bridge id<MTLTexture>)object->mtl_depth_read_data[captureOrientation];
+    const char *captureDirectory = getenv("MGL_CAPTURE_ATTACHMENTS_DIR");
+    BOOL captureFrame = captureDirectory && _dontCareFrameGeneration >= 180u && _dontCareFrameGeneration <= 181u;
+    if (sampled && source.textureType == MTLTextureType2D &&
+        mglEnvFlagEnabled("MGL_CAPTURE_DEPTH_READ") && source.pixelFormat == MTLPixelFormatDepth32Float &&
+        (captureFrame || (!captureDirectory && object->mtl_render_target_write_version >= 500u))) {
+        static GLuint captured[32]; static unsigned count;
+        bool seen = false;
+        for (unsigned i=0;i<count;i++) if (captured[i]==object->name) seen=true;
+        if (captureFrame || (!seen && count<32)) {
+            if (!seen && count<32) captured[count++]=object->name;
+            NSUInteger width=source.width,height=source.height,pitch=(width*sizeof(float)+255u)&~255u;
+            id<MTLBuffer> original=[_device newBufferWithLength:pitch*height options:MTLResourceStorageModeShared];
+            id<MTLBuffer> converted=[_device newBufferWithLength:pitch*height options:MTLResourceStorageModeShared];
+            id<MTLBlitCommandEncoder> capture=mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
+            for (unsigned i=0;i<2;i++) [capture copyFromTexture:i?sampled:source sourceSlice:0 sourceLevel:0
+                sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(width,height,1) toBuffer:i?converted:original
+                destinationOffset:0 destinationBytesPerRow:pitch destinationBytesPerImage:pitch*height];
+            [capture endEncoding];
+            GLuint name=object->name, version=object->mtl_render_target_write_version;
+            NSString *directory = captureFrame ? [NSString stringWithUTF8String:captureDirectory] : nil;
+            [_currentCommandBuffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                if(cb.status!=MTLCommandBufferStatusCompleted)return;
+                float minimum=1,maximum=0,error=0; NSUInteger filled=0;
+                for(NSUInteger y=0;y<height;y++) {
+                    NSUInteger sourceY = captureOrientation ? height - 1u - y : y;
+                    float *a=(float *)((uint8_t *)original.contents+sourceY*pitch);
+                    float *b=(float *)((uint8_t *)converted.contents+y*pitch);
+                    for(NSUInteger x=0;x<width;x++) { minimum=fminf(minimum,b[x]);maximum=fmaxf(maximum,b[x]);error=fmaxf(error,fabsf(a[x]-b[x]));filled+=b[x]<1; }
+                }
+                NSLog(@"MGL DEPTH READ VERIFY texture=%u orientation=%u version=%u min=%g max=%g populated=%lu/%lu error=%g",name,captureOrientation,version,minimum,maximum,(unsigned long)filled,(unsigned long)(width*height),error);
+                if (directory) {
+                    for (unsigned i=0; i<2; i++) {
+                        id<MTLBuffer> buffer = i ? converted : original;
+                        NSMutableData *data=[NSMutableData dataWithLength:width*height*sizeof(float)];
+                        for(NSUInteger y=0;y<height;y++) memcpy((uint8_t *)data.mutableBytes+y*width*sizeof(float), (uint8_t *)buffer.contents+y*pitch, width*sizeof(float));
+                        NSString *path=[NSString stringWithFormat:@"%@/mgl-depth-%u-%u-%s-o%u-%lux%lu.raw",directory,name,version,i?"sampled":"native",captureOrientation,(unsigned long)width,(unsigned long)height];
+                        [data writeToFile:path atomically:YES];
+                    }
+                }
+            }];
+        }
+    }
+    return YES;
+}
+
+
 
 /* mglVertexAttribComponentSize / mglVertexFormatName moved to mgl_vertex_format.h/.m. */
 
@@ -2837,12 +2723,7 @@ void mglTraceDrawElementsAttrib(GLMContext ctx,
     size_t elemBytes = mglVertexAttribElementBytes(a->type, a->size);
     GLboolean effectiveNormalized = a->normalized;
     Program *program = mglResolveProgramForStageFromState(ctx, _VERTEX_SHADER);
-    if (!effectiveNormalized &&
-        a->type == GL_UNSIGNED_BYTE &&
-        a->size == 4 &&
-        mglRendererVertexAttribIsColorInput(program, attrib)) {
-        effectiveNormalized = GL_TRUE;
-    }
+
 
     if (elemBytes == 0u ||
         vertexOffset > (NSUInteger)vbo->size ||
@@ -3182,9 +3063,12 @@ void logDirtyBits(GLMContext ctx)
                           copyLength,
                           (unsigned long long)sourceHash];
     if (!_doubleVertexAttribBufferCache) {
-        _doubleVertexAttribBufferCache = [NSMutableDictionary dictionary];
+        _doubleVertexAttribBufferCache = [[NSCache alloc] init];
+        _doubleVertexAttribBufferCache.name = @"MGL double vertex attrib conversion";
+        _doubleVertexAttribBufferCache.countLimit = 128;
+        _doubleVertexAttribBufferCache.totalCostLimit = 64u * 1024u * 1024u;
     }
-    id<MTLBuffer> cached = _doubleVertexAttribBufferCache[cacheKey];
+    id<MTLBuffer> cached = [_doubleVertexAttribBufferCache objectForKey:cacheKey];
     if (cached) {
         if (outStride) {
             *outStride = convertedStride;
@@ -3240,7 +3124,7 @@ void logDirtyBits(GLMContext ctx)
     if (!converted) {
         return nil;
     }
-    _doubleVertexAttribBufferCache[cacheKey] = converted;
+    [_doubleVertexAttribBufferCache setObject:converted forKey:cacheKey cost:converted.length];
     if (outStride) {
         *outStride = convertedStride;
     }
@@ -3309,9 +3193,12 @@ void logDirtyBits(GLMContext ctx)
                           copyLength,
                           (unsigned long long)sourceHash];
     if (!_doubleVertexAttribBufferCache) {
-        _doubleVertexAttribBufferCache = [NSMutableDictionary dictionary];
+        _doubleVertexAttribBufferCache = [[NSCache alloc] init];
+        _doubleVertexAttribBufferCache.name = @"MGL double vertex attrib conversion";
+        _doubleVertexAttribBufferCache.countLimit = 128;
+        _doubleVertexAttribBufferCache.totalCostLimit = 64u * 1024u * 1024u;
     }
-    id<MTLBuffer> cached = _doubleVertexAttribBufferCache[cacheKey];
+    id<MTLBuffer> cached = [_doubleVertexAttribBufferCache objectForKey:cacheKey];
     if (cached) {
         if (outStride) {
             *outStride = convertedStride;
@@ -3384,7 +3271,7 @@ void logDirtyBits(GLMContext ctx)
     if (!converted) {
         return nil;
     }
-    _doubleVertexAttribBufferCache[cacheKey] = converted;
+    [_doubleVertexAttribBufferCache setObject:converted forKey:cacheKey cost:converted.length];
     if (outStride) {
         *outStride = convertedStride;
     }
@@ -3454,9 +3341,12 @@ void logDirtyBits(GLMContext ctx)
                           copyLength,
                           (unsigned long long)sourceHash];
     if (!_doubleVertexAttribBufferCache) {
-        _doubleVertexAttribBufferCache = [NSMutableDictionary dictionary];
+        _doubleVertexAttribBufferCache = [[NSCache alloc] init];
+        _doubleVertexAttribBufferCache.name = @"MGL double vertex attrib conversion";
+        _doubleVertexAttribBufferCache.countLimit = 128;
+        _doubleVertexAttribBufferCache.totalCostLimit = 64u * 1024u * 1024u;
     }
-    id<MTLBuffer> cached = _doubleVertexAttribBufferCache[cacheKey];
+    id<MTLBuffer> cached = [_doubleVertexAttribBufferCache objectForKey:cacheKey];
     if (cached) {
         if (outStride) {
             *outStride = convertedStride;
@@ -3554,7 +3444,7 @@ void logDirtyBits(GLMContext ctx)
     if (!converted) {
         return nil;
     }
-    _doubleVertexAttribBufferCache[cacheKey] = converted;
+    [_doubleVertexAttribBufferCache setObject:converted forKey:cacheKey cost:converted.length];
     if (outStride) {
         *outStride = convertedStride;
     }
@@ -3575,11 +3465,8 @@ void logDirtyBits(GLMContext ctx)
  * buffers at render time.
  */
 
-#define MGL_MAX_PACKED_STRUCT_BUFFERS 256
 #define MGL_PACKED_UNIFORM_ARENA_INITIAL_SIZE (4u * 1024u * 1024u)
 #define MGL_PACKED_UNIFORM_ALIGNMENT 256u
-static Buffer *s_packedStructBuffers[MGL_MAX_PACKED_STRUCT_BUFFERS];
-static int s_packedStructBufferIdx = 0;
 
 /* Compute the location step per array element from reflected members.
  * For a struct S = { vec4 m0, float m1[2], mat2 m2 }, the step is 4
@@ -3603,125 +3490,65 @@ static GLuint mglPlainStructLocStep(const SpirvResource *res)
     return step > 0 ? step : 1;
 }
 
-typedef struct {
-    char name[128];
-    size_t offset;
-    size_t size;
-    bool mat3;
-} MGLLooseMetalMember;
-
-/* Aggregated loose uniforms are reflected with the GLSL struct layout, but
- * Metal pads mat3 columns to 16 bytes. Read the generated MSL member order so
- * the transient packed buffer matches the layout the GPU actually reads. */
-static bool mglLooseMetalTypeLayout(const char *type, size_t *size, size_t *align)
-{
-    if (!strcmp(type, "float4x4")) { *size = 64; *align = 16; }
-    else if (!strcmp(type, "float3x3")) { *size = 48; *align = 16; }
-    else if (!strcmp(type, "float4") || !strcmp(type, "int4") ||
-             !strcmp(type, "uint4") || !strcmp(type, "float3") ||
-             !strcmp(type, "int3") || !strcmp(type, "uint3")) {
-        *size = 16; *align = 16;
-    } else if (!strcmp(type, "float2") || !strcmp(type, "int2") ||
-               !strcmp(type, "uint2")) { *size = 8; *align = 8; }
-    else if (!strcmp(type, "float") || !strcmp(type, "int") ||
-             !strcmp(type, "uint")) { *size = 4; *align = 4; }
-    else if (!strcmp(type, "short") || !strcmp(type, "ushort")) {
-        *size = 2; *align = 2;
-    } else return false;
-    return true;
-}
-
-static bool mglLooseMetalLayout(const char *msl, const char *resourceName,
-                                MGLLooseMetalMember members[128],
-                                size_t *memberCount, size_t *structSize)
-{
-    if (!msl || !resourceName || strncmp(resourceName, "_mgl_loose_", 11)) return false;
-    char declaration[64];
-    snprintf(declaration, sizeof(declaration), "struct _MGLLooseUniforms%s", resourceName + 10);
-    const char *p = strstr(msl, declaration);
-    if (!p || !(p = strchr(p, '{'))) return false;
-    p++;
-    size_t count = 0, offset = 0, maxAlign = 1;
-    while (*p && *p != '}') {
-        const char *end = strchr(p, '\n');
-        if (!end) return false;
-        char line[256], type[32] = {0}, name[128] = {0};
-        size_t length = (size_t)(end - p);
-        if (length >= sizeof(line)) return false;
-        memcpy(line, p, length);
-        line[length] = '\0';
-        if (sscanf(line, " %31s %127[^;];", type, name) == 2) {
-            size_t size = 0, align = 0;
-            if (!mglLooseMetalTypeLayout(type, &size, &align) || count >= 128) return false;
-            size_t nameLen = strlen(name);
-            while (nameLen && isspace((unsigned char)name[nameLen - 1])) name[--nameLen] = '\0';
-            offset = (offset + align - 1) & ~(align - 1);
-            strncpy(members[count].name, name, sizeof(members[count].name) - 1);
-            members[count].name[sizeof(members[count].name) - 1] = '\0';
-            members[count].offset = offset;
-            members[count].size = size;
-            members[count].mat3 = !strcmp(type, "float3x3");
-            count++;
-            offset += size;
-            if (align > maxAlign) maxAlign = align;
-        }
-        p = end + 1;
-    }
-    if (!count) return false;
-    *memberCount = count;
-    *structSize = (offset + maxAlign - 1) & ~(maxAlign - 1);
-    return true;
-}
-
 /* Compute the byte size of one element of a GL uniform type.
  * Used as a fallback array stride for plain struct uniform members
  * that lack ArrayStride decorations in SPIR-V. */
-static GLuint mglGLTypeElementByteSize(GLuint gl_type)
+/* Copy one GL uniform value into its reflected native Metal layout. Uploads
+ * are column-major after glUniformMatrix transpose handling. mat3 uploads may
+ * already contain padded columns; all other matrices can arrive tightly packed. */
+static void mglPackPlainUniformElement(const SpirvUBOMember *member,
+                                      uint8_t *destination, size_t available,
+                                      const uint8_t *source, size_t sourceSize)
 {
-    switch (gl_type) {
-        case GL_FLOAT:
-        case GL_INT:
-        case GL_UNSIGNED_INT:
-        case GL_BOOL:
-            return 4;
-        case GL_FLOAT_VEC2:
-        case GL_INT_VEC2:
-        case GL_UNSIGNED_INT_VEC2:
-        case GL_BOOL_VEC2:
-            return 8;
-        case GL_FLOAT_VEC3:
-        case GL_INT_VEC3:
-        case GL_UNSIGNED_INT_VEC3:
-        case GL_BOOL_VEC3:
-            return 12;
-        case GL_FLOAT_VEC4:
-        case GL_INT_VEC4:
-        case GL_UNSIGNED_INT_VEC4:
-        case GL_BOOL_VEC4:
-            return 16;
-        case GL_FLOAT_MAT2:
-            return 8;   /* one column = vec2 */
-        case GL_FLOAT_MAT3:
-            return 12;  /* one column = vec3 */
-        case GL_FLOAT_MAT4:
-            return 16;  /* one column = vec4 */
-        case GL_FLOAT_MAT2x3:
-            return 12;
-        case GL_FLOAT_MAT2x4:
-            return 16;
-        case GL_FLOAT_MAT3x2:
-            return 8;
-        case GL_FLOAT_MAT3x4:
-            return 16;
-        case GL_FLOAT_MAT4x2:
-            return 8;
-        case GL_FLOAT_MAT4x3:
-            return 12;
-        case GL_DOUBLE:
-            return 8;
-        default:
-            return 4;
+    unsigned columns = 1, rows = 1, scalarSize = 4;
+    bool boolean = false;
+    switch (member->gl_type) {
+        case GL_FLOAT_MAT2: columns = rows = 2; break;
+        case GL_FLOAT_MAT3: columns = rows = 3; break;
+        case GL_FLOAT_MAT4: columns = rows = 4; break;
+        case GL_FLOAT_MAT2x3: columns = 2; rows = 3; break;
+        case GL_FLOAT_MAT2x4: columns = 2; rows = 4; break;
+        case GL_FLOAT_MAT3x2: columns = 3; rows = 2; break;
+        case GL_FLOAT_MAT3x4: columns = 3; rows = 4; break;
+        case GL_FLOAT_MAT4x2: columns = 4; rows = 2; break;
+        case GL_FLOAT_MAT4x3: columns = 4; rows = 3; break;
+        case GL_DOUBLE_MAT2: columns = rows = 2; scalarSize = 8; break;
+        case GL_DOUBLE_MAT3: columns = rows = 3; scalarSize = 8; break;
+        case GL_DOUBLE_MAT4: columns = rows = 4; scalarSize = 8; break;
+        case GL_DOUBLE_MAT2x3: columns = 2; rows = 3; scalarSize = 8; break;
+        case GL_DOUBLE_MAT2x4: columns = 2; rows = 4; scalarSize = 8; break;
+        case GL_DOUBLE_MAT3x2: columns = 3; rows = 2; scalarSize = 8; break;
+        case GL_DOUBLE_MAT3x4: columns = 3; rows = 4; scalarSize = 8; break;
+        case GL_DOUBLE_MAT4x2: columns = 4; rows = 2; scalarSize = 8; break;
+        case GL_DOUBLE_MAT4x3: columns = 4; rows = 3; scalarSize = 8; break;
+        case GL_BOOL: boolean = true; break;
+        case GL_BOOL_VEC2: boolean = true; rows = 2; break;
+        case GL_BOOL_VEC3: boolean = true; rows = 3; break;
+        case GL_BOOL_VEC4: boolean = true; rows = 4; break;
+        default: break;
     }
+    if (boolean) {
+        for (unsigned row = 0; row < rows && (row + 1u) * sizeof(int16_t) <= available; row++) {
+            GLint value = 0;
+            if ((row + 1u) * sizeof(value) > sourceSize) break;
+            memcpy(&value, source + row * sizeof(value), sizeof(value));
+            int16_t logical = value != 0;
+            memcpy(destination + row * sizeof(logical), &logical, sizeof(logical));
+        }
+        return;
+    }
+    if (columns > 1 && member->matrix_stride > 0) {
+        size_t rowBytes = rows * scalarSize;
+        size_t stride = (size_t)member->matrix_stride;
+        size_t sourceStride = sourceSize == columns * stride ? stride : rowBytes;
+        for (unsigned col = 0; col < columns; col++) {
+            size_t srcOffset = col * sourceStride, dstOffset = col * stride;
+            if (srcOffset + rowBytes > sourceSize || dstOffset + rowBytes > available) break;
+            memcpy(destination + dstOffset, source + srcOffset, rowBytes);
+        }
+        return;
+    }
+    memcpy(destination, source, MIN(available, sourceSize));
 }
 
 static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment)
@@ -3732,10 +3559,91 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
     return (value + mask) & ~mask;
 }
 
-/* Suballocate immutable packed uniform data from one shared Metal buffer per
- * command buffer.  The wrapper pool is reset before vertex+fragment mapping,
- * so every map entry in one synchronization pass keeps a distinct Buffer
- * object even if the arena has to grow between stages. */
+static NSUInteger mglPlainUniformArenaCacheHash(const Buffer *sourceBuffer,
+                                                NSUInteger sourceOffset,
+                                                NSUInteger sourceSize,
+                                                NSUInteger packedSize)
+{
+    uint64_t x = (uint64_t)(uintptr_t)sourceBuffer;
+    x ^= (uint64_t)sourceOffset + 0x9e3779b97f4a7c15ULL + (x << 6) + (x >> 2);
+    x ^= (uint64_t)sourceSize + 0x9e3779b97f4a7c15ULL + (x << 6) + (x >> 2);
+    x ^= (uint64_t)packedSize + 0x9e3779b97f4a7c15ULL + (x << 6) + (x >> 2);
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ULL;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebULL;
+    x ^= x >> 31;
+    return (NSUInteger)x & (MGL_PLAIN_UNIFORM_ARENA_CACHE_CAPACITY - 1u);
+}
+
+- (void)preparePackedUniformArenaForCurrentCommandBuffer
+{
+    if (!_currentCommandBuffer) {
+        [_packedUniformRangeCache removeAllObjects];
+        _packedUniformArenaCommandBuffer = nil;
+        _packedUniformArenaLeaseGroup = nil;
+        _packedUniformArenaLease = nil;
+        _packedUniformArenaCapacity = 0u;
+        _packedUniformArenaOffset = 0u;
+        memset(_plainUniformArenaCache, 0, sizeof(_plainUniformArenaCache));
+        return;
+    }
+    if (_packedUniformArenaCommandBuffer == _currentCommandBuffer) return;
+
+    [_packedUniformRangeCache removeAllObjects];
+    _packedUniformArenaCommandBuffer = _currentCommandBuffer;
+    MGLPackedUniformArenaLeaseGroup *group =
+        [[MGLPackedUniformArenaLeaseGroup alloc] init];
+    _packedUniformArenaLeaseGroup = group;
+    [_currentCommandBuffer addCompletedHandler:^(id<MTLCommandBuffer> commandBuffer) {
+        (void)commandBuffer;
+        [group returnLeases];
+    }];
+    _packedUniformArenaLease = nil;
+    _packedUniformArenaCapacity = 0u;
+    _packedUniformArenaOffset = 0u;
+    memset(_plainUniformArenaCache, 0, sizeof(_plainUniformArenaCache));
+}
+
+- (Buffer *)packedStructBufferForArenaBuffer:(id<MTLBuffer>)arenaBuffer
+                                    capacity:(NSUInteger)capacity
+                                      offset:(NSUInteger)offset
+                                        size:(size_t)size
+{
+    if (!arenaBuffer || !arenaBuffer.contents) {
+        return NULL;
+    }
+    if (s_packedStructBufferIdx >= MGL_MAX_PACKED_STRUCT_BUFFERS) {
+        static uint64_t s_packedWrapperExhaustionCount = 0;
+        uint64_t hit = ++s_packedWrapperExhaustionCount;
+        if (hit <= 8u || (hit % 256u) == 0u) {
+            NSLog(@"MGL WARNING: packed uniform wrapper pool exhausted (%u entries)",
+                  MGL_MAX_PACKED_STRUCT_BUFFERS);
+        }
+        return NULL;
+    }
+    int idx = s_packedStructBufferIdx++;
+    Buffer *buf = &s_packedStructBuffers[idx];
+    if (buf->name == 0u) {
+        buf->name = 0xF0000000u | (GLuint)idx;
+        buf->target = GL_UNIFORM_BUFFER;
+        buf->usage = GL_STREAM_DRAW;
+    }
+    buf->data.mtl_data = (__bridge void *)arenaBuffer;
+    buf->size = (GLsizeiptr)capacity;
+    buf->data.buffer_data = 0;
+    buf->data.buffer_size = capacity;
+    buf->data.dirty_bits = 0;
+    buf->has_initialized_data = GL_TRUE;
+    buf->ever_written = GL_TRUE;
+    buf->written_min = (GLintptr)offset;
+    buf->written_max = (GLintptr)(offset + size);
+    buf->transient_batch_buffer = GL_TRUE;
+    return buf;
+}
+
+/* Suballocate immutable packed uniform data from arenas leased to one Metal
+ * command buffer. Leases return to the bounded pool only after GPU completion. */
 - (Buffer *)packedStructBufferWithData:(const void *)data
                                   size:(size_t)size
                            snapshotKey:(NSArray *)snapshotKey
@@ -3746,24 +3654,7 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
         return NULL;
     }
 
-    if (_packedUniformArenaCommandBuffer != _currentCommandBuffer) {
-        _packedUniformArenaCommandBuffer = _currentCommandBuffer;
-        _packedUniformArenaBuffer = nil;
-        _packedUniformArenaCapacity = 0u;
-        _packedUniformArenaOffset = 0u;
-        [_packedUniformRetiredArenas removeAllObjects];
-        [_packedUniformRangeCache removeAllObjects];
-    }
-
-    if (s_packedStructBufferIdx >= MGL_MAX_PACKED_STRUCT_BUFFERS) {
-        static uint64_t s_packedWrapperExhaustionCount = 0;
-        uint64_t hit = ++s_packedWrapperExhaustionCount;
-        if (hit <= 8u || (hit % 256u) == 0u) {
-            NSLog(@"MGL WARNING: packed uniform wrapper pool exhausted (%u entries)",
-                  MGL_MAX_PACKED_STRUCT_BUFFERS);
-        }
-        return NULL;
-    }
+    [self preparePackedUniformArenaForCurrentCommandBuffer];
 
     NSUInteger alignedSize = mglPackedUniformAlignUp((NSUInteger)size,
                                                       MGL_PACKED_UNIFORM_ALIGNMENT);
@@ -3773,23 +3664,24 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
         return NULL;
     }
 
-    /* An exact byte key (not just a hash) prevents collisions and captures
-     * legacy global-fallback changes even without a reliable generation.
-     * Retain the selected arena, never cache mutable Buffer wrapper pointers. */
     NSArray *contentKey = nil;
-    NSArray *cachedRange = nil;
     if (_packedUniformReuseEnabled && snapshotKey) {
         NSData *content = immutableBytes && immutableBytes.length == size
             ? immutableBytes : [NSData dataWithBytes:data length:size];
         contentKey = @[snapshotKey, content];
-        cachedRange = [_packedUniformRangeCache objectForKey:contentKey];
+        NSArray *cachedRange = _packedUniformRangeCache[contentKey];
+        if (cachedRange) {
+            id<MTLBuffer> arena = cachedRange[0];
+            NSUInteger offset = [cachedRange[1] unsignedIntegerValue];
+            Buffer *buffer = [self packedStructBufferForArenaBuffer:arena
+                capacity:arena.length offset:offset size:size];
+            *outOffset = (GLintptr)offset;
+            return buffer;
+        }
     }
-    id<MTLBuffer> selectedArena = cachedRange ? cachedRange[0] : nil;
-    if (cachedRange) alignedOffset = [cachedRange[1] unsignedIntegerValue];
-
-    BOOL needsArena = !cachedRange && (!_packedUniformArenaBuffer ||
+    BOOL needsArena = !_packedUniformArenaLease ||
         alignedOffset > _packedUniformArenaCapacity ||
-        alignedSize > (_packedUniformArenaCapacity - alignedOffset));
+        alignedSize > (_packedUniformArenaCapacity - alignedOffset);
     if (needsArena) {
         NSUInteger previousCapacity = _packedUniformArenaCapacity;
         NSUInteger grown = previousCapacity > 0u
@@ -3800,7 +3692,7 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
         }
         if (grown < alignedSize) {
             grown = alignedSize;
-        } else if (_packedUniformArenaBuffer &&
+        } else if (_packedUniformArenaLease &&
                    alignedSize <= previousCapacity &&
                    grown <= NSUIntegerMax / 2u) {
             /* When the current arena merely filled, grow rather than allocate
@@ -3808,73 +3700,80 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
             grown *= 2u;
         }
 
-        id<MTLBuffer> replacement =
-            [_device newBufferWithLength:grown
-                                 options:(MTLResourceStorageModeShared |
-                                          MTLResourceCPUCacheModeWriteCombined)];
-        if (!replacement || !replacement.contents) {
-            return NULL;
-        }
-        replacement.label = [NSString stringWithFormat:@"MGL packed uniforms %lu KiB",
-                             (unsigned long)(grown / 1024u)];
-
-        if (_packedUniformArenaBuffer) {
-            if (!_packedUniformRetiredArenas) {
-                _packedUniformRetiredArenas = [NSMutableArray array];
+        MGLPackedUniformArenaLease *replacementLease = nil;
+        if (grown <= MGL_PACKED_ARENA_POOL_MAX_BYTES) {
+            for (MGLPackedUniformArenaLease *candidate in _packedUniformArenaPool) {
+                if (candidate.capacity < grown) continue;
+                bool expectedAvailable = true;
+                if (atomic_compare_exchange_strong_explicit(&candidate->available,
+                                                            &expectedAvailable,
+                                                            false,
+                                                            memory_order_acq_rel,
+                                                            memory_order_acquire)) {
+                    replacementLease = candidate;
+                    mglPackedArenaRecordEvent(YES, candidate.capacity);
+                    break;
+                }
             }
-            [_packedUniformRetiredArenas addObject:_packedUniformArenaBuffer];
         }
-        _packedUniformArenaBuffer = replacement;
-        _packedUniformArenaCapacity = grown;
+        if (!replacementLease) {
+            id<MTLBuffer> replacement =
+                [_device newBufferWithLength:grown
+                                     options:(MTLResourceStorageModeShared |
+                                              MTLResourceCPUCacheModeWriteCombined)];
+            if (!replacement || !replacement.contents) {
+                return NULL;
+            }
+            replacement.label = [NSString stringWithFormat:@"MGL packed uniforms %lu KiB",
+                                 (unsigned long)(grown / 1024u)];
+            replacementLease = [[MGLPackedUniformArenaLease alloc] init];
+            replacementLease.buffer = replacement;
+            replacementLease.capacity = grown;
+            BOOL canPool = grown <= MGL_PACKED_ARENA_POOL_MAX_BYTES &&
+                _packedUniformArenaPool.count < MGL_PACKED_ARENA_POOL_MAX_ENTRIES &&
+                _packedUniformArenaPoolCapacity <= MGL_PACKED_ARENA_POOL_MAX_BYTES - grown;
+            if (canPool) {
+                replacementLease.pooled = YES;
+                if (!_packedUniformArenaPool) {
+                    _packedUniformArenaPool = [NSMutableArray array];
+                }
+                [_packedUniformArenaPool addObject:replacementLease];
+                _packedUniformArenaPoolCapacity += grown;
+            }
+            mglPackedArenaRecordEvent(NO, grown);
+        }
+
+        /* The current group retains every arena used by this CB, including
+         * replaced arenas, until completion or discard. */
+        [_packedUniformArenaLeaseGroup addLease:replacementLease];
+        _packedUniformArenaLease = replacementLease;
+        _packedUniformArenaCapacity = replacementLease.capacity;
         _packedUniformArenaOffset = 0u;
         alignedOffset = 0u;
     }
 
-    if (!cachedRange) {
-        selectedArena = _packedUniformArenaBuffer;
-        uint8_t *destination = (uint8_t *)selectedArena.contents + alignedOffset;
-        memcpy(destination, data, size);
-        if (alignedSize > size) {
-            memset(destination + size, 0, alignedSize - size);
-        }
-        _packedUniformArenaOffset = alignedOffset + alignedSize;
-        if (contentKey) {
-            if (!_packedUniformRangeCache) _packedUniformRangeCache = [NSMutableDictionary new];
-            /* Bounded cache: dropping metadata never overwrites an encoded
-             * range; the allocator still advances monotonically. */
-            if (_packedUniformRangeCache.count >= 128u) [_packedUniformRangeCache removeAllObjects];
-            _packedUniformRangeCache[contentKey] = @[selectedArena, @(alignedOffset)];
-        }
+    id<MTLBuffer> arenaBuffer = _packedUniformArenaLease.buffer;
+    if (!arenaBuffer || !arenaBuffer.contents) return NULL;
+    uint8_t *destination = (uint8_t *)arenaBuffer.contents + alignedOffset;
+    memcpy(destination, data, size);
+    if (alignedSize > size) {
+        memset(destination + size, 0, alignedSize - size);
     }
 
-    int idx = s_packedStructBufferIdx++;
-    Buffer *buf = s_packedStructBuffers[idx];
-    if (!buf) {
-        buf = (Buffer *)calloc(1, sizeof(Buffer));
-        if (!buf) {
-            return NULL;
-        }
-        buf->name = 0xF0000000u | (GLuint)idx;
-        buf->target = GL_UNIFORM_BUFFER;
-        buf->usage = GL_STREAM_DRAW;
-        s_packedStructBuffers[idx] = buf;
+    _packedUniformArenaOffset = alignedOffset + alignedSize;
+    if (contentKey) {
+        if (!_packedUniformRangeCache) _packedUniformRangeCache = [NSMutableDictionary new];
+        if (_packedUniformRangeCache.count >= 128u)
+            [_packedUniformRangeCache removeObjectForKey:_packedUniformRangeCache.allKeys.firstObject];
+        _packedUniformRangeCache[contentKey] = @[arenaBuffer, @(alignedOffset)];
     }
 
-    /* Non-owning bridge: the renderer retains the active/retired arenas and
-     * Metal command buffers retain every encoded resource until completion. */
-    buf->data.mtl_data = (__bridge void *)selectedArena;
-    buf->size = (GLsizeiptr)selectedArena.length;
-    buf->data.buffer_data = 0;
-    buf->data.buffer_size = selectedArena.length;
-    buf->data.dirty_bits = 0;
-    buf->has_initialized_data = GL_TRUE;
-    buf->ever_written = GL_TRUE;
-    buf->written_min = (GLintptr)alignedOffset;
-    buf->written_max = (GLintptr)(alignedOffset + size);
-    /* Mark as transient so mglRendererGetValidatedBuffer bypasses the
-     * buffer hash-table lookup (packed struct buffers are standalone
-     * Buffer wrappers, not inserted into the GL buffer table). */
-    buf->transient_batch_buffer = GL_TRUE;
+    /* Non-owning bridge: the lease group retains active and replaced arenas
+     * until this command buffer completes or is discarded. */
+    Buffer *buf = [self packedStructBufferForArenaBuffer:arenaBuffer
+                                                capacity:_packedUniformArenaCapacity
+                                                  offset:alignedOffset
+                                                    size:size];
     *outOffset = (GLintptr)alignedOffset;
     return buf;
 }
@@ -3982,11 +3881,13 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
             BufferBaseTarget *fallbackBuffers = NULL;
 
             Program *activeProgram = mglResolveProgramForStageFromState(ctx, stage);
-            if (spvc_type == SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT && activeProgram) {
-                buffers = activeProgram->plain_uniform_buffers;
-                fallbackBuffers = ctx->state.buffer_base[gl_buffer_type].buffers;
+            if (spvc_type == SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT) {
+                if (!activeProgram) continue;
+                MGLPlainUniformVersion *version = _replayUniformVersions[stage];
+                buffers = version ? version->slots : activeProgram->plain_uniform_buffers;
+                /* Plain uniforms belong to the Program, not GL indexed bindings. */
             } else {
-                buffers = ctx->state.buffer_base[gl_buffer_type].buffers;
+                buffers = mglStateBufferBaseTargets(&ctx->state, gl_buffer_type);
             }
             
             for (int i = 0; i < count; i++)
@@ -4004,9 +3905,8 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
                     continue;
                 }
                 SpirvResource *resource = &program->spirv_resources_list[stage][spvc_type].list[i];
-                if (mglShouldSkipStageBufferResource(program, stage, spvc_type, resource)) {
-                    continue;
-                }
+                BOOL skippedResource = mglShouldSkipStageBufferResource(program, stage, spvc_type, resource);
+                if (skippedResource) continue;
 
                 if (spvc_type == SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT &&
                     getenv("MGL_DEBUG_STRUCT_PACK")) {
@@ -4040,10 +3940,6 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
                     }
                     GLuint array_size = mglStageBufferResourceElementCount(spvc_type, resource);
                     size_t struct_size = resource->required_size;
-                    MGLLooseMetalMember metalMembers[128];
-                    size_t metalMemberCount = 0;
-                    bool useMetalLayout = false;
-                    bool metalLayoutResolved = false;
                     bool allowFallback = fallbackBuffers &&
                         mglPlainUniformAllowsGlobalFallback(resource);
 
@@ -4053,17 +3949,12 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
                         GLuint elem_loc_end = (element + 1u) * loc_step;
                         GLuint elem_byte_start = element * (GLuint)struct_size;
 
-                        /* Epochs reject normal updates cheaply; exact source
-                         * witnesses also guard legacy fallback/binding changes
-                         * and writes that did not go through glUniform. */
+                        /* Layout identity stays stable across unrelated updates.
+                         * Exact dependency witnesses reject changed member data. */
                         NSArray *cpuKey = _packedUniformReuseEnabled && !_parallelEncodeActive &&
-                            program->msl_texture_cache_instance_id && resource->_id &&
-                            program->plain_uniform_generation != UINT64_MAX &&
-                            ctx->plain_uniform_fallback_generation != UINT64_MAX
+                            program->msl_texture_cache_instance_id && resource->_id
                             ? @[@(program->msl_texture_cache_instance_id),
-                                @(program->msl_texture_cache_generation),
-                                @(program->plain_uniform_generation),
-                                @(ctx->plain_uniform_fallback_generation), @(stage),
+                                @(program->msl_texture_cache_generation), @(stage),
                                 @(resource->_id), @(element), @(metal_binding), @(resource->required_size)] : nil;
                         MGLPackedUniformSnapshot *cpuSnapshot = cpuKey ? _packedUniformCPUSnapshots[cpuKey] : nil;
                         BufferBaseTarget *snapshotFallback = allowFallback ? fallbackBuffers : NULL;
@@ -4074,12 +3965,6 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
                             cpuSnapshot = nil;
                         }
                         if (cpuSnapshot) struct_size = cpuSnapshot.bytes.length;
-                        else if (!metalLayoutResolved) {
-                            struct_size = resource->required_size;
-                            useMetalLayout = mglLooseMetalLayout(program->spirv[stage].msl_str,
-                                resource->name, metalMembers, &metalMemberCount, &struct_size);
-                            metalLayoutResolved = true;
-                        }
                         uint8_t stack_packed[256];
                         uint8_t *packed = cpuSnapshot ? (uint8_t *)cpuSnapshot.bytes.bytes
                             : (struct_size <= sizeof(stack_packed) ? stack_packed : (uint8_t *)calloc(1, struct_size));
@@ -4105,18 +3990,6 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
                             if (member_offset >= elem_byte_start) {
                                 member_offset -= elem_byte_start;
                             }
-                            const MGLLooseMetalMember *metalMember = NULL;
-                            if (useMetalLayout && member->name) {
-                                const char *memberName = strrchr(member->name, '.');
-                                memberName = memberName ? memberName + 1 : member->name;
-                                for (size_t mi = 0; mi < metalMemberCount; mi++) {
-                                    if (!strcmp(metalMembers[mi].name, memberName)) {
-                                        metalMember = &metalMembers[mi];
-                                        member_offset = (GLuint)metalMember->offset;
-                                        break;
-                                    }
-                                }
-                            }
                             if (member_offset >= struct_size) {
                                 continue;
                             }
@@ -4133,13 +4006,9 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
                                 /* Array member: each element stored at a
                                  * separate location (CTS convention: 1
                                  * location per leaf element). */
-                                GLuint elem_stride = (GLuint)member->array_stride;
-                                if (elem_stride == 0) {
-                                    /* Plain struct uniforms lack ArrayStride
-                                     * decorations; derive stride from the
-                                     * member's GL type (per-element byte size). */
-                                    elem_stride = mglGLTypeElementByteSize(member->gl_type);
-                                }
+                                GLuint elem_stride = member->array_stride > 0
+                                    ? (GLuint)member->array_stride : 0;
+                                if (!elem_stride) continue;
                                 for (GLint ai = 0; ai < member->size; ai++) {
                                     GLint elem_loc = member_loc + ai;
                                     if (elem_loc < 0 || elem_loc >= (GLint)MAX_BINDABLE_BUFFERS) {
@@ -4160,20 +4029,12 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
                                     if (!mbuf || !mbuf->data.buffer_data || mbuf->size <= 0) {
                                         continue;
                                     }
-                                    size_t copy_size = (size_t)mbuf->size;
-                                    if (copy_size > (size_t)elem_stride) {
-                                        copy_size = (size_t)elem_stride;
-                                    }
-                                    GLuint dest_off = member_offset +
-                                        (GLuint)(ai * elem_stride);
-                                    if ((size_t)dest_off + copy_size > struct_size) {
-                                        copy_size = struct_size - (size_t)dest_off;
-                                    }
-                                    if (copy_size > 0) {
-                                        memcpy(packed + dest_off,
-                                               (const void *)(uintptr_t)mbuf->data.buffer_data,
-                                               copy_size);
-                                    }
+                                    size_t dest_off = member_offset + (size_t)ai * elem_stride;
+                                    if (dest_off >= struct_size) continue;
+                                    mglPackPlainUniformElement(member, packed + dest_off,
+                                        MIN((size_t)elem_stride, struct_size - dest_off),
+                                        (const uint8_t *)(uintptr_t)mbuf->data.buffer_data,
+                                        (size_t)mbuf->size);
                                 }
                             } else {
                                 /* Scalar / vector / matrix member: all data
@@ -4193,31 +4054,10 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
                                 if (!mbuf || !mbuf->data.buffer_data || mbuf->size <= 0) {
                                     continue;
                                 }
-                                if (metalMember && metalMember->mat3 && mbuf->size >= 36 &&
-                                    (size_t)member_offset + 48 <= struct_size) {
-                                    const uint8_t *src = (const uint8_t *)(uintptr_t)mbuf->data.buffer_data;
-                                    if (mbuf->size >= 48) {
-                                        memcpy(packed + member_offset, src, 48);
-                                    } else {
-                                        for (size_t col = 0; col < 3; col++) {
-                                            memcpy(packed + member_offset + col * 16,
-                                                   src + col * 12, 12);
-                                        }
-                                    }
-                                    continue;
-                                }
-                                size_t copy_size = (size_t)mbuf->size;
-                                if (metalMember && copy_size > metalMember->size) {
-                                    copy_size = metalMember->size;
-                                }
-                                if ((size_t)member_offset + copy_size > struct_size) {
-                                    copy_size = struct_size - (size_t)member_offset;
-                                }
-                                if (copy_size > 0) {
-                                    memcpy(packed + member_offset,
-                                           (const void *)(uintptr_t)mbuf->data.buffer_data,
-                                           copy_size);
-                                }
+                                mglPackPlainUniformElement(member, packed + member_offset,
+                                    struct_size - member_offset,
+                                    (const uint8_t *)(uintptr_t)mbuf->data.buffer_data,
+                                    (size_t)mbuf->size);
                             }
                         }
 
@@ -4232,8 +4072,14 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
                                 if (!_packedUniformCPUSnapshots) _packedUniformCPUSnapshots = [NSMutableDictionary new];
                                 if (_packedUniformCPUSnapshots.count >= 128u ||
                                     _packedUniformCPUSnapshotBytes + created.retainedBytes > 8u * 1024u * 1024u) {
-                                    [_packedUniformCPUSnapshots removeAllObjects];
-                                    _packedUniformCPUSnapshotBytes = 0;
+                                    while (_packedUniformCPUSnapshots.count >= 128u ||
+                                        (_packedUniformCPUSnapshots.count &&
+                                         _packedUniformCPUSnapshotBytes + created.retainedBytes > 8u * 1024u * 1024u)) {
+                                        NSArray *victim = _packedUniformCPUSnapshots.allKeys.firstObject;
+                                        MGLPackedUniformSnapshot *old = _packedUniformCPUSnapshots[victim];
+                                        _packedUniformCPUSnapshotBytes -= old.retainedBytes;
+                                        [_packedUniformCPUSnapshots removeObjectForKey:victim];
+                                    }
                                 }
                                 _packedUniformCPUSnapshots[cpuKey] = created;
                                 _packedUniformCPUSnapshotBytes += created.retainedBytes;
@@ -4347,6 +4193,7 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
 	                    }
 	                }
 
+
                 NSUInteger reflectedRequiredSize =
                     [self getProgramBindingRequiredSize:stage type:spvc_type index:i];
 
@@ -4371,6 +4218,107 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
                     entry->size = baseBinding->size;
                     baseBinding->buffer = buf->name;
                     buffer_map->count++;
+
+                    /* Plain uniforms are read-only Program storage. Publish an
+                     * immutable CPU snapshot directly into the command-buffer
+                     * arena instead of allocating/uploading a Metal buffer for
+                     * each location. UBO/SSBO and writable buffers keep their
+                     * regular backing and mutation rules. */
+                    if (spvc_type == SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT &&
+                        mglPlainUniformArenaEnabled() &&
+                        (stage == _VERTEX_SHADER || stage == _FRAGMENT_SHADER) &&
+                        baseBinding->offset >= 0 && baseBinding->size > 0 &&
+                        buf->size > 0 && buf->data.buffer_data) {
+                        NSUInteger sourceOffset = (NSUInteger)baseBinding->offset;
+                        NSUInteger sourceSize = (NSUInteger)baseBinding->size;
+                        NSUInteger available = MIN((NSUInteger)buf->size,
+                                                   (NSUInteger)buf->data.buffer_size);
+                        if (sourceOffset <= available && sourceSize <= available - sourceOffset) {
+                            NSUInteger packedSize = MAX(sourceSize, reflectedRequiredSize);
+                            const uint8_t *source = (const uint8_t *)(uintptr_t)buf->data.buffer_data + sourceOffset;
+                            [self preparePackedUniformArenaForCurrentCommandBuffer];
+
+                            NSUInteger cacheIndex = mglPlainUniformArenaCacheHash(buf,
+                                                                                   sourceOffset,
+                                                                                   sourceSize,
+                                                                                   packedSize);
+                            MGLPlainUniformArenaCacheEntry *cacheSlot = NULL;
+                            Buffer *snapshot = NULL;
+                            GLintptr finalOffset = 0;
+                            for (NSUInteger probe = 0;
+                                 probe < MGL_PLAIN_UNIFORM_ARENA_CACHE_CAPACITY;
+                                 probe++) {
+                                MGLPlainUniformArenaCacheEntry *candidate =
+                                    &_plainUniformArenaCache[(cacheIndex + probe) &
+                                        (MGL_PLAIN_UNIFORM_ARENA_CACHE_CAPACITY - 1u)];
+                                if (!candidate->valid) {
+                                    cacheSlot = candidate;
+                                    break;
+                                }
+                                if (candidate->source_buffer != buf ||
+                                    candidate->source_offset != sourceOffset ||
+                                    candidate->source_size != sourceSize ||
+                                    candidate->packed_size != packedSize) {
+                                    continue;
+                                }
+
+                                cacheSlot = candidate;
+                                id<MTLBuffer> cachedArena = candidate->arena_buffer;
+                                if (cachedArena && cachedArena.contents &&
+                                    candidate->arena_offset <= candidate->arena_capacity &&
+                                    packedSize <= candidate->arena_capacity - candidate->arena_offset &&
+                                    sourceSize <= packedSize &&
+                                    memcmp(source,
+                                           (const uint8_t *)cachedArena.contents + candidate->arena_offset,
+                                           sourceSize) == 0) {
+                                    snapshot = [self packedStructBufferForArenaBuffer:cachedArena
+                                                                              capacity:candidate->arena_capacity
+                                                                                offset:candidate->arena_offset
+                                                                                  size:packedSize];
+                                    if (!snapshot) return false;
+                                }
+                                break;
+                            }
+
+                            if (snapshot) {
+                                finalOffset = (GLintptr)cacheSlot->arena_offset;
+                                mglPlainUniformCacheRecordEvent(YES);
+                            } else {
+                                uint8_t stackPadding[4096];
+                                uint8_t *heapPadding = NULL;
+                                const void *packedBytes = source;
+                                if (packedSize > sourceSize) {
+                                    uint8_t *padding = packedSize <= sizeof(stackPadding)
+                                        ? stackPadding : (heapPadding = malloc(packedSize));
+                                    if (!padding) return false;
+                                    memset(padding, 0, packedSize);
+                                    memcpy(padding, source, sourceSize);
+                                    packedBytes = padding;
+                                }
+                                snapshot = [self packedStructBufferWithData:packedBytes
+                                                                      size:packedSize
+                                                               snapshotKey:nil
+                                                            immutableBytes:nil
+                                                                    offset:&finalOffset];
+                                free(heapPadding);
+                                if (!snapshot) return false;
+                                mglPlainUniformCacheRecordEvent(NO);
+                                if (cacheSlot) {
+                                    cacheSlot->source_buffer = buf;
+                                    cacheSlot->source_offset = sourceOffset;
+                                    cacheSlot->source_size = sourceSize;
+                                    cacheSlot->packed_size = packedSize;
+                                    cacheSlot->arena_buffer = (__bridge id<MTLBuffer>)snapshot->data.mtl_data;
+                                    cacheSlot->arena_offset = (NSUInteger)finalOffset;
+                                    cacheSlot->arena_capacity = (NSUInteger)snapshot->data.buffer_size;
+                                    cacheSlot->valid = YES;
+                                }
+                            }
+                            entry->buf = snapshot;
+                            entry->offset = finalOffset;
+                            entry->size = (GLsizeiptr)packedSize;
+                        }
+                    }
 
                     if (mglProgramNeedsBindingTrace(program)) {
                         static uint64_t s_focusedUBOMapLogs = 0;
@@ -4409,8 +4357,8 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
                                     usedFallbackBinding ? 1 : 0);
                     }
 
-                    if (reflectedRequiredSize > 0 && baseBinding->size > 0 &&
-                        (NSUInteger)baseBinding->size < reflectedRequiredSize) {
+                    if (reflectedRequiredSize > 0 && entry->size > 0 &&
+                        (NSUInteger)entry->size < reflectedRequiredSize) {
                         GLuint programName = ctx ? ctx->state.program_name : 0u;
                         if (mglShouldLogSmallBaseBinding(programName,
                                                          stage,
@@ -4692,13 +4640,13 @@ static NSUInteger mglPackedUniformAlignUp(NSUInteger value, NSUInteger alignment
             break;
     }
 
-    if (mapped_buffers != count) {
+    if (mapped_buffers != count && mglTraceLogIsEnabled()) {
         static unsigned long long s_map_mismatch_hits = 0;
         s_map_mismatch_hits++;
         if ((s_map_mismatch_hits % 64ull) == 1ull) {
             Buffer *drawIndexBuffer = vao->element_array.buffer;
             void *indexBufferMetal = drawIndexBuffer ? drawIndexBuffer->data.mtl_data : NULL;
-            NSLog(@"MGL WARNING: mapGLBuffersToMTLBufferMap mismatch (pipeline=%p mapped=%u expected=%u stage=%d hit=%llu indexBuffer=%p vao=%p)",
+            mglTraceLog("MGL vertex input map summary (pipeline=%p mapped=%u expected=%u stage=%d hit=%llu indexBuffer=%p vao=%p)",
                   _pipelineState, mapped_buffers, count, stage, s_map_mismatch_hits, indexBufferMetal, vao);
         }
     }
@@ -4828,7 +4776,7 @@ static BOOL mglSnapshotSharedBufferRange(id<MTLDevice> device,
                 RETURN_FALSE_ON_NULL(ptr->data.mtl_data);
             }
 
-            id<MTLBuffer> buffer = (id<MTLBuffer>)SafeMetalBridge(ptr->data.mtl_data, objc_getClass("MTLBuffer"), "MTLBuffer");
+            id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)(ptr->data.mtl_data);
             if (!buffer) {
                 NSLog(@"MGL SECURITY ERROR: Failed to validate small Metal buffer (buffer %u)", ptr->name);
                 return false;
@@ -4972,8 +4920,7 @@ static BOOL mglSnapshotSharedBufferRange(id<MTLDevice> device,
             RETURN_FALSE_ON_NULL(ptr->data.mtl_data);
         }
 
-        // CRITICAL SECURITY FIX: Safe Metal buffer validation
-        id<MTLBuffer> buffer = (id<MTLBuffer>)SafeMetalBridge(ptr->data.mtl_data, objc_getClass("MTLBuffer"), "MTLBuffer");
+        id<MTLBuffer> buffer = (__bridge id<MTLBuffer>)(ptr->data.mtl_data);
         if (!buffer) {
             NSLog(@"MGL SECURITY ERROR: Failed to validate Metal buffer (buffer %u)", ptr->name);
             return false;
@@ -5622,6 +5569,120 @@ static BOOL mglSnapshotSharedBufferRange(id<MTLDevice> device,
     return texture;
 }
 
+/* Native views alias the current GL buffer storage. Misaligned ranges and
+ * RGB32 formats use ordered GPU copies, never CPU shadow data. */
+- (id<MTLTexture>)nativeTexelBufferForTexture:(Texture *)tex
+                                     buffer:(id<MTLBuffer>)source
+                                     format:(MTLPixelFormat)format
+                                      count:(NSUInteger)count
+                              bytesPerTexel:(NSUInteger)sourceBytes
+{
+    BOOL expand = mglTextureNeedsChannelExpansion(tex->internalformat, format);
+    NSUInteger destinationBytes = expand ? 16u : sourceBytes;
+    uint32_t alpha = 1u;
+    if (expand) {
+        if (sourceBytes != 12u ||
+            (format != MTLPixelFormatRGBA32Float && format != MTLPixelFormatRGBA32Sint &&
+             format != MTLPixelFormatRGBA32Uint)) return nil;
+        if (format == MTLPixelFormatRGBA32Float) alpha = 0x3f800000u;
+    }
+    NSUInteger alignment = [_device minimumTextureBufferAlignmentForPixelFormat:format];
+    NSUInteger activeBytes = count * destinationBytes;
+    NSUInteger rowBytes = ((activeBytes + alignment - 1u) / alignment) * alignment;
+    NSUInteger offset = (NSUInteger)tex->texture_buffer_offset;
+    BOOL direct = !mglEnvFlagEnabled("MGL_NATIVE_TEXEL_FORCE_STAGE") &&
+        !expand && offset % alignment == 0u &&
+        offset <= source.length && rowBytes <= source.length - offset;
+    id<MTLTexture> existing = (__bridge id<MTLTexture>)tex->mtl_data;
+    if (direct && existing.textureType == MTLTextureTypeTextureBuffer &&
+        existing.buffer == source && existing.bufferOffset == offset &&
+        existing.width == count && existing.pixelFormat == format) return existing;
+
+    id<MTLBuffer> backing = source;
+    NSUInteger viewOffset = offset;
+    if (!direct) {
+        backing = [_device newBufferWithLength:rowBytes options:MTLResourceStorageModePrivate];
+        if (!backing) return nil;
+        viewOffset = 0u;
+        [self endRenderEncoding];
+        if (![self ensureWritableCommandBuffer:"native_texel_buffer_stage"]) return nil;
+        if (expand) {
+            if (!_nativeTexelExpandPipeline) {
+                NSString *code = @"#include <metal_stdlib>\nusing namespace metal;\n"
+                    "kernel void expand_rgb32(device const uchar *s [[buffer(0)]], "
+                    "device uchar *d [[buffer(1)]], constant uint2 &p [[buffer(2)]], "
+                    "uint i [[thread_position_in_grid]]) { if(i>=p.x)return; "
+                    "for(uint b=0;b<12;b++)d[16*i+b]=s[12*i+b]; "
+                    "for(uint b=0;b<4;b++)d[16*i+12+b]=uchar(p.y>>(8*b)); }";
+                NSError *error = nil;
+                id<MTLLibrary> library = [self newMetalLibraryWithSource:code options:nil
+                    label:@"MGL native texel RGB32 expansion" error:&error];
+                id<MTLFunction> function = [library newFunctionWithName:@"expand_rgb32"];
+                if (function) _nativeTexelExpandPipeline = [_device newComputePipelineStateWithFunction:function error:&error];
+                if (!_nativeTexelExpandPipeline) { NSLog(@"MGL native texel expansion failed: %@", error); return nil; }
+            }
+            id<MTLComputeCommandEncoder> encoder = mglProfileCompute(_currentCommandBuffer, __func__, __LINE__);
+            if (!encoder) return nil;
+            uint32_t params[2] = {(uint32_t)count, alpha};
+            [encoder setComputePipelineState:_nativeTexelExpandPipeline];
+            [encoder setBuffer:source offset:offset atIndex:0];
+            [encoder setBuffer:backing offset:0 atIndex:1];
+            [encoder setBytes:params length:sizeof(params) atIndex:2];
+            [encoder dispatchThreads:MTLSizeMake(count,1,1) threadsPerThreadgroup:MTLSizeMake(
+                MIN((NSUInteger)64,_nativeTexelExpandPipeline.maxTotalThreadsPerThreadgroup),1,1)];
+            [encoder endEncoding];
+        } else {
+            id<MTLBlitCommandEncoder> encoder = mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
+            if (!encoder) return nil;
+            [encoder copyFromBuffer:source sourceOffset:offset toBuffer:backing destinationOffset:0 size:activeBytes];
+            [encoder endEncoding];
+        }
+    }
+    if (!direct && mglEnvFlagEnabled("MGL_NATIVE_TEXEL_VERIFY")) {
+        static unsigned verifyCount;
+        BOOL verify = NO;
+        @synchronized ([MGLRenderer class]) { if (verifyCount < 3u) { verifyCount++; verify = YES; } }
+        if (verify) {
+            NSUInteger sourceSize = count * sourceBytes;
+            NSUInteger destinationOffset = (sourceSize + 3u) & ~(NSUInteger)3u;
+            id<MTLBuffer> readback = [_device newBufferWithLength:destinationOffset + activeBytes
+                options:MTLResourceStorageModeShared];
+            if (!readback) return nil;
+            id<MTLBlitCommandEncoder> encoder = mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
+            if (!encoder) return nil;
+            [encoder copyFromBuffer:source sourceOffset:offset toBuffer:readback destinationOffset:0 size:sourceSize];
+            [encoder copyFromBuffer:backing sourceOffset:0 toBuffer:readback destinationOffset:destinationOffset size:activeBytes];
+            [encoder endEncoding];
+            [_currentCommandBuffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+                if (completed.status != MTLCommandBufferStatusCompleted) return;
+                const uint8_t *a = readback.contents;
+                const uint8_t *b = a + destinationOffset;
+                NSUInteger mismatches = 0;
+                for (NSUInteger i=0;i<count;i++) {
+                    mismatches += memcmp(a+i*sourceBytes,b+i*destinationBytes,sourceBytes) != 0;
+                    if (expand) mismatches += memcmp(b+i*destinationBytes+12u,&alpha,4u) != 0;
+                }
+                NSLog(@"MGL NATIVE TEXEL VERIFY format=%lu texels=%lu expand=%d mismatches=%lu",
+                    (unsigned long)format,(unsigned long)count,expand,(unsigned long)mismatches);
+            }];
+        }
+    }
+    MTLTextureDescriptor *descriptor = [MTLTextureDescriptor new];
+    descriptor.textureType = MTLTextureTypeTextureBuffer;
+    descriptor.pixelFormat = format;
+    descriptor.width = count;
+    descriptor.usage = MTLTextureUsageShaderRead;
+    descriptor.storageMode = backing.storageMode;
+    id<MTLTexture> result = [backing newTextureWithDescriptor:descriptor offset:viewOffset bytesPerRow:rowBytes];
+    if (result && mglEnvFlagEnabled("MGL_TEXBUFFER_DIAGNOSTICS")) {
+        static unsigned logCount;
+        if (logCount++ < 24u) NSLog(@"MGL NATIVE TEXBUFFER tex=%u buffer=%u format=%lu texels=%lu offset=%lu direct=%d expand=%d",
+            tex->name,tex->texture_buffer->name,(unsigned long)format,(unsigned long)count,
+            (unsigned long)offset,direct,expand);
+    }
+    return result;
+}
+
 - (id<MTLTexture>)createMTLTexelBufferTexture:(Texture *)tex
 {
     Buffer *sourceBuffer = tex->texture_buffer;
@@ -5664,7 +5725,7 @@ static BOOL mglSnapshotSharedBufferRange(id<MTLDevice> device,
         return nil;
     }
 
-    MTLPixelFormat bufferPixelFormat = (tex->internalformat == GL_RGBA8)
+    MTLPixelFormat bufferPixelFormat = (!mglNativeTexelBufferEnabled() && tex->internalformat == GL_RGBA8)
         ? MTLPixelFormatRGBA8Uint
         : mtlPixelFormatForGLTex(tex);
     if (bufferPixelFormat == MTLPixelFormatInvalid || bufferPixelFormat == 0) {
@@ -5679,6 +5740,14 @@ static BOOL mglSnapshotSharedBufferRange(id<MTLDevice> device,
               tex->name,
               sourceBuffer->name);
         return nil;
+    }
+
+    if (mglNativeTexelBufferEnabled()) {
+        id<MTLBuffer> source = (__bridge id<MTLBuffer>)sourceBuffer->data.mtl_data;
+        id<MTLTexture> native = [self nativeTexelBufferForTexture:tex buffer:source
+            format:bufferPixelFormat count:texelCount bytesPerTexel:bytesPerTexel];
+        if (native) tex->dirty_bits = 0;
+        return native;
     }
 
     const uint8_t *sourceBytes = NULL;
@@ -6775,84 +6844,10 @@ static BOOL mglSnapshotSharedBufferRange(id<MTLDevice> device,
 - (GLuint)textureUnitForSampledResource:(SpirvResource *)sampledResource metalBinding:(GLuint)metalBinding stage:(int)stage
 {
     Program *program = mglResolveProgramForStageFromState(ctx, stage);
-    if (!program) {
-        GLuint candidate = sampledResource &&
-                           sampledResource->sampler_unit >= 0 &&
-                           sampledResource->sampler_unit < TEXTURE_UNITS
-            ? (GLuint)sampledResource->sampler_unit
-            : metalBinding;
-        return candidate;
-    }
-
-    const char *sampledName = NULL;
-    if (!sampledResource && metalBinding < TEXTURE_UNITS) {
+    if (program && !sampledResource && metalBinding < TEXTURE_UNITS) {
         sampledResource = mglFindSamplerResourceForMetalBinding(program, stage, metalBinding);
     }
-    if (sampledResource) {
-        sampledName = sampledResource->name;
-    }
-
-    /*
-     * Minecraft usually assigns sampler texture units from the RenderPipeline
-     * sampler list, not from numeric suffixes like Sampler2. For example, chunk
-     * rendering declares Sampler0 and Sampler2, so Sampler2 can be uploaded
-     * through glUniform1i(..., 1). Keep sampler units on the exact reflected
-     * resource instead of only the Metal binding: vertex and fragment resources
-     * commonly share binding numbers, and binding-level state can make entity,
-     * hand, and text textures bleed into each other.
-     */
-    if (sampledResource &&
-        sampledResource->sampler_unit_explicit &&
-        sampledResource->sampler_unit >= 0 &&
-        sampledResource->sampler_unit < TEXTURE_UNITS) {
-        return (GLuint)sampledResource->sampler_unit;
-    }
-
-    if (metalBinding >= TEXTURE_UNITS) {
-        return metalBinding;
-    }
-
-    bool stageExplicit = (stage >= 0 && stage < _MAX_SHADER_TYPES)
-        ? (program->sampler_units_explicit_by_stage[stage][metalBinding] == GL_TRUE)
-        : false;
-    bool globalExplicit = (program->sampler_units_explicit[metalBinding] == GL_TRUE);
-
-    GLint unit = (stage >= 0 && stage < _MAX_SHADER_TYPES)
-        ? program->sampler_units_by_stage[stage][metalBinding]
-        : program->sampler_units[metalBinding];
-
-    if (stageExplicit && unit >= 0 && unit < TEXTURE_UNITS) {
-        return (GLuint)unit;
-    }
-
-    unit = program->sampler_units[metalBinding];
-    if (globalExplicit && unit >= 0 && unit < TEXTURE_UNITS) {
-        return (GLuint)unit;
-    }
-
-    GLint defaultUnit = (stage >= 0 && stage < _MAX_SHADER_TYPES)
-        ? program->sampler_units_by_stage[stage][metalBinding]
-        : program->sampler_units[metalBinding];
-    if (defaultUnit < 0 || defaultUnit >= TEXTURE_UNITS) {
-        defaultUnit = program->sampler_units[metalBinding];
-    }
-
-    if (sampledResource &&
-        !sampledResource->sampler_unit_explicit &&
-        sampledResource->sampler_unit >= 0 &&
-        sampledResource->sampler_unit < TEXTURE_UNITS) {
-        return (GLuint)sampledResource->sampler_unit;
-    }
-
-    if (defaultUnit >= 0 && defaultUnit < TEXTURE_UNITS) {
-        return (GLuint)defaultUnit;
-    }
-
-    /*
-     * OpenGL's valid default is unit 0, and explicit glUniform1i uploads above
-     * are authoritative. No name-based fallback is applied.
-     */
-    return 0u;
+    return (GLuint)mglResolveSamplerTextureUnit(program, sampledResource, metalBinding, stage);
 }
 
 - (GLuint)textureUnitForSampledBinding:(GLuint)metalBinding stage:(int)stage
@@ -7035,7 +7030,7 @@ static BOOL mglSnapshotSharedBufferRange(id<MTLDevice> device,
     id<MTLBuffer> readback = [_device newBufferWithLength:byteCount
                                                   options:MTLResourceStorageModeShared];
     id<MTLCommandBuffer> cb = [_commandQueue commandBuffer];
-    id<MTLBlitCommandEncoder> blit = cb ? [cb blitCommandEncoder] : nil;
+    id<MTLBlitCommandEncoder> blit = cb ? mglProfileBlit(cb, __func__, __LINE__) : nil;
     if (!readback || !cb || !blit) {
         MGLTraceNSLog(@"MGL TRACE sampled.readback setup-fail program=%u binding=%u glTex=%u reason=%@ readback=%p cb=%p blit=%p hit=%llu",
               (unsigned)program,
@@ -7402,25 +7397,12 @@ static BOOL mglSnapshotSharedBufferRange(id<MTLDevice> device,
     }
 
     SpirvResource *res = &ptr->spirv_resources_list[stage][type].list[index];
-    // Per-Program cache: the MSL string is immutable post-link, so the
-    // texture type for a given (program instance, generation, stage, binding)
-    // never changes.  The Program instance ID is never reused, even if malloc
-    // later reuses the Program's address.
-    MTLTextureType mslType;
-    if (mglResourceBindingPlanEnabled() && res->binding_plan_valid) {
-        mslType = (MTLTextureType)res->binding_plan_texture_type;
-    } else {
-        NSString *mslTextureCacheKey = [NSString stringWithFormat:@"T_%llu_%llu_%d_%u",
-                                        (unsigned long long)ptr->msl_texture_cache_instance_id,
-                                        (unsigned long long)ptr->msl_texture_cache_generation,
-                                        stage, (unsigned)res->binding];
-        NSNumber *cachedMslType = [_mslTextureTypeCache objectForKey:mslTextureCacheKey];
-        if (cachedMslType != nil) {
-            mslType = (MTLTextureType)[cachedMslType unsignedIntegerValue];
-        } else {
-            mslType = mglExpectedTextureTypeFromMSL(ptr->spirv[stage].msl_str, res->binding);
-            [_mslTextureTypeCache setObject:@(mslType) forKey:mslTextureCacheKey];
-        }
+    if (res->msl_texture_expectation_cache_instance_id != ptr->msl_texture_cache_instance_id ||
+        res->msl_texture_expectation_cache_generation != ptr->msl_texture_cache_generation) {
+        res->msl_texture_expectation_cache_instance_id = ptr->msl_texture_cache_instance_id;
+        res->msl_texture_expectation_cache_generation = ptr->msl_texture_cache_generation;
+        res->msl_expected_texture_type_valid = 0;
+        res->msl_expected_texture_data_kind_valid = 0;
     }
 
     MTLTextureType spirvType = 0;
@@ -7449,21 +7431,37 @@ static BOOL mglSnapshotSharedBufferRange(id<MTLDevice> device,
             break;
     }
 
-    if (mslType != 0 && mslType != spirvType) {
-        static uint64_t s_mslTextureTypeOverrideCount = 0;
-        uint64_t hit = ++s_mslTextureTypeOverrideCount;
-        if (hit <= 32ull || (hit % 512ull) == 0ull) {
-            NSLog(@"MGL TEX EXPECT override from MSL stage=%d type=%d index=%d binding=%u name=%s spirvType=%lu mslType=%lu imageDim=%u hit=%llu",
-                  stage,
-                  type,
-                  index,
-                  (unsigned)res->binding,
-                  res->name ? res->name : "(null)",
-                  (unsigned long)spirvType,
-                  (unsigned long)mslType,
-                  (unsigned)res->image_dim,
-                  (unsigned long long)hit);
+    MTLTextureType mslType;
+    if (mglResourceBindingPlanEnabled() && res->binding_plan_valid) {
+        mslType = (MTLTextureType)res->binding_plan_texture_type;
+    } else if (res->msl_expected_texture_type_valid) {
+        mslType = (MTLTextureType)res->msl_expected_texture_type;
+    } else {
+        mslType = mglExpectedTextureTypeFromMSL(ptr->spirv[stage].msl_str, res->binding);
+        res->msl_expected_texture_type = (uint32_t)mslType;
+        res->msl_expected_texture_type_valid = 1;
+
+        /* The override diagnostic describes the cached MSL expectation. Emit
+         * it only when that expectation is first computed for this generation. */
+        if (mslType != 0 && mslType != spirvType) {
+            static uint64_t s_mslTextureTypeOverrideCount = 0;
+            uint64_t hit = ++s_mslTextureTypeOverrideCount;
+            if (hit <= 32ull || (hit % 512ull) == 0ull) {
+                NSLog(@"MGL TEX EXPECT override from MSL stage=%d type=%d index=%d binding=%u name=%s spirvType=%lu mslType=%lu imageDim=%u hit=%llu",
+                      stage,
+                      type,
+                      index,
+                      (unsigned)res->binding,
+                      res->name ? res->name : "(null)",
+                      (unsigned long)spirvType,
+                      (unsigned long)mslType,
+                      (unsigned)res->image_dim,
+                      (unsigned long long)hit);
+            }
         }
+    }
+
+    if (mslType != 0 && mslType != spirvType) {
         return mslType;
     }
 
@@ -7492,20 +7490,25 @@ static BOOL mglSnapshotSharedBufferRange(id<MTLDevice> device,
         MGLTextureDataKind kind = (MGLTextureDataKind)res->binding_plan_texture_kind;
         return kind != MGLTextureDataKindUnknown ? kind : MGLTextureDataKindFloat;
     }
-    NSString *mslDataKindCacheKey = [NSString stringWithFormat:@"K_%llu_%llu_%d_%u",
-                                      (unsigned long long)ptr->msl_texture_cache_instance_id,
-                                      (unsigned long long)ptr->msl_texture_cache_generation,
-                                      stage, (unsigned)res->binding];
-    NSNumber *cachedMslKind = [_mslTextureTypeCache objectForKey:mslDataKindCacheKey];
-    if (cachedMslKind != nil) {
-        return (MGLTextureDataKind)[cachedMslKind unsignedIntegerValue];
+
+    if (res->msl_texture_expectation_cache_instance_id != ptr->msl_texture_cache_instance_id ||
+        res->msl_texture_expectation_cache_generation != ptr->msl_texture_cache_generation) {
+        res->msl_texture_expectation_cache_instance_id = ptr->msl_texture_cache_instance_id;
+        res->msl_texture_expectation_cache_generation = ptr->msl_texture_cache_generation;
+        res->msl_expected_texture_type_valid = 0;
+        res->msl_expected_texture_data_kind_valid = 0;
+    }
+
+    if (res->msl_expected_texture_data_kind_valid) {
+        return (MGLTextureDataKind)res->msl_expected_texture_data_kind;
     }
 
     MGLTextureDataKind mslKind =
         mglExpectedTextureDataKindFromMSL(ptr->spirv[stage].msl_str, res->binding);
     MGLTextureDataKind resolvedKind =
         mslKind != MGLTextureDataKindUnknown ? mslKind : MGLTextureDataKindFloat;
-    [_mslTextureTypeCache setObject:@(resolvedKind) forKey:mslDataKindCacheKey];
+    res->msl_expected_texture_data_kind = (uint32_t)resolvedKind;
+    res->msl_expected_texture_data_kind_valid = 1;
     return resolvedKind;
 }
 
@@ -7948,6 +7951,24 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
     s_lastPixelWidth = pixelWidth;
     s_lastPixelHeight = pixelHeight;
     return newDrawableSize;
+}
+
+- (BOOL)ensureDrawableAvailableLocked:(const char *)reason
+{
+    if (_drawable && _drawable.texture) {
+        return YES;
+    }
+    if (!_layer) {
+        return NO;
+    }
+
+    /* A previous drawable with a nil texture is unusable; drop it before
+     * asking the layer for a fresh one. Do not touch GL scissor state here:
+     * callers may have explicitly set it before the first drawable use. */
+    _drawable = nil;
+    [self mglSyncLayerDrawableSizeFromView:reason ? reason : "ensureDrawable"];
+    _drawable = [_layer nextDrawable];
+    return (_drawable != nil && _drawable.texture != nil);
 }
 
 - (BOOL)mglEnsureLayerDrawableSizeAtLeastWidth:(NSUInteger)requiredWidth
@@ -8846,7 +8867,7 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
         }
     }
 
-    id <MTLComputeCommandEncoder> computeCommandEncoder = [_currentCommandBuffer computeCommandEncoder];
+    id <MTLComputeCommandEncoder> computeCommandEncoder = mglProfileCompute(_currentCommandBuffer, __func__, __LINE__);
     if (!computeCommandEncoder) {
         NSLog(@"MGL ERROR: Failed to create compute command encoder");
         return;
@@ -8976,7 +8997,7 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
         }
     }
 
-    id<MTLComputeCommandEncoder> computeCommandEncoder = [_currentCommandBuffer computeCommandEncoder];
+    id<MTLComputeCommandEncoder> computeCommandEncoder = mglProfileCompute(_currentCommandBuffer, __func__, __LINE__);
     if (!computeCommandEncoder) {
         NSLog(@"MGL ERROR: Failed to create compute command encoder for indirect dispatch");
         return;
@@ -9112,6 +9133,25 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
     [self flushCommandBuffer: finish];
 }
 
+-(void) mtlMemoryBarrier:(GLMContext) glm_ctx
+{
+    METAL_LOCK();
+    ctx = glm_ctx;
+    [self flushDrawBuffer:glm_ctx];
+    [self endRenderEncodingLocked];
+    METAL_UNLOCK();
+}
+
+// GLFW swap interval controls Metal presentation for this window/context.
+- (void)setSwapInterval:(int)interval
+{
+    METAL_LOCK();
+    _swapInterval = interval;
+    _layer.displaySyncEnabled = interval != 0;
+    NSLog(@"MGL PRESENT swapInterval=%d displaySyncEnabled=%d", interval, (int)_layer.displaySyncEnabled);
+    METAL_UNLOCK();
+}
+
 #pragma mark C interface to mtlSwapBuffers
 -(void) mtlSwapBuffers:(GLMContext) glm_ctx
 {
@@ -9130,6 +9170,15 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
     static volatile double s_mainThreadHeartbeatSeconds = 0.0;
     static volatile uint64_t s_mainThreadPingCount = 0;
     uint64_t swapCall = ++s_swapCallCount;
+    if (mglPerfSummaryEnabled() && (swapCall == 1u || swapCall == 60u || swapCall % 300u == 0u)) {
+        NSWindow *window = _view.window;
+        NSLog(@"MGL PRESENT STATE call=%llu active=%d visible=%d occlusionVisible=%d refresh=%ld drawableCount=%lu",
+              (unsigned long long)swapCall, (int)NSApp.isActive,
+              (int)window.isVisible,
+              (int)((window.occlusionState & NSWindowOcclusionStateVisible) != 0),
+              (long)window.screen.maximumFramesPerSecond,
+              (unsigned long)_layer.maximumDrawableCount);
+    }
     double swapStartSeconds = mglNowSeconds();
     bool traceSwap = mglShouldTraceCall(swapCall);
     MGL_FRAME_STORE(g_mglSwapCallCount, swapCall);
@@ -9286,8 +9335,12 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
             return;
         }
 
-        if (_drawable == NULL)
-        {
+        if (_deferDrawableAcquireEnabled) {
+            if (![self ensureDrawableAvailableLocked:"swap.present"]) {
+                NSLog(@"MGL ERROR: Failed to obtain drawable for presentation");
+                return;
+            }
+        } else if (_drawable == NULL) {
             if (traceSwap) {
                 MGLTraceNSLog(@"MGL TRACE swap.nextDrawable.begin call=%llu stage=pre_present", (unsigned long long)swapCall);
             }
@@ -9304,7 +9357,7 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
             }
         }
 
-        if (_drawable == NULL) {
+        if (!_deferDrawableAcquireEnabled && _drawable == NULL) {
             NSLog(@"MGL WARNING: Drawable is NULL in mtlSwapBuffers, getting new drawable");
             if (traceSwap) {
                 MGLTraceNSLog(@"MGL TRACE swap.nextDrawable.begin call=%llu stage=pre_present_retry", (unsigned long long)swapCall);
@@ -9341,9 +9394,12 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
 
         // Opt-in capture of the actual presented pixels for visual debugging.
         static BOOL captureSwapFrames = NO;
+        static uint64_t captureSwapFrame = 0;
         static dispatch_once_t captureSwapFramesOnce;
         dispatch_once(&captureSwapFramesOnce, ^{
             captureSwapFrames = getenv("MGL_CAPTURE_SWAP_FRAMES") != NULL;
+            const char *singleFrame = getenv("MGL_CAPTURE_SWAP_FRAME");
+            if (singleFrame) captureSwapFrame = strtoull(singleFrame, NULL, 10);
         });
         if (captureSwapFrames && swapCall <= 3ull) {
             NSLog(@"MGL capture swap call=%llu format=%lu drawable=%p size=%lux%lu",
@@ -9351,9 +9407,12 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
                   drawableTexture, (unsigned long)drawableTexture.width,
                   (unsigned long)drawableTexture.height);
         }
-        if (captureSwapFrames && drawableTexture &&
-            (swapCall <= 3ull || (swapCall <= 600ull && swapCall % 30ull == 0ull) ||
-             (swapCall > 600ull && swapCall <= 9000ull && swapCall % 300ull == 0ull)) &&
+        BOOL captureThisFrame = captureSwapFrame > 0
+            ? swapCall == captureSwapFrame
+            : captureSwapFrames &&
+              (swapCall <= 3ull || (swapCall <= 600ull && swapCall % 30ull == 0ull) ||
+               (swapCall > 600ull && swapCall <= 9000ull && swapCall % 300ull == 0ull));
+        if (captureThisFrame && drawableTexture &&
             (drawableTexture.pixelFormat == MTLPixelFormatBGRA8Unorm ||
              drawableTexture.pixelFormat == MTLPixelFormatBGRA8Unorm_sRGB)) {
             NSUInteger width = drawableTexture.width;
@@ -9361,7 +9420,7 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
             NSUInteger rowBytes = (width * 4u + 255u) & ~255u;
             id<MTLBuffer> captureBuffer = [_device newBufferWithLength:rowBytes * height
                                                                options:MTLResourceStorageModeShared];
-            id<MTLBlitCommandEncoder> captureBlit = [_currentCommandBuffer blitCommandEncoder];
+            id<MTLBlitCommandEncoder> captureBlit = mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
             [captureBlit copyFromTexture:drawableTexture
                              sourceSlice:0 sourceLevel:0
                             sourceOrigin:MTLOriginMake(0, 0, 0)
@@ -9426,7 +9485,14 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
                       (unsigned long)_drawable.texture.pixelFormat);
             }
 
-            [_currentCommandBuffer presentDrawable: _drawable];
+            if (_swapInterval > 1) {
+                NSInteger refreshRate = _view.window.screen.maximumFramesPerSecond;
+                if (refreshRate <= 0) refreshRate = 60;
+                [_currentCommandBuffer presentDrawable:_drawable
+                    afterMinimumDuration:(double)_swapInterval / (double)refreshRate];
+            } else {
+                [_currentCommandBuffer presentDrawable:_drawable];
+            }
             if (traceSwap) {
                 MGLTraceNSLog(@"MGL TRACE swap.present call=%llu cb=%p drawable=%p",
                       (unsigned long long)swapCall, _currentCommandBuffer, _drawable);
@@ -9458,28 +9524,38 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
             [self recordGPUError];
         }
 
-        if (traceSwap) {
-            MGLTraceNSLog(@"MGL TRACE swap.nextDrawable.begin call=%llu stage=post_commit", (unsigned long long)swapCall);
-        }
-        static uint32_t s_postCommitNextDrawableLogBudget = 4;
-        if (s_postCommitNextDrawableLogBudget > 0) {
-            s_postCommitNextDrawableLogBudget--;
-            NSLog(@"MGL VIEW: postCommitNextDrawable layer=%p superlayer=%p view=%p view.layer=%p view.window=%p",
-                  _layer, _layer.superlayer, _view, _view.layer, _view.window);
-        }
-        _drawable = [_layer nextDrawable];
-        if (traceSwap) {
-            id<MTLTexture> tex = _drawable ? _drawable.texture : nil;
-            MGLTraceNSLog(@"MGL TRACE swap.nextDrawable.end call=%llu stage=post_commit drawable=%p tex=%p size=%lux%lu",
-                  (unsigned long long)swapCall,
-                  _drawable,
-                  tex,
-                  (unsigned long)(tex ? tex.width : 0),
-                  (unsigned long)(tex ? tex.height : 0));
-        }
-        if (_drawable == NULL) {
-            NSLog(@"MGL WARNING: Failed to get next drawable in mtlSwapBuffers");
-            return;
+        if (_deferDrawableAcquireEnabled) {
+            /* Never carry a submitted drawable into the next frame. The next
+             * default-framebuffer operation will acquire one on demand. */
+            _drawable = nil;
+        } else {
+            /* The submitted command buffer owns its presentation resource.
+             * Preserve the legacy eager prefetch when the experiment is off. */
+            if (mglEnvFlagEnabled("MGL_RELEASE_PRESENTED_DRAWABLE")) _drawable = nil;
+
+            if (traceSwap) {
+                MGLTraceNSLog(@"MGL TRACE swap.nextDrawable.begin call=%llu stage=post_commit", (unsigned long long)swapCall);
+            }
+            static uint32_t s_postCommitNextDrawableLogBudget = 4;
+            if (s_postCommitNextDrawableLogBudget > 0) {
+                s_postCommitNextDrawableLogBudget--;
+                NSLog(@"MGL VIEW: postCommitNextDrawable layer=%p superlayer=%p view=%p view.layer=%p view.window=%p",
+                      _layer, _layer.superlayer, _view, _view.layer, _view.window);
+            }
+            _drawable = [_layer nextDrawable];
+            if (traceSwap) {
+                id<MTLTexture> tex = _drawable ? _drawable.texture : nil;
+                MGLTraceNSLog(@"MGL TRACE swap.nextDrawable.end call=%llu stage=post_commit drawable=%p tex=%p size=%lux%lu",
+                      (unsigned long long)swapCall,
+                      _drawable,
+                      tex,
+                      (unsigned long)(tex ? tex.width : 0),
+                      (unsigned long)(tex ? tex.height : 0));
+            }
+            if (_drawable == NULL) {
+                NSLog(@"MGL WARNING: Failed to get next drawable in mtlSwapBuffers");
+                return;
+            }
         }
 
         if (![self newCommandBufferLocked]) {
@@ -9591,7 +9667,7 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
                     copyPass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
                     copyPass.colorAttachments[0].storeAction = MTLStoreActionStore;
 
-                    id<MTLRenderCommandEncoder> copyEncoder = [_currentCommandBuffer renderCommandEncoderWithDescriptor:copyPass];
+                    id<MTLRenderCommandEncoder> copyEncoder = mglProfileRender(_currentCommandBuffer, copyPass, __func__, __LINE__, ctx ? ctx->state.program_name : 0, ctx && ctx->state.framebuffer ? ctx->state.framebuffer->name : 0);
                     if (copyEncoder) {
                         [copyEncoder setRenderPipelineState:pipeline];
                         [copyEncoder setVertexBytes:&params length:sizeof(params) atIndex:0];
@@ -9717,7 +9793,7 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
                     return;
                 }
 
-                id<MTLBlitCommandEncoder> sampleEncoder = [_currentCommandBuffer blitCommandEncoder];
+                id<MTLBlitCommandEncoder> sampleEncoder = mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
                 if (!sampleEncoder) {
                     NSLog(@"MGL WARNING: swap.sample.%@ call=%llu failed(create blit encoder)",
                           sampleTag,
@@ -9989,11 +10065,15 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
         GLuint drawBufferIndex = mglDefaultDrawBufferIndexForGL(glm_ctx->state.draw_buffer);
         if (wantsColor) {
             if (drawBufferIndex == _FRONT) {
-                if (!_drawable && _layer) {
+                if (_deferDrawableAcquireEnabled) {
+                    if (![self ensureDrawableAvailableLocked:"scissored-clear.defaultFramebuffer"]) {
+                        wantsColor = NO;
+                    }
+                } else if (!_drawable && _layer) {
                     [self mglSyncLayerDrawableSizeFromView:"scissored-clear.nextDrawable"];
                     _drawable = [_layer nextDrawable];
                 }
-                colorTexture = _drawable ? _drawable.texture : nil;
+                if (wantsColor) colorTexture = _drawable ? _drawable.texture : nil;
             } else if (drawBufferIndex < _MAX_DRAW_BUFFERS) {
                 colorTexture = _drawBuffers[drawBufferIndex].drawbuffer;
                 if (!colorTexture) {
@@ -10104,7 +10184,7 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
         return;
     }
 
-    id<MTLRenderCommandEncoder> clearEncoder = [_currentCommandBuffer renderCommandEncoderWithDescriptor:clearPass];
+    id<MTLRenderCommandEncoder> clearEncoder = mglProfileRender(_currentCommandBuffer, clearPass, __func__, __LINE__, ctx ? ctx->state.program_name : 0, ctx && ctx->state.framebuffer ? ctx->state.framebuffer->name : 0);
     if (!clearEncoder) {
         NSLog(@"MGL ERROR: scissored clear failed to create render encoder");
         return;
@@ -11080,7 +11160,7 @@ Buffer *getIndirectBuffer(GLMContext ctx)
         }
     }
 
-    id<MTLComputeCommandEncoder> computeEncoder = [_currentCommandBuffer computeCommandEncoder];
+    id<MTLComputeCommandEncoder> computeEncoder = mglProfileCompute(_currentCommandBuffer, __func__, __LINE__);
     if (!computeEncoder) {
         NSLog(@"MGL TESS ERROR: failed to create compute encoder for TCS dispatch");
         return false;
@@ -11396,7 +11476,7 @@ Buffer *getIndirectBuffer(GLMContext ctx)
         }
     }
 
-    id<MTLComputeCommandEncoder> computeEncoder = [_currentCommandBuffer computeCommandEncoder];
+    id<MTLComputeCommandEncoder> computeEncoder = mglProfileCompute(_currentCommandBuffer, __func__, __LINE__);
     if (!computeEncoder) {
         NSLog(@"MGL TESS ERROR: failed to create compute encoder for TES dispatch");
         return false;
@@ -11550,7 +11630,7 @@ Buffer *getIndirectBuffer(GLMContext ctx)
         glm_ctx->state.transform_feedback->active &&
         !glm_ctx->state.transform_feedback->paused) {
         BufferBaseTarget *xfbSlot =
-            &glm_ctx->state.buffer_base[_TRANSFORM_FEEDBACK_BUFFER].buffers[0];
+            &mglStateBufferBaseTargets(&glm_ctx->state, _TRANSFORM_FEEDBACK_BUFFER)[0];
         if (xfbSlot->buf) {
             /* Lazily create Metal buffer backing if not yet created. */
             if (!xfbSlot->buf->data.mtl_data) {
@@ -11769,6 +11849,7 @@ Buffer *getIndirectBuffer(GLMContext ctx)
     glm_ctx->mtl_funcs.mtlGetSyncStatus = mtlGetSyncStatus;
     glm_ctx->mtl_funcs.mtlReleaseSync = mtlReleaseSync;
     glm_ctx->mtl_funcs.mtlFlush = mtlFlush;
+    glm_ctx->mtl_funcs.mtlMemoryBarrier = mtlMemoryBarrier;
     glm_ctx->mtl_funcs.mtlSwapBuffers = mtlSwapBuffers;
     glm_ctx->mtl_funcs.mtlFlushDrawBuffer = mtlFlushDrawBuffer;
     glm_ctx->mtl_funcs.mtlInvalidateRenderPass = mtlInvalidateRenderPass;
@@ -11955,6 +12036,12 @@ void* CppCreateMGLRendererAndBindToContext (void *glm_ctx)
     _pipelineStencilFormat = MTLPixelFormatInvalid;
     _pipelineProgramName = 0;
     _pipelineStateCache = [[NSMutableDictionary alloc] initWithCapacity:64];
+    _earlyPipelineCacheEnabled = mglEnvFlagEnabled("MGL_EARLY_PIPELINE_CACHE");
+    _earlyPipelineCacheVerify = mglEnvFlagEnabled("MGL_EARLY_PIPELINE_CACHE_VERIFY");
+    if (_earlyPipelineCacheEnabled) {
+        _earlyPipelineStateCache = [NSCache new];
+        _earlyPipelineStateCache.countLimit = 256u;
+    }
     _dsCacheEnabled = mglEnvFlagEnabledDefaultOn("MGL_DS_CACHE");
     if (_dsCacheEnabled) {
         _depthStencilStateCache = [NSMutableDictionary new];
@@ -12058,6 +12145,10 @@ void* CppCreateMGLRendererAndBindToContext (void *glm_ctx)
     NSLog(@"MGL INFO: PROPER FIX - Creating Metal layer with AGX-safe settings");
 
     _layer = [[CAMetalLayer alloc] init];
+    _swapInterval = 1;
+    _earlySamplePreflightEnabled = mglEnvFlagEnabled("MGL_EARLY_SAMPLE_PREFLIGHT");
+    _deferDrawableAcquireEnabled = mglEnvFlagEnabledDefaultOn("MGL_DEFER_DRAWABLE_ACQUIRE");
+    _layer.displaySyncEnabled = YES;
     if (!_layer) {
         NSLog(@"MGL ERROR: Failed to create Metal layer");
         return;
@@ -12278,6 +12369,8 @@ void* CppCreateMGLRendererAndBindToContext (void *glm_ctx)
             [_pipelineStateCache removeAllObjects];
             _pipelineStateCache = nil;
         }
+        [_earlyPipelineStateCache removeAllObjects];
+        _earlyPipelineStateCache = nil;
 
         // Cleanup drawable and layer
         if (_drawable) {
@@ -12501,6 +12594,7 @@ void* CppCreateMGLRendererAndBindToContext (void *glm_ctx)
     // Reset pipeline state
     _pipelineState = nil;
     [_pipelineStateCache removeAllObjects];
+    [_earlyPipelineStateCache removeAllObjects];
     // Note: _depthStencilState would be an instance variable if it exists
 
     // Clear all cached objects

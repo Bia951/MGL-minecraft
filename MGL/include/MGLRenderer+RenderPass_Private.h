@@ -104,10 +104,20 @@ void mglEnableIndirectCommandBuffersForPipeline(MTLRenderPipelineDescriptor *pip
 @end
 
 @interface MGLRenderer ()
+/* Caller holds the renderer's Metal state lock. Does not alter GL scissor state. */
+- (BOOL)ensureDrawableAvailableLocked:(const char *)reason;
 // === Render pass state sync ===
 - (bool)syncRenderPassStateForContext:(GLMContext)glm_ctx;
 - (bool)rotateRenderEncoderForCurrentFramebufferLocked;
-- (bool)syncPipelineStateWithDeferredBufferMap:(bool)deferredBufferMapForPipelineBuild;
+- (bool)syncPipelineStateWithDeferredBufferMap:(bool)deferredBufferMapForPipelineBuild
+                       mappedCommandBuffer:(id<MTLCommandBuffer> *)mappedCommandBuffer;
+- (uint64_t)fragmentSampleFlipMaskForProgram:(Program *)program;
+- (id<MTLTexture>)sampleFlipTextureViewForObject:(Texture *)object;
+- (id<MTLFunction>)sampleFlipSpecializedFragmentFunctionForProgram:(Program *)program
+                                                    baseFunction:(id<MTLFunction>)baseFunction
+                                                            mask:(uint64_t)mask;
+- (bool)processDirtyStateDomainsLocked:(bool)draw_command
+                   mappedCommandBuffer:(id<MTLCommandBuffer> *)mappedCommandBuffer;
 - (BOOL)shouldUseDontCareLoadForColorTexture:(Texture *)tex
                              firstUseThisFrame:(BOOL)firstUseThisFrame;
 - (BOOL)prepareRenderPassIfFBOChanged:(MGLDrawBatch *)batch

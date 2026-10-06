@@ -30,10 +30,22 @@
 #include "mgl_frame_activity.h"
 #include "mgl_trace_log.h"
 #include "mgl_sampler_compat.h"
+#include "mgl_spirv_resource.h"
 
 /* === Task 4: Snapshot Arena (bump allocator) === */
 
 #define MGL_ARENA_INITIAL_CAPACITY  (4u * 1024u * 1024u)  /* 4 MB */
+
+int mglUniformVersionsEnabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = getenv("MGL_UNIFORM_VERSIONS");
+        /* Keep immutable replay opt-in until whole-frame measurements show a win. */
+        enabled = (value && value[0] != '\0' && strcmp(value, "0") != 0) ? 1 : 0;
+    }
+    return enabled;
+}
 
 struct MGLBatchArenaChunk {
     struct MGLBatchArenaChunk *next;
@@ -177,9 +189,150 @@ static void mglDestroyTransientBuffer(GLMContext ctx, Buffer *buffer)
     free(buffer);
 }
 
+void mglRetainPlainUniformVersion(MGLPlainUniformVersion *version)
+{
+    if (version && version->refcount != UINT32_MAX) {
+        version->refcount++;
+    }
+}
+
+void mglReleasePlainUniformVersion(GLMContext ctx, MGLPlainUniformVersion *version)
+{
+    if (!version || version->refcount == 0u || --version->refcount != 0u) {
+        return;
+    }
+
+    for (GLuint i = 0; i < version->buffer_count; i++) {
+        Buffer *buffer = &version->buffers[i];
+        if (ctx && ctx->mtl_funcs.release_buffer_metal_data) {
+            ctx->mtl_funcs.release_buffer_metal_data(ctx, buffer);
+        }
+    }
+    free(version->data_bytes);
+    free(version->buffers);
+    free(version);
+}
+
+void mglInvalidateProgramPlainUniformVersion(GLMContext ctx, Program *program)
+{
+    if (!program || !program->plain_uniform_current_version) {
+        return;
+    }
+
+    MGLPlainUniformVersion *version = program->plain_uniform_current_version;
+    program->plain_uniform_current_version = NULL;
+    mglReleasePlainUniformVersion(ctx, version);
+}
+
+MGLPlainUniformVersion *mglGetProgramPlainUniformVersion(GLMContext ctx,
+                                                         Program *program)
+{
+    if (!ctx || !program) {
+        return NULL;
+    }
+
+    MGLPlainUniformVersion *cached = program->plain_uniform_current_version;
+    if (cached && cached->generation == program->plain_uniform_generation) {
+        mglRetainPlainUniformVersion(cached);
+        return cached;
+    }
+    mglInvalidateProgramPlainUniformVersion(ctx, program);
+
+    MGLPlainUniformVersion *version = calloc(1, sizeof(*version));
+    if (!version) {
+        return NULL;
+    }
+    version->generation = program->plain_uniform_generation;
+    version->refcount = 1u; /* Program cache ownership. */
+
+    GLuint buffer_count = 0u;
+    size_t data_bytes_size = 0u;
+    for (GLuint slot = 0; slot < MAX_BINDABLE_BUFFERS; slot++) {
+        Buffer *source = program->plain_uniform_buffers[slot].buf;
+        if (!source) {
+            continue;
+        }
+        buffer_count++;
+
+        size_t copy_size = source->size > 0 ? (size_t)source->size : 0u;
+        if (copy_size == 0u) {
+            continue;
+        }
+        if (!source->data.buffer_data || source->data.buffer_size < copy_size ||
+            data_bytes_size > SIZE_MAX - 15u) {
+            mglReleasePlainUniformVersion(ctx, version);
+            return NULL;
+        }
+        data_bytes_size = (data_bytes_size + 15u) & ~(size_t)15u;
+        if (copy_size > SIZE_MAX - data_bytes_size) {
+            mglReleasePlainUniformVersion(ctx, version);
+            return NULL;
+        }
+        data_bytes_size += copy_size;
+    }
+    if (buffer_count > 0u) {
+        version->buffers = calloc(buffer_count, sizeof(*version->buffers));
+        if (!version->buffers) {
+            mglReleasePlainUniformVersion(ctx, version);
+            return NULL;
+        }
+    }
+    if (data_bytes_size > 0u) {
+        version->data_bytes = malloc(data_bytes_size);
+        if (!version->data_bytes) {
+            mglReleasePlainUniformVersion(ctx, version);
+            return NULL;
+        }
+    }
+
+    size_t data_offset = 0u;
+    for (GLuint slot = 0; slot < MAX_BINDABLE_BUFFERS; slot++) {
+        const BufferBaseTarget *source_binding = &program->plain_uniform_buffers[slot];
+        Buffer *source = source_binding->buf;
+        if (!source) {
+            continue;
+        }
+        Buffer *copy = &version->buffers[version->buffer_count++];
+        *copy = *source;
+        copy->name = 0u;
+        copy->data.mtl_data = NULL;
+        copy->data.buffer_data = 0;
+        copy->data.buffer_size = 0;
+        copy->data.dirty_bits = DIRTY_BUFFER_ADDR;
+        copy->mapped = GL_FALSE;
+        copy->mapped_ptr = NULL;
+        copy->transient_batch_buffer = GL_TRUE;
+        copy->last_write_src_ptr = NULL;
+        copy->last_write_src_hash = 0u;
+
+        size_t copy_size = copy->size > 0 ? (size_t)copy->size : 0u;
+        if (copy_size > 0u) {
+            data_offset = (data_offset + 15u) & ~(size_t)15u;
+            void *bytes = (uint8_t *)version->data_bytes + data_offset;
+            memcpy(bytes, (const void *)(uintptr_t)source->data.buffer_data, copy_size);
+            copy->data.buffer_data = (vm_address_t)(uintptr_t)bytes;
+            copy->data.buffer_size = copy_size;
+            data_offset += copy_size;
+        }
+
+        BufferBaseTarget *destination = &version->slots[slot];
+        *destination = *source_binding;
+        destination->buffer = 0u;
+        destination->buf = copy;
+    }
+
+    program->plain_uniform_current_version = version;
+    mglRetainPlainUniformVersion(version); /* Batch ownership. */
+    return version;
+}
+
 static void mglReleaseBatch(GLMContext ctx, MGLDrawBatch *batch)
 {
     if (!batch) return;
+
+    if (ctx && ctx->trusted_replay_vao == (VertexArray *)batch->vao_snapshot) {
+        ctx->trusted_replay_vao = NULL;
+    }
 
     /* Arena-managed allocations (commands, state_snapshot, vao_snapshot) are
      * freed collectively via arena reset (mglResetBatchArena), not
@@ -203,6 +356,18 @@ static void mglReleaseBatch(GLMContext ctx, MGLDrawBatch *batch)
         batch->vao_snapshot = NULL;
     }
     batch->source_vao = NULL;
+    if (batch->plain_uniform_version) {
+        mglReleasePlainUniformVersion(ctx, batch->plain_uniform_version);
+        batch->plain_uniform_version = NULL;
+    }
+    if (batch->vertex_plain_uniform_version) {
+        mglReleasePlainUniformVersion(ctx, batch->vertex_plain_uniform_version);
+        batch->vertex_plain_uniform_version = NULL;
+    }
+    if (batch->fragment_plain_uniform_version) {
+        mglReleasePlainUniformVersion(ctx, batch->fragment_plain_uniform_version);
+        batch->fragment_plain_uniform_version = NULL;
+    }
     if (batch->retained_program) {
         mglReleaseProgramReference(ctx, (Program *)batch->retained_program);
         batch->retained_program = NULL;
@@ -231,12 +396,17 @@ static Program *mglRetainBatchProgram(GLMContext ctx, MGLDrawBatch *batch, Progr
         return NULL;
     }
 
-    if (!mglObjectPointerLooksPlausible(program) ||
-        !mglPointerRangeIsReadable(program, sizeof(*program))) {
+    if (!mglObjectPointerLooksPlausible(program)) {
         return NULL;
     }
 
     if (expectedName == 0u) {
+        /* Membership proves a live object before reading its name; deleted
+         * retained programs use the guarded VM-range slow path. */
+        if (!mglHashTableContainsData(&ctx->state.program_table, program) &&
+            !mglPointerRangeIsReadable(program, sizeof(*program))) {
+            return NULL;
+        }
         expectedName = program->name;
     }
     if (!mglProgramPointerUsableForName(ctx, program, expectedName)) {
@@ -248,10 +418,10 @@ static Program *mglRetainBatchProgram(GLMContext ctx, MGLDrawBatch *batch, Progr
     return program;
 }
 
-static void mglRetainBatchProgramReferences(GLMContext ctx, MGLDrawBatch *batch)
+static bool mglRetainBatchProgramReferences(GLMContext ctx, MGLDrawBatch *batch)
 {
     if (!ctx || !batch) {
-        return;
+        return false;
     }
 
     (void)mglRetainBatchProgram(ctx,
@@ -261,29 +431,50 @@ static void mglRetainBatchProgramReferences(GLMContext ctx, MGLDrawBatch *batch)
                                 &batch->retained_program);
 
     if (ctx->state.program_name != 0u || !ctx->state.program_pipeline) {
-        return;
+        Program *program = (Program *)batch->retained_program;
+        if (program && mglUniformVersionsEnabled()) {
+            batch->plain_uniform_version = mglGetProgramPlainUniformVersion(ctx, program);
+            if (!batch->plain_uniform_version) return false;
+            batch->mono_uniform_generation =
+                ((MGLPlainUniformVersion *)batch->plain_uniform_version)->generation;
+        }
+        return true;
     }
 
     ProgramPipeline *pipeline = ctx->state.program_pipeline;
     if (!mglObjectPointerLooksPlausible(pipeline) ||
         !mglPointerRangeIsReadable(pipeline, sizeof(*pipeline))) {
-        return;
+        return mglUniformVersionsEnabled() ? false : true;
     }
 
     (void)mglRetainBatchProgram(ctx,
                                 batch,
                                 pipeline->stage_programs[_VERTEX_SHADER],
-                                pipeline->stage_programs[_VERTEX_SHADER]
-                                    ? pipeline->stage_programs[_VERTEX_SHADER]->name
-                                    : 0u,
+                                0u,
                                 &batch->retained_vertex_program);
     (void)mglRetainBatchProgram(ctx,
                                 batch,
                                 pipeline->stage_programs[_FRAGMENT_SHADER],
-                                pipeline->stage_programs[_FRAGMENT_SHADER]
-                                    ? pipeline->stage_programs[_FRAGMENT_SHADER]->name
-                                    : 0u,
+                                0u,
                                 &batch->retained_fragment_program);
+
+    Program *vertexProgram = (Program *)batch->retained_vertex_program;
+    if (vertexProgram && mglUniformVersionsEnabled()) {
+        batch->vertex_plain_uniform_version =
+            mglGetProgramPlainUniformVersion(ctx, vertexProgram);
+        if (!batch->vertex_plain_uniform_version) return false;
+        batch->vertex_uniform_generation =
+            ((MGLPlainUniformVersion *)batch->vertex_plain_uniform_version)->generation;
+    }
+    Program *fragmentProgram = (Program *)batch->retained_fragment_program;
+    if (fragmentProgram && mglUniformVersionsEnabled()) {
+        batch->fragment_plain_uniform_version =
+            mglGetProgramPlainUniformVersion(ctx, fragmentProgram);
+        if (!batch->fragment_plain_uniform_version) return false;
+        batch->fragment_uniform_generation =
+            ((MGLPlainUniformVersion *)batch->fragment_plain_uniform_version)->generation;
+    }
+    return true;
 }
 
 static bool mglInitializeBatchStateSnapshot(GLMContext ctx, MGLDrawBatch *batch)
@@ -325,7 +516,10 @@ static bool mglInitializeBatchStateSnapshot(GLMContext ctx, MGLDrawBatch *batch)
     MGL_PERF_ADD(g_mglSnapshotBytesAllocatedSinceSwap,
                  sizeof(GLMState) + sizeof(VertexArray));
 
-    mglRetainBatchProgramReferences(ctx, batch);
+    if (!mglRetainBatchProgramReferences(ctx, batch)) {
+        MGL_SIGNPOST_END(InitBatchSnapshot);
+        return false;
+    }
     MGL_SIGNPOST_END(InitBatchSnapshot);
     return true;
 }
@@ -333,6 +527,15 @@ static bool mglInitializeBatchStateSnapshot(GLMContext ctx, MGLDrawBatch *batch)
 void mglResetCommandBufferForContext(GLMContext ctx, MGLCommandBuffer *cb)
 {
     if (!cb) return;
+
+    if (ctx && ctx->trusted_replay_vao) {
+        for (uint32_t i = 0; i < cb->batch_count; i++) {
+            if (ctx->trusted_replay_vao == (VertexArray *)cb->batches[i].vao_snapshot) {
+                ctx->trusted_replay_vao = NULL;
+                break;
+            }
+        }
+    }
 
     for (uint32_t i = 0; i < cb->batch_count; i++) {
         mglReleaseBatch(ctx, &cb->batches[i]);
@@ -519,6 +722,9 @@ static void mglTrackPendingReadRange(GLMContext ctx, Buffer *buffer, uint64_t st
         MGLBufferReadRange *range = &cb->buffer_read_ranges[i];
         if (range->buffer == buffer &&
             mglRangesOverlapOrTouch(range->start, range->end, start, end)) {
+            /* Existing ranges are already disjoint and fully coalesced.
+             * A contained read cannot connect any additional range. */
+            if (range->start <= start && range->end >= end) return;
             if (start < range->start) range->start = start;
             if (end > range->end) range->end = end;
             mergedIndex = i;
@@ -659,15 +865,15 @@ static void mglTrackPendingTextureRead(GLMContext ctx, Texture *texture)
     cb->texture_read_objects[cb->texture_read_count++] = texture;
 }
 
-/* Forward declaration: defined below, used by the program-aware hazard
- * guards in both mglTrackPendingSampledTextureReads and
- * mglFlushPendingDrawsForActiveTextures. */
-static bool mglStateSamplesTextureUnit(GLMContext ctx, GLuint unit);
+/* Declared GL sampler targets select bindings independently on each unit. */
+static void mglStateTextureTargetMasks(GLMContext ctx, uint16_t masks[TEXTURE_UNITS]);
 
 static void mglTrackPendingSampledTextureReads(GLMContext ctx)
 {
     if (!ctx) return;
 
+    uint16_t targets[TEXTURE_UNITS] = {0};
+    mglStateTextureTargetMasks(ctx, targets);
     unsigned *mask = ctx->state.active_texture_mask;
     for (int w = 0; w < 4; w++) {
         unsigned bits = mask[w];
@@ -679,25 +885,16 @@ static void mglTrackPendingSampledTextureReads(GLMContext ctx)
                 continue;
             }
 
-            /* Program-aware guard: only track textures as "read" on units
-             * the current program actually samples.  Without this, a texture
-             * left bound on an unsampled unit (e.g. FBO color attachment
-             * after glTexImage2D) would be falsely tracked as read, causing
-             * mglFlushPendingDrawsBeforeFramebufferTextureWrites to flush
-             * on the next draw. */
-            if (!mglStateSamplesTextureUnit(ctx, (GLuint)unit)) {
-                continue;
-            }
-
-            Texture *active = ctx->state.active_textures[unit];
-            if (active) {
-                mglTrackPendingTextureRead(ctx, active);
+            if (!targets[unit]) continue;
+            /* Unknown/no-program resources retain the old active binding. */
+            if (targets[unit] == (1u << _MAX_TEXTURE_TYPES) - 1u) {
+                mglTrackPendingTextureRead(ctx, ctx->state.active_textures[unit]);
             }
 
             TextureUnit *textureUnit = &ctx->state.texture_units[unit];
             for (int target = 0; target < _MAX_TEXTURE_TYPES; target++) {
                 Texture *bound = textureUnit->textures[target];
-                if (bound) {
+                if ((targets[unit] & (1u << target)) && bound) {
                     mglTrackPendingTextureRead(ctx, bound);
                 }
             }
@@ -1056,43 +1253,43 @@ void mglFlushPendingDrawsBeforeTextureWrite(GLMContext ctx, void *texture)
     }
 }
 
-/*
- * mglStateSamplesTextureUnit — 当前活跃 program 是否实际采样纹理单元 unit
- *
- * 遍历当前 monolithic program 或 pipeline 各 stage program，调用
- * mglProgramSamplesTextureUnit 判断是否有 sampler 资源解析到该 unit。
- * 无 program 且无 pipeline 时退化为保守返回 true（保留旧刷新行为）。
- */
-static bool mglStateSamplesTextureUnit(GLMContext ctx, GLuint unit)
+/* Only the selected stages of a separable pipeline contribute dependencies. */
+static void mglStateTextureTargetMasks(GLMContext ctx, uint16_t masks[TEXTURE_UNITS])
 {
-    if (!ctx) return true;
-
     Program *program = ctx->state.program;
-    if (program && mglProgramSamplesTextureUnit(program, unit)) {
-        return true;
-    }
-
-    /* Pipeline with separate stage programs. */
-    if (!program && ctx->state.program_pipeline) {
-        ProgramPipeline *pipeline = ctx->state.program_pipeline;
-        bool hasAnyStage = false;
-        for (int stage = 0; stage < _MAX_SHADER_TYPES; stage++) {
-            Program *stageProg = pipeline->stage_programs[stage];
-            if (!stageProg) continue;
-            hasAnyStage = true;
-            if (mglProgramSamplesTextureUnit(stageProg, unit)) {
-                return true;
-            }
+    bool hasProgram = program != NULL;
+    for (int stage = 0; stage < _MAX_SHADER_TYPES; stage++) {
+        if (stage == _COMPUTE_SHADER) continue;
+        Program *stageProgram = program;
+        if (!program && ctx->state.program_pipeline) {
+            stageProgram = ctx->state.program_pipeline->stage_programs[stage];
         }
-        /* Pipeline has stage programs but none sample this unit -> safe.
-         * Empty pipeline -> conservative. */
-        return !hasAnyStage;
+        if (stageProgram) {
+            hasProgram = true;
+            mglAccumulateProgramTextureTargetMasks(stageProgram, stage, masks);
+        }
     }
+    if (!hasProgram) {
+        for (GLuint unit = 0; unit < TEXTURE_UNITS; unit++) {
+            masks[unit] = (1u << _MAX_TEXTURE_TYPES) - 1u;
+        }
+    }
+}
 
-    /* No program and no pipeline: conservative. */
-    if (!program) return true;
-
-    return false;
+static void mglTraceTextureHazard(GLMContext ctx, int unit, uint16_t targets,
+                                  int target, Texture *texture)
+{
+    static int enabled = -1;
+    static uint64_t hits;
+    if (enabled < 0) enabled = getenv("MGL_TRACE_TEXTURE_HAZARDS") != NULL;
+    if (!enabled) return;
+    uint64_t hit = ++hits;
+    if (hit <= 32 || hit % 4096 == 0) {
+        MGLCommandBuffer *cb = &ctx->draw_command_buffer;
+        fprintf(stderr, "MGL TEXHAZARD hit=%llu program=%u unit=%d targets=0x%x target=%d texture=%u batches=%u commands=%u\n",
+                (unsigned long long)hit, ctx->state.program_name, unit, targets,
+                target, texture->name, cb->batch_count, cb->total_commands);
+    }
 }
 
 /*
@@ -1118,6 +1315,8 @@ void mglFlushPendingDrawsForActiveTextures(GLMContext ctx)
         return;
     }
 
+    uint16_t targets[TEXTURE_UNITS] = {0};
+    mglStateTextureTargetMasks(ctx, targets);
     unsigned *mask = ctx->state.active_texture_mask;
     for (int w = 0; w < 4; w++) {
         unsigned bits = mask[w];
@@ -1129,16 +1328,11 @@ void mglFlushPendingDrawsForActiveTextures(GLMContext ctx)
                 continue;
             }
 
-            /* Program-aware guard: skip units the current program/pipeline
-             * never samples.  This eliminates false-positive WAR flushes
-             * where a texture (e.g. FBO color attachment left bound after
-             * glTexImage2D) sits on a unit no sampler reads. */
-            if (!mglStateSamplesTextureUnit(ctx, (GLuint)unit)) {
-                continue;
-            }
-
+            if (!targets[unit]) continue;
             Texture *active = ctx->state.active_textures[unit];
-            if (active && mglPendingDrawsWriteTexture(ctx, active)) {
+            if (targets[unit] == (1u << _MAX_TEXTURE_TYPES) - 1u &&
+                active && mglPendingDrawsWriteTexture(ctx, active)) {
+                mglTraceTextureHazard(ctx, unit, targets[unit], -1, active);
                 MGL_PERF_INC(g_mglFlushReasonActiveTexWarSinceSwap);
                 mglFlushCommandBuffer(ctx);
                 return;
@@ -1147,7 +1341,9 @@ void mglFlushPendingDrawsForActiveTextures(GLMContext ctx)
             TextureUnit *textureUnit = &ctx->state.texture_units[unit];
             for (int target = 0; target < _MAX_TEXTURE_TYPES; target++) {
                 Texture *bound = textureUnit->textures[target];
-                if (bound && mglPendingDrawsWriteTexture(ctx, bound)) {
+                if ((targets[unit] & (1u << target)) &&
+                    bound && mglPendingDrawsWriteTexture(ctx, bound)) {
+                    mglTraceTextureHazard(ctx, unit, targets[unit], target, bound);
                     MGL_PERF_INC(g_mglFlushReasonActiveTexWarSinceSwap);
                     mglFlushCommandBuffer(ctx);
                     return;
@@ -1200,36 +1396,22 @@ static void mglHashBufferBaseBinding(uint64_t *hash,
     *hash ^= mglRotateLeft64((uint64_t)binding->size, (salt + 37u) & 63);
 }
 
+static void mglHashDrawBufferBinding(GLMContext ctx, const BufferBaseTarget *binding,
+                                    uint64_t salt, void *data)
+{
+    mglHashBufferBaseBinding(data, binding, salt);
+    if (binding->buffer) {
+        Buffer *resolved = searchHashTable(&ctx->state.buffer_table, binding->buffer);
+        if (resolved && resolved != binding->buf) {
+            *(uint64_t *)data ^= mglRotateLeft64((uint64_t)(uintptr_t)resolved, (salt + 11u) & 63u);
+        }
+    }
+}
+
 static uint64_t mglComputeDrawBufferBindingHash(GLMContext ctx)
 {
     uint64_t hash = 0;
-
-    const int draw_buffer_targets[] = {
-        _UNIFORM_BUFFER,
-        _UNIFORM_CONSTANT,
-        _SHADER_STORAGE_BUFFER,
-        _ATOMIC_COUNTER_BUFFER,
-        _TEXTURE_BUFFER
-    };
-
-    for (size_t t = 0; t < sizeof(draw_buffer_targets) / sizeof(draw_buffer_targets[0]); t++) {
-        int target = draw_buffer_targets[t];
-        for (int i = 0; i < MAX_BINDABLE_BUFFERS; i++) {
-            mglHashBufferBaseBinding(&hash,
-                                     &ctx->state.buffer_base[target].buffers[i],
-                                     ((uint64_t)(target + 1) * 131u) + (uint64_t)i);
-        }
-    }
-
-    Program *program = ctx->state.program;
-    if (program) {
-        for (int i = 0; i < MAX_BINDABLE_BUFFERS; i++) {
-            mglHashBufferBaseBinding(&hash,
-                                     &program->plain_uniform_buffers[i],
-                                     0x700u + (uint64_t)i);
-        }
-    }
-
+    mglVisitDrawBufferBindings(ctx, mglHashDrawBufferBinding, &hash);
     return hash;
 }
 
@@ -1436,6 +1618,24 @@ void mglComputeStateKey(GLMContext ctx, GLenum mode, bool uses_elements, MGLStat
         out->fragment_program_name = pipeline && pipeline->stage_programs[_FRAGMENT_SHADER]
             ? pipeline->stage_programs[_FRAGMENT_SHADER]->name
             : 0u;
+    }
+    if (mglUniformVersionsEnabled()) {
+        if (ctx->state.program_name != 0u && ctx->state.program) {
+            out->mono_uniform_generation = ctx->state.program->plain_uniform_generation;
+        } else if (out->program_pipeline_name != 0u) {
+            ProgramPipeline *pipeline = ctx->state.program_pipeline;
+            if (!pipeline || pipeline->name != out->program_pipeline_name) {
+                pipeline = (ProgramPipeline *)searchHashTable(
+                    &ctx->state.program_pipeline_table,
+                    out->program_pipeline_name);
+            }
+            if (pipeline) {
+                Program *vertex = pipeline->stage_programs[_VERTEX_SHADER];
+                Program *fragment = pipeline->stage_programs[_FRAGMENT_SHADER];
+                out->vertex_uniform_generation = vertex ? vertex->plain_uniform_generation : 0u;
+                out->fragment_uniform_generation = fragment ? fragment->plain_uniform_generation : 0u;
+            }
+        }
     }
     out->vao_name = ctx->state.vao ? ctx->state.vao->name : 0;
     out->fbo_name = ctx->state.framebuffer ? ctx->state.framebuffer->name : 0;
@@ -1790,39 +1990,23 @@ static uint64_t mglTrackPendingBufferMapReads(GLMContext ctx,
     return activeCount;
 }
 
-/* Plain (loose) uniforms live in per-Program Buffer objects.  When a
- * pipeline is bound, ctx->state.program may be NULL while the pipeline's
- * stage programs still own plain-uniform buffers that pending deferred
- * draws read at replay time.  Track those stages too, otherwise a
- * glUniform* routed to a stage program would not flush the draws that
- * depend on its previous contents. */
-static void mglTrackPipelinePlainUniformReads(GLMContext ctx, uint64_t *activeCount)
+static void mglTrackDrawBufferBinding(GLMContext ctx, const BufferBaseTarget *binding,
+                                     uint64_t salt, void *data)
 {
-    if (!ctx || !activeCount) return;
-
-    ProgramPipeline *pipeline = ctx->state.program_pipeline;
-    if (!pipeline && ctx->state.var.program_pipeline_binding != 0u) {
-        pipeline = (ProgramPipeline *)searchHashTable(&ctx->state.program_pipeline_table,
-                                                      ctx->state.var.program_pipeline_binding);
-    }
-    if (!pipeline) return;
-
-    for (int stage = 0; stage < _MAX_SHADER_TYPES; stage++) {
-        Program *program = pipeline->stage_programs[stage];
-        if (!program) continue;
-
-        for (int i = 0; i < MAX_BINDABLE_BUFFERS; i++) {
-            BufferBaseTarget *binding = &program->plain_uniform_buffers[i];
-            if (!binding->buf) continue;
-            (*activeCount)++;
-            if (binding->size > 0 && binding->offset >= 0) {
-                mglTrackPendingReadBytes(ctx,
-                                         binding->buf,
-                                         (uint64_t)binding->offset,
-                                         (uint64_t)binding->size);
-            } else {
-                mglTrackPendingReadWholeBuffer(ctx, binding->buf);
-            }
+    (void)salt;
+    Buffer *resolved = binding->buffer
+        ? searchHashTable(&ctx->state.buffer_table, binding->buffer) : NULL;
+    /* The renderer can recover an invalid pointer by GL name. Track both
+     * identities without dereferencing a potentially stale pointer. */
+    Buffer *sources[2] = { binding->buf, resolved != binding->buf ? resolved : NULL };
+    for (GLuint i = 0; i < 2; i++) {
+        Buffer *buffer = sources[i];
+        if (!buffer) continue;
+        (*(uint64_t *)data)++;
+        if (binding->size > 0 && binding->offset >= 0) {
+            mglTrackPendingReadBytes(ctx, buffer, (uint64_t)binding->offset, (uint64_t)binding->size);
+        } else {
+            mglTrackPendingReadWholeBuffer(ctx, buffer);
         }
     }
 }
@@ -1830,86 +2014,15 @@ static void mglTrackPipelinePlainUniformReads(GLMContext ctx, uint64_t *activeCo
 static void mglTrackPendingBaseBufferReads(GLMContext ctx)
 {
     if (!ctx) return;
-
     uint64_t activeCount = 0;
-
-    bool mapsCurrent =
-        mglHazardMapFastPathEnabled() &&
-        (ctx->state.dirty_bits & (DIRTY_PROGRAM | DIRTY_BUFFER_BASE_STATE)) == 0u &&
-        (ctx->state.vertex_buffer_map_list.count > 0u ||
-         ctx->state.fragment_buffer_map_list.count > 0u);
-
-    if (mapsCurrent) {
-        activeCount += mglTrackPendingBufferMapReads(
-            ctx, &ctx->state.vertex_buffer_map_list);
-        activeCount += mglTrackPendingBufferMapReads(
-            ctx, &ctx->state.fragment_buffer_map_list);
-
-        Program *program = ctx->state.program;
-        if (program) {
-            for (int i = 0; i < MAX_BINDABLE_BUFFERS; i++) {
-                BufferBaseTarget *binding = &program->plain_uniform_buffers[i];
-                if (!binding->buf) continue;
-                activeCount++;
-                if (binding->size > 0 && binding->offset >= 0) {
-                    mglTrackPendingReadBytes(ctx,
-                                             binding->buf,
-                                             (uint64_t)binding->offset,
-                                             (uint64_t)binding->size);
-                } else {
-                    mglTrackPendingReadWholeBuffer(ctx, binding->buf);
-                }
-            }
-        }
-        mglTrackPipelinePlainUniformReads(ctx, &activeCount);
-
-        MGL_PERF_ADD(g_mglHazardActiveBindingsSinceSwap, activeCount);
-        return;
+    mglVisitDrawBufferBindings(ctx, mglTrackDrawBufferBinding, &activeCount);
+    /* Keep packed-buffer map dependencies in addition to their plain-uniform
+     * sources. Reflection also covers stages outside these V/F maps. */
+    if (mglHazardMapFastPathEnabled() &&
+        (ctx->state.dirty_bits & (DIRTY_PROGRAM | DIRTY_BUFFER_BASE_STATE)) == 0u) {
+        activeCount += mglTrackPendingBufferMapReads(ctx, &ctx->state.vertex_buffer_map_list);
+        activeCount += mglTrackPendingBufferMapReads(ctx, &ctx->state.fragment_buffer_map_list);
     }
-
-    const int trackedTargets[] = {
-        _UNIFORM_BUFFER,
-        _UNIFORM_CONSTANT,
-        _SHADER_STORAGE_BUFFER,
-        _ATOMIC_COUNTER_BUFFER,
-        _TEXTURE_BUFFER
-    };
-
-    for (size_t t = 0; t < sizeof(trackedTargets) / sizeof(trackedTargets[0]); t++) {
-        int target = trackedTargets[t];
-        for (int i = 0; i < MAX_BINDABLE_BUFFERS; i++) {
-            BufferBaseTarget *binding = &ctx->state.buffer_base[target].buffers[i];
-            if (!binding->buf) continue;
-            activeCount++;
-            if (binding->size > 0 && binding->offset >= 0) {
-                mglTrackPendingReadBytes(ctx,
-                                         binding->buf,
-                                         (uint64_t)binding->offset,
-                                         (uint64_t)binding->size);
-            } else {
-                mglTrackPendingReadWholeBuffer(ctx, binding->buf);
-            }
-        }
-    }
-
-    Program *program = ctx->state.program;
-    if (program) {
-        for (int i = 0; i < MAX_BINDABLE_BUFFERS; i++) {
-            BufferBaseTarget *binding = &program->plain_uniform_buffers[i];
-            if (!binding->buf) continue;
-            activeCount++;
-            if (binding->size > 0 && binding->offset >= 0) {
-                mglTrackPendingReadBytes(ctx,
-                                         binding->buf,
-                                         (uint64_t)binding->offset,
-                                         (uint64_t)binding->size);
-            } else {
-                mglTrackPendingReadWholeBuffer(ctx, binding->buf);
-            }
-        }
-    }
-    mglTrackPipelinePlainUniformReads(ctx, &activeCount);
-
     MGL_PERF_ADD(g_mglHazardActiveBindingsSinceSwap, activeCount);
 }
 
@@ -2511,7 +2624,10 @@ static bool mglInitializeStreamMergedBatch(GLMContext ctx,
     MGL_PERF_ADD(g_mglSnapshotBytesAllocatedSinceSwap,
                  sizeof(GLMState) + sizeof(VertexArray));
 
-    mglRetainBatchProgramReferences(ctx, batch);
+    if (!mglRetainBatchProgramReferences(ctx, batch)) {
+        MGL_SIGNPOST_END(InitStreamMergedBatch);
+        return false;
+    }
     MGL_SIGNPOST_END(InitStreamMergedBatch);
     return true;
 }
@@ -2664,11 +2780,10 @@ static void mglTrackPendingDrawBufferReads(GLMContext ctx,
             }
         }
     }
-
-    mglTrackPendingBaseBufferReads(ctx);
 }
 
-void mglRecordDrawCommand(GLMContext ctx, const MGLDrawCommand *cmd)
+static void mglRecordDrawCommandCore(GLMContext ctx, const MGLDrawCommand *cmd,
+                                     MGLStateKey *cachedKey, bool *keyValid)
 {
     MGL_SIGNPOST_BEGIN(RecordDrawCommand);
     if (!ctx || !cmd) {
@@ -2692,7 +2807,15 @@ void mglRecordDrawCommand(GLMContext ctx, const MGLDrawCommand *cmd)
          cmd->type != MGL_CMD_DRAW_ARRAYS_INSTANCED_BASE_INSTANCE);
 
     MGLStateKey key;
-    mglComputeStateKey(ctx, cmd->mode, cmd_uses_elements, &key);
+    if (cachedKey && keyValid) {
+        if (!*keyValid) {
+            mglComputeStateKey(ctx, cmd->mode, cmd_uses_elements, cachedKey);
+            *keyValid = true;
+        }
+        key = *cachedKey;
+    } else {
+        mglComputeStateKey(ctx, cmd->mode, cmd_uses_elements, &key);
+    }
 
     MGLStreamMergeCandidate streamCandidate;
     bool can_stream_merge =
@@ -2872,14 +2995,29 @@ void mglRecordDrawCommand(GLMContext ctx, const MGLDrawCommand *cmd)
         cb->array_cmd_count++;
     }
 
-    if (can_stream_merge) {
+    /* Buffer-base bindings are part of the batch key, so one registration on
+     * the batch's first successfully appended command covers its fixed base
+     * reads. Per-draw vertex/index ranges remain separate for ordinary draws. */
+    if (batch->command_count == 1) {
         mglTrackPendingBaseBufferReads(ctx);
-    } else {
+    }
+    if (!can_stream_merge) {
         mglTrackPendingDrawBufferReads(ctx, cmd, cmd_uses_elements);
     }
     mglTrackPendingSampledTextureReads(ctx);
     mglTrackPendingFramebufferTextureWrites(ctx);
     MGL_SIGNPOST_END(RecordDrawCommand);
+}
+
+void mglRecordDrawCommandWithStateKey(GLMContext ctx, const MGLDrawCommand *cmd,
+                                      MGLStateKey *cachedKey, bool *keyValid)
+{
+    mglRecordDrawCommandCore(ctx, cmd, cachedKey, keyValid);
+}
+
+void mglRecordDrawCommand(GLMContext ctx, const MGLDrawCommand *cmd)
+{
+    mglRecordDrawCommandCore(ctx, cmd, NULL, NULL);
 }
 
 void mglAppendDrawCommand(GLMContext ctx, const MGLDrawCommand *cmd)

@@ -172,7 +172,7 @@ static NSUInteger mglABSizeConstantCapacity(Program *program, int stage)
                     const GLuint clientBinding =
                         mglClientBufferBindingForResourceElement(resourceType, resource, element);
                     BufferBaseTarget *base = clientBinding < MAX_BINDABLE_BUFFERS
-                        ? &state->buffer_base[bufferIndex].buffers[clientBinding] : NULL;
+                        ? &mglStateBufferBaseTargets(state, bufferIndex)[clientBinding] : NULL;
                     Buffer *bufferObject = base ? base->buf : NULL;
                     id<MTLBuffer> metalBuffer = nil;
                     NSUInteger offset = 0u;
@@ -260,7 +260,7 @@ static NSUInteger mglABSizeConstantCapacity(Program *program, int stage)
                         const GLuint clientBinding =
                             mglClientBufferBindingForResourceElement(resourceType, resource, element);
                         BufferBaseTarget *base = clientBinding < MAX_BINDABLE_BUFFERS
-                            ? &state->buffer_base[bufferIndex].buffers[clientBinding] : NULL;
+                            ? &mglStateBufferBaseTargets(state, bufferIndex)[clientBinding] : NULL;
                         Buffer *bufferObject = base ? base->buf : NULL;
                         id<MTLBuffer> metalBuffer = nil;
                         NSUInteger offset = 0u;
@@ -320,7 +320,7 @@ static NSUInteger mglABSizeConstantCapacity(Program *program, int stage)
                     const GLuint clientBinding =
                         mglClientBufferBindingForResourceElement(resourceType, resource, element);
                     BufferBaseTarget *base = clientBinding < MAX_BINDABLE_BUFFERS
-                        ? &state->buffer_base[bufferIndex].buffers[clientBinding] : NULL;
+                        ? &mglStateBufferBaseTargets(state, bufferIndex)[clientBinding] : NULL;
                     id<MTLBuffer> metalBuffer = base && base->buf
                         ? (__bridge id<MTLBuffer>)base->buf->data.mtl_data
                         : _argumentBufferFallbackStorage;
@@ -372,7 +372,15 @@ static NSUInteger mglABSizeConstantCapacity(Program *program, int stage)
             if (!encoder) return false;
             spirv->mtl_argument_encoders[set] = (void *)CFBridgingRetain(encoder);
         }
-        MGLArgumentBindingTable *table = [MGLArgumentBindingTable new];
+        if (_resolvedArgumentBufferCommandBuffer != _currentCommandBuffer) {
+            [_resolvedArgumentBufferCache removeAllObjects];
+            _resolvedArgumentBufferCommandBuffer = _currentCommandBuffer;
+        }
+        NSArray *key = @[@(program->msl_texture_cache_instance_id), @(program->msl_texture_cache_generation), @(stage), @(set)];
+        NSArray *previous = _resolvedArgumentBufferCache[key];
+        MGLArgumentBindingTable *previousTable = previous ? previous[1] : nil;
+        MGLArgumentBindingTable *table = previousTable ? nil : [MGLArgumentBindingTable new];
+        NSUInteger entryIndex = 0u;
         uint32_t sizes[4096] = {0};
         NSUInteger sizeCount = set == 1u && spirv->needs_buffer_size_buffer
             ? mglABSizeConstantCapacity(program, stage) : 0u;
@@ -393,7 +401,7 @@ static NSUInteger mglABSizeConstantCapacity(Program *program, int stage)
                     GLuint argument = resource->argument_id + element;
                     GLuint binding = mglClientBufferBindingForResourceElement(type, resource, element);
                     BufferBaseTarget *base = binding < MAX_BINDABLE_BUFFERS
-                        ? &state->buffer_base[target].buffers[binding] : NULL;
+                        ? &mglStateBufferBaseTargets(state, target)[binding] : NULL;
                     Buffer *buffer = base ? mglRendererGetValidatedBuffer(resourceContext, base->buf,
                         "prepare-argument-buffer", binding) : NULL;
                     NSUInteger offset = 0u, visible = resource->required_size;
@@ -418,12 +426,43 @@ static NSUInteger mglABSizeConstantCapacity(Program *program, int stage)
                         metal = [self argumentBufferFallbackWithLength:MAX(visible, resource->required_size)];
                         offset = 0u;
                     }
-                    if (![table addBuffer:metal argument:argument offset:offset visibleSize:visible usage:usage]) return false;
+                    if (!table) {
+                        NSArray *entry = entryIndex < previousTable.entries.count
+                            ? previousTable.entries[entryIndex] : nil;
+                        if (!entry || [entry[0] unsignedIntegerValue] != argument || entry[1] != metal ||
+                            [entry[2] unsignedIntegerValue] != offset || [entry[3] unsignedIntegerValue] != visible ||
+                            [entry[4] unsignedIntegerValue] != usage) {
+                            table = [MGLArgumentBindingTable new];
+                            for (NSUInteger i = 0u; i < entryIndex; i++) {
+                                NSArray *prior = previousTable.entries[i];
+                                if (![table addBuffer:prior[1] argument:[prior[0] unsignedIntegerValue]
+                                    offset:[prior[2] unsignedIntegerValue] visibleSize:[prior[3] unsignedIntegerValue]
+                                    usage:[prior[4] unsignedIntegerValue]]) return false;
+                            }
+                        }
+                    }
+                    if (table && ![table addBuffer:metal argument:argument offset:offset visibleSize:visible usage:usage]) return false;
+                    entryIndex++;
                 }
             }
         }
-        NSData *sizeData = sizeCount ? [NSData dataWithBytes:sizes length:sizeCount * sizeof(uint32_t)] : nil;
-        if (![table sealWithSizeConstants:sizeData]) return false;
+        NSUInteger sizeBytes = sizeCount * sizeof(uint32_t);
+        BOOL sizesMatch = previousTable && previousTable.sizeConstants.length == sizeBytes &&
+            (!sizeBytes || memcmp(previousTable.sizeConstants.bytes, sizes, sizeBytes) == 0);
+        NSData *sizeData = sizesMatch ? previousTable.sizeConstants
+            : (sizeBytes ? [NSData dataWithBytes:sizes length:sizeBytes] : nil);
+        if (!table && (entryIndex != previousTable.entries.count || !sizesMatch)) {
+            table = [MGLArgumentBindingTable new];
+            for (NSUInteger i = 0u; i < entryIndex; i++) {
+                NSArray *entry = previousTable.entries[i];
+                if (![table addBuffer:entry[1] argument:[entry[0] unsignedIntegerValue]
+                    offset:[entry[2] unsignedIntegerValue] visibleSize:[entry[3] unsignedIntegerValue]
+                    usage:[entry[4] unsignedIntegerValue]]) return false;
+            }
+        }
+        BOOL descriptorsChanged = table != nil;
+        if (table && ![table sealWithSizeConstants:sizeData]) return false;
+        if (!table) table = previousTable;
         // Resolve/processBuffer may have rotated the command buffer. Descriptor
         // caches never cross that boundary, just like immutable arena ranges.
         if (_resolvedArgumentBufferCommandBuffer != _currentCommandBuffer) {
@@ -431,11 +470,10 @@ static NSUInteger mglABSizeConstantCapacity(Program *program, int stage)
             _resolvedArgumentBufferCommandBuffer = _currentCommandBuffer;
         }
         if (!_resolvedArgumentBufferCache) _resolvedArgumentBufferCache = [NSMutableDictionary new];
-        NSArray *key = @[@(program->msl_texture_cache_instance_id), @(program->msl_texture_cache_generation), @(stage), @(set)];
         NSArray *cached = _resolvedArgumentBufferCache[key];
         id<MTLBuffer> storage = cached ? cached[0] : nil;
         id<MTLBuffer> auxiliary = cached && cached[2] != [NSNull null] ? cached[2] : nil;
-        if (!storage || storage.length < encoder.encodedLength || ![table hasSameBindingsAs:cached[1]]) {
+        if (!storage || storage.length < encoder.encodedLength || descriptorsChanged) {
             storage = [_device newBufferWithLength:encoder.encodedLength options:MTLResourceStorageModeShared];
             if (!storage) return false;
             [encoder setArgumentBuffer:storage offset:0];
@@ -446,7 +484,8 @@ static NSUInteger mglABSizeConstantCapacity(Program *program, int stage)
                 if (!auxiliary) return false;
                 [encoder setBuffer:auxiliary offset:0 atIndex:MGL_BUFFER_SIZE_BUFFER_INDEX];
             }
-            if (_resolvedArgumentBufferCache.count >= 128u) [_resolvedArgumentBufferCache removeAllObjects];
+            if (_resolvedArgumentBufferCache.count >= 128u)
+                [_resolvedArgumentBufferCache removeObjectForKey:_resolvedArgumentBufferCache.allKeys.firstObject];
             _resolvedArgumentBufferCache[key] = @[storage, table, auxiliary ?: (id)[NSNull null]];
         }
         // The chosen fallback must be resident too; do not re-look up a live
@@ -481,7 +520,7 @@ static NSUInteger mglABSizeConstantCapacity(Program *program, int stage)
             GLuint clientBinding = mglClientBufferBindingForResourceElement(
                 SPVC_RESOURCE_TYPE_STORAGE_BUFFER, resource, element);
             if (clientBinding >= MAX_BINDABLE_BUFFERS) continue;
-            BufferBaseTarget *base = &state->buffer_base[_SHADER_STORAGE_BUFFER].buffers[clientBinding];
+            BufferBaseTarget *base = &mglStateBufferBaseTargets(state, _SHADER_STORAGE_BUFFER)[clientBinding];
             if (!base->buf) continue;
             GLsizeiptr visible = base->size > 0 ? base->size : (base->buf->size - base->offset);
             if (visible < 0) visible = 0;

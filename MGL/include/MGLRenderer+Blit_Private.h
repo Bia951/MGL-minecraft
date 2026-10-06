@@ -59,6 +59,21 @@ GLboolean mglGetCPUFormatTypeForInternalFormat(GLenum internalformat,
                                                GLenum *outFormat,
                                                GLenum *outType);
 
+/* A copy changes GPU-visible content even when CPU readback is authoritative.
+ * Keep the storage orientation while invalidating all sampled caches. */
+static inline void mglInvalidateSampledCopiesForTextureLevel(Texture *tex, GLuint level)
+{
+    if (!tex) return;
+    BOOL usesOriginal = !tex->is_render_target ||
+        ((tex->mtl_render_yflip_authority >> 1) == tex->mtl_render_target_write_version &&
+         (tex->mtl_render_yflip_authority & 1u));
+    tex->mtl_render_target_write_version++;
+    tex->mtl_render_yflip_authority = (tex->mtl_render_target_write_version << 1) | (usesOriginal ? 1u : 0u);
+    if (tex->is_render_target) {
+        tex->mtl_gl_sampled_dirty_mip_mask |= level < 32u ? (uint32_t)1u << level : UINT32_MAX;
+    }
+}
+
 /* RT Metal-fill marker — inline because it's small and called from
  * both MGLRenderer.m and MGLRenderer+Blit.m / MGLRenderer+Texture.m. */
 static inline void mglMarkTextureLevelMetalFilled(Texture *tex, GLuint level, size_t uploadSize)
@@ -76,8 +91,10 @@ static inline void mglMarkTextureLevelMetalFilled(Texture *tex, GLuint level, si
     texLevel->last_src_ptr = NULL;
     texLevel->last_src_hash = 0ull;
 
+    /* GPU copies also change sampled content, even when the destination has
+     * never been attached to a framebuffer. */
+    tex->mtl_render_target_write_version++;
     if (tex->is_render_target) {
-        tex->mtl_render_target_write_version++;
         if (level < 32u) {
             tex->mtl_gl_sampled_dirty_mip_mask |= (uint32_t)1u << level;
         } else {
@@ -107,6 +124,8 @@ void mglMarkTextureLevelRenderTargetWrittenImpl(Texture *tex,
                                                   writesColor:(BOOL)writesColor
                                                   writesDepth:(BOOL)writesDepth;
 - (id<MTLDepthStencilState>)clearRectDepthState;
+- (id<MTLTexture>)depthCompareTextureForObject:(Texture *)object program:(Program *)program;
+- (BOOL)updateDepthCompareCopyForTexture:(Texture *)object;
 
 // === Multisample resolve ===
 - (id<MTLTexture>)resolvedReadbackTextureForMultisampleTexture:(id<MTLTexture>)sourceTexture
@@ -124,6 +143,8 @@ void mglMarkTextureLevelRenderTargetWrittenImpl(Texture *tex,
 - (BOOL)updateGLSampledRenderTargetCopyForTexture:(Texture *)tex
                                            source:(id<MTLTexture>)source
                                            reason:(const char *)reason;
+- (BOOL)updateGLSampledRenderTargetCopiesForTextures:(Texture * const *)textures
+                                                count:(NSUInteger)count;
 - (id<MTLTexture>)freshGLSampledRenderTargetCopyForSampling:(Texture *)tex
                                                      source:(id<MTLTexture>)source
                                                       stage:(const char *)stage

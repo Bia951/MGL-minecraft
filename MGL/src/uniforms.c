@@ -32,6 +32,7 @@
 #include "glm_context.h"
 #include "mgl_safety.h"
 #include "draw_command.h"
+#include "mgl_uniform_reflection.h"
 
 #pragma mark uniforms
 
@@ -44,7 +45,25 @@
 static GLMContext mglUniformResolveContext(GLMContext ctx, const char *func)
 {
     GLMContext current = MGLgetCurrentContext();
-    if (!current || !mglPointerRangeIsReadable(current, sizeof(*current))) {
+    if (!current) {
+        fprintf(stderr,
+                "MGL WARNING: dropping uniform update in %s with invalid current ctx=%p arg=%p\n",
+                func ? func : "(null)",
+                (void *)current,
+                (void *)ctx);
+        return NULL;
+    }
+
+    /* The current context is a thread-local pointer installed by the context
+     * lifecycle. Unbinding clears it; destroyGLMContext clears the current
+     * context before freeing it or restores the prior TLS context when
+     * destroying a non-current one. When the API argument agrees, avoid
+     * repeating a VM-region walk for every scalar/vector uniform update. */
+    if (ctx == current) {
+        return current;
+    }
+
+    if (!mglPointerRangeIsReadable(current, sizeof(*current))) {
         fprintf(stderr,
                 "MGL WARNING: dropping uniform update in %s with invalid current ctx=%p arg=%p\n",
                 func ? func : "(null)",
@@ -174,37 +193,6 @@ static GLboolean mglSafeCStringEquals(const char *lhs, const char *rhs)
     return memcmp(lhs, rhs, lhsLength + 1u) == 0 ? GL_TRUE : GL_FALSE;
 }
 
-static GLboolean mglSafeCStringContains(const char *haystack, const char *needle)
-{
-    size_t hay_len = 0u;
-    size_t needle_len = 0u;
-
-    if (!mglSafeCStringLength(haystack, &hay_len) ||
-        !mglSafeCStringLength(needle, &needle_len)) {
-        return GL_FALSE;
-    }
-    if (needle_len == 0u) {
-        return GL_TRUE;
-    }
-    if (needle_len > hay_len) {
-        return GL_FALSE;
-    }
-
-    for (size_t i = 0; i <= hay_len - needle_len; i++) {
-        GLboolean match = GL_TRUE;
-        for (size_t j = 0; j < needle_len; j++) {
-            if (haystack[i + j] != needle[j]) {
-                match = GL_FALSE;
-                break;
-            }
-        }
-        if (match) {
-            return GL_TRUE;
-        }
-    }
-
-    return GL_FALSE;
-}
 
 static const char *mglSafeCStringForLog(const char *str)
 {
@@ -277,18 +265,20 @@ static Program *mglUniformValidateProgramPointer(GLMContext ctx, Program *progra
         return NULL;
     }
 
-    if (mglObjectPointerLooksPlausible(program) &&
+    GLboolean pointerPlausible = mglObjectPointerLooksPlausible(program);
+    /* A table member is a live Program allocation. Check identity before
+     * probing VM regions, which is needed only for deleted retained objects. */
+    if (pointerPlausible &&
         mglHashTableContainsData(&ctx->state.program_table, program)) {
         return program;
     }
 
-    GLboolean pointerReadable =
-        mglObjectPointerLooksPlausible(program) &&
-        mglPointerRangeIsReadable(program, sizeof(*program));
-    GLuint expectedName = pointerReadable ? program->name : 0u;
-
-    if (!pointerReadable ||
-        !mglProgramPointerUsableForName(ctx, program, expectedName)) {
+    if (!pointerPlausible ||
+        !mglPointerRangeIsReadable(program, sizeof(*program)) ||
+        program->name == 0u ||
+        !program->delete_status ||
+        program->refcount <= 0 ||
+        program->linked_glsl_program == NULL) {
         fprintf(stderr,
                 "MGL WARNING: %s dropping invalid program pointer %p\n",
                 func ? func : "uniform",
@@ -320,123 +310,9 @@ static Program *mglUniformGetNamedProgram(GLMContext ctx, GLuint program, const 
     return mglUniformValidateProgramPointer(ctx, getProgram(ctx, program), func);
 }
 
-static GLint mglKnownPlainUniformLocation(const char *name)
+static GLboolean mglUniformResourceLooksSamplerLike(const SpirvResource *res, int type)
 {
-    if (!name) {
-        return -1;
-    }
-
-    if (!mglSafeCStringLength(name, NULL)) {
-        return -1;
-    }
-
-    if (mglSafeCStringEquals(name, "ModelViewMat")) {
-        return 0;
-    }
-    if (mglSafeCStringEquals(name, "ProjMat")) {
-        return 1;
-    }
-    if (mglSafeCStringEquals(name, "TextureMat")) {
-        return 2;
-    }
-    if (mglSafeCStringEquals(name, "ColorModulator")) {
-        return 3;
-    }
-    if (mglSafeCStringEquals(name, "FogStart")) {
-        return 4;
-    }
-    if (mglSafeCStringEquals(name, "FogEnd")) {
-        return 5;
-    }
-    if (mglSafeCStringEquals(name, "FogColor")) {
-        return 6;
-    }
-    if (mglSafeCStringEquals(name, "FogShape")) {
-        return 7;
-    }
-    if (mglSafeCStringEquals(name, "GameTime")) {
-        return 8;
-    }
-    if (mglSafeCStringEquals(name, "ScreenSize")) {
-        return 9;
-    }
-    if (mglSafeCStringEquals(name, "LineWidth")) {
-        return 10;
-    }
-    if (mglSafeCStringEquals(name, "IViewRotMat")) {
-        return 11;
-    }
-    if (mglSafeCStringEquals(name, "ChunkOffset")) {
-        return 12;
-    }
-    if (mglSafeCStringEquals(name, "u_ProjectionMatrix")) {
-        return 0;
-    }
-    if (mglSafeCStringEquals(name, "u_ModelViewMatrix")) {
-        return 1;
-    }
-    if (mglSafeCStringEquals(name, "u_RegionOffset")) {
-        return 2;
-    }
-    if (mglSafeCStringEquals(name, "u_TexCoordShrink")) {
-        return 3;
-    }
-    if (mglSafeCStringEquals(name, "u_FogColor")) {
-        return 4;
-    }
-    if (mglSafeCStringEquals(name, "u_EnvironmentFog")) {
-        return 5;
-    }
-    if (mglSafeCStringEquals(name, "u_RenderFog")) {
-        return 6;
-    }
-
-    /* 1.21.11 new plain uniforms */
-    if (mglSafeCStringEquals(name, "CameraBlockPos")) {
-        return 13;
-    }
-    if (mglSafeCStringEquals(name, "CameraOffset")) {
-        return 14;
-    }
-    if (mglSafeCStringEquals(name, "UseRgss")) {
-        return 15;
-    }
-    if (mglSafeCStringEquals(name, "ChunkVisibility")) {
-        return 16;
-    }
-
-    return -1;
-}
-
-static GLboolean mglUniformNameLooksSamplerLike(const char *name)
-{
-    if (!name || !mglSafeCStringLength(name, NULL)) {
-        return GL_FALSE;
-    }
-
-    return (mglSafeCStringContains(name, "Sampler") ||
-            mglSafeCStringEquals(name, "CloudFaces")) ? GL_TRUE : GL_FALSE;
-}
-
-static GLboolean mglUniformResourceLooksSamplerLike(const SpirvResource *res, int res_type)
-{
-    if (!res) {
-        return GL_FALSE;
-    }
-
-    switch (res_type) {
-        case SPVC_RESOURCE_TYPE_SAMPLED_IMAGE:
-        case SPVC_RESOURCE_TYPE_SEPARATE_IMAGE:
-        case SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS:
-        case SPVC_RESOURCE_TYPE_STORAGE_IMAGE:
-            return GL_TRUE;
-        case SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT:
-            return (res->image_dim != 0u ||
-                    res->uniform_location >= MGL_SYNTHETIC_SAMPLER_LOCATION_BASE ||
-                    mglUniformNameLooksSamplerLike(res->name)) ? GL_TRUE : GL_FALSE;
-        default:
-            return GL_FALSE;
-    }
+    return mglProgramResourceLooksSamplerLike(res, type) ? GL_TRUE : GL_FALSE;
 }
 
 static const int mglActiveUniformResourceTypes[] = {
@@ -758,84 +634,13 @@ GLint mglProgramActiveUniformIndexByName(Program *program, const GLchar *name)
     return -1;
 }
 
-static GLint mglKnownPlainUniformType(const char *name)
-{
-    if (!name || !mglSafeCStringLength(name, NULL)) {
-        return GL_FLOAT;
-    }
-
-    if (mglSafeCStringEquals(name, "ModelViewMat") ||
-        mglSafeCStringEquals(name, "ProjMat") ||
-        mglSafeCStringEquals(name, "TextureMat") ||
-        mglSafeCStringEquals(name, "u_ProjectionMatrix") ||
-        mglSafeCStringEquals(name, "u_ModelViewMatrix")) {
-        return GL_FLOAT_MAT4;
-    }
-    if (mglSafeCStringEquals(name, "IViewRotMat")) {
-        return GL_FLOAT_MAT3;
-    }
-    if (mglSafeCStringEquals(name, "ColorModulator") ||
-        mglSafeCStringEquals(name, "FogColor") ||
-        mglSafeCStringEquals(name, "u_FogColor") ||
-        mglSafeCStringEquals(name, "u_TexCoordShrink")) {
-        return GL_FLOAT_VEC4;
-    }
-    if (mglSafeCStringEquals(name, "ScreenSize")) {
-        return GL_FLOAT_VEC2;
-    }
-    if (mglSafeCStringEquals(name, "ChunkOffset") ||
-        mglSafeCStringEquals(name, "u_RegionOffset")) {
-        return GL_FLOAT_VEC3;
-    }
-    if (mglSafeCStringEquals(name, "FogShape") ||
-        mglSafeCStringEquals(name, "u_EnvironmentFog") ||
-        mglSafeCStringEquals(name, "u_RenderFog")) {
-        return GL_INT;
-    }
-
-    return GL_FLOAT;
-}
-
-static GLint mglSamplerUniformGLType(const SpirvResource *res, int res_type)
-{
-    if (!res) {
-        return 0;
-    }
-
-    if (res_type == SPVC_RESOURCE_TYPE_STORAGE_IMAGE) {
-        return (res->image_dim == 5u) ? GL_INT_IMAGE_BUFFER : GL_INT_IMAGE_2D;
-    }
-
-    if (res_type == SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS) {
-        return GL_SAMPLER_2D;
-    }
-
-    if (res_type == SPVC_RESOURCE_TYPE_SAMPLED_IMAGE ||
-        res_type == SPVC_RESOURCE_TYPE_SEPARATE_IMAGE ||
-        mglUniformResourceLooksSamplerLike(res, res_type)) {
-        switch (res->image_dim) {
-            case 0: return res->image_arrayed ? GL_SAMPLER_1D_ARRAY : GL_SAMPLER_1D;
-            case 1: return res->image_arrayed ? GL_SAMPLER_2D_ARRAY : GL_SAMPLER_2D;
-            case 2: return GL_SAMPLER_3D;
-            case 3: return res->image_arrayed ? GL_SAMPLER_CUBE_MAP_ARRAY : GL_SAMPLER_CUBE;
-            case 5: return GL_INT_SAMPLER_BUFFER;
-            default: return GL_SAMPLER_2D;
-        }
-    }
-
-    return 0;
-}
-
 GLint mglProgramActiveUniformGLType(const SpirvResource *res, int res_type)
 {
-    GLint sampler_type = mglSamplerUniformGLType(res, res_type);
-    if (sampler_type != 0) {
-        return sampler_type;
-    }
+    (void)res_type;
     if (res && res->gl_type != 0) {
         return (GLint)res->gl_type;
     }
-    return mglKnownPlainUniformType(res ? res->name : NULL);
+    return 0;
 }
 
 GLint mglProgramActiveUniformSize(const SpirvResource *res, int res_type)
@@ -972,10 +777,6 @@ static GLint mglPlainUniformResourceLocation(const SpirvResource *res)
         return -1;
     }
 
-    GLint known = mglKnownPlainUniformLocation(res->name);
-    if (known >= 0) {
-        return known;
-    }
     if (res->uniform_location >= 0) {
         return res->uniform_location;
     }
@@ -1136,6 +937,10 @@ static GLboolean mglMetalSamplerSlotSharedAcrossResources(Program *program, GLui
         return GL_FALSE;
     }
 
+    if (program->sampler_metal_slot_shared_valid[metal_binding]) {
+        return program->sampler_metal_slot_shared[metal_binding];
+    }
+
     unsigned hits = 0u;
     for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++) {
         for (size_t rt = 0; rt < sizeof(sampler_resource_types) / sizeof(sampler_resource_types[0]); rt++) {
@@ -1153,199 +958,147 @@ static GLboolean mglMetalSamplerSlotSharedAcrossResources(Program *program, GLui
                 }
 
                 if (++hits > 1u) {
+                    program->sampler_metal_slot_shared[metal_binding] = GL_TRUE;
+                    program->sampler_metal_slot_shared_valid[metal_binding] = GL_TRUE;
                     return GL_TRUE;
                 }
             }
         }
     }
 
-    return GL_FALSE;
+    program->sampler_metal_slot_shared[metal_binding] = hits > 1u ? GL_TRUE : GL_FALSE;
+    program->sampler_metal_slot_shared_valid[metal_binding] = GL_TRUE;
+    return program->sampler_metal_slot_shared[metal_binding];
+}
+
+/* Reflection is immutable between links. Cache both sampler matches and
+ * negative lookups, retaining every stage/type alias used by the old scan. */
+static MGLSamplerUniformCacheEntry *mglSamplerUniformMatches(Program *program,
+                                                           GLint location)
+{
+    static const int types[] = {
+        SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT, SPVC_RESOURCE_TYPE_SAMPLED_IMAGE,
+        SPVC_RESOURCE_TYPE_SEPARATE_IMAGE, SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS,
+        SPVC_RESOURCE_TYPE_STORAGE_IMAGE
+    };
+    for (GLuint i = 0; i < MGL_SAMPLER_UNIFORM_CACHE_CAPACITY; i++) {
+        MGLSamplerUniformCacheEntry *entry = &program->sampler_uniform_cache[i];
+        if (entry->valid && entry->location == location) return entry;
+    }
+
+    SpirvResource *primary = NULL;
+    int primaryType = -1;
+    for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES && !primary; stage++) {
+        for (size_t t = 0; t < sizeof(types) / sizeof(types[0]) && !primary; t++) {
+            SpirvResourceList *list = mglUniformSafeResourceList(program, stage, types[t], __FUNCTION__);
+            if (!list) continue;
+            for (GLuint i = 0; i < list->count; i++) {
+                SpirvResource *res = &list->list[i];
+                if (mglUniformResourceLooksSamplerLike(res, types[t]) &&
+                    mglUniformLocationMatchesResource(res, types[t], location)) {
+                    primary = res;
+                    primaryType = types[t];
+                    break;
+                }
+            }
+        }
+    }
+
+    MGLSamplerUniformCacheEntry *entry =
+        &program->sampler_uniform_cache[program->sampler_uniform_cache_next];
+    program->sampler_uniform_cache_next =
+        (program->sampler_uniform_cache_next + 1u) % MGL_SAMPLER_UNIFORM_CACHE_CAPACITY;
+    free(entry->matches);
+    memset(entry, 0, sizeof(*entry));
+    entry->location = location;
+    if (!primary) {
+        entry->valid = GL_TRUE;
+        return entry;
+    }
+
+    /* Grow only on cache misses; matching uses the original validated rules. */
+    for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++) {
+        for (size_t t = 0; t < sizeof(types) / sizeof(types[0]); t++) {
+            SpirvResourceList *list = mglUniformSafeResourceList(program, stage, types[t], __FUNCTION__);
+            if (!list) continue;
+            for (GLuint i = 0; i < list->count; i++) {
+                SpirvResource *res = &list->list[i];
+                if (!mglSamplerResourceMatchesUniformWrite(res, types[t], location, primary, primaryType)) continue;
+                MGLSamplerUniformMatch *matches = realloc(entry->matches,
+                    (entry->match_count + 1u) * sizeof(*matches));
+                if (!matches) {
+                    free(entry->matches);
+                    memset(entry, 0, sizeof(*entry));
+                    return NULL;
+                }
+                entry->matches = matches;
+                GLint element = location - res->uniform_location;
+                matches[entry->match_count++] = (MGLSamplerUniformMatch){
+                    .resource = res, .array_element = element > 0 ? element : 0,
+                    .stage = stage, .resource_type = types[t]
+                };
+            }
+        }
+    }
+    entry->valid = GL_TRUE;
+    return entry;
 }
 
 static GLboolean mglSetSamplerUniformUnit(GLMContext ctx, GLint location, GLint unit)
 {
-    static const int sampler_resource_types[] = {
-        SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT,
-        SPVC_RESOURCE_TYPE_SAMPLED_IMAGE,
-        SPVC_RESOURCE_TYPE_SEPARATE_IMAGE,
-        SPVC_RESOURCE_TYPE_SEPARATE_SAMPLERS,
-        SPVC_RESOURCE_TYPE_STORAGE_IMAGE
-    };
-
     ctx = mglUniformResolveContext(ctx, __FUNCTION__);
-    if (!ctx || location < 0) {
-        return GL_FALSE;
-    }
-
+    if (!ctx || location < 0) return GL_FALSE;
     Program *program = mglUniformGetCurrentProgram(ctx, __FUNCTION__);
-    if (!program) {
-        return GL_FALSE;
-    }
+    if (!program) return GL_FALSE;
+    MGLSamplerUniformCacheEntry *entry = mglSamplerUniformMatches(program, location);
+    if (!entry) { ERROR_RETURN_VALUE(GL_OUT_OF_MEMORY, GL_TRUE); }
+    if (!entry->match_count) return GL_FALSE;
+    if (unit < 0 || unit >= TEXTURE_UNITS) { ERROR_RETURN_VALUE(GL_INVALID_VALUE, GL_TRUE); }
 
-    GLboolean matched = GL_FALSE;
-    GLboolean needs_update = GL_FALSE;
-    const char *firstMatchedName = NULL;
-    GLuint firstMatchedBinding = 0u;
-    int firstMatchedStage = -1;
-    SpirvResource *primaryResource = NULL;
-    int primaryResourceType = -1;
-
-    for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++) {
-        for (size_t rt = 0; rt < sizeof(sampler_resource_types) / sizeof(sampler_resource_types[0]); rt++) {
-            int res_type = sampler_resource_types[rt];
-            SpirvResourceList *resources = mglUniformSafeResourceList(program, stage, res_type, __FUNCTION__);
-            if (!resources) {
-                continue;
-            }
-
-            for (GLuint i = 0; i < resources->count; i++) {
-                SpirvResource *res = &resources->list[i];
-                if (!mglUniformResourceLooksSamplerLike(res, res_type) ||
-                    !mglUniformLocationMatchesResource(res, res_type, location)) {
-                    continue;
-                }
-
-                matched = GL_TRUE;
-                if (!firstMatchedName) {
-                    firstMatchedName = res->name;
-                    firstMatchedBinding = res->binding;
-                    firstMatchedStage = stage;
-                }
-                if (!primaryResource) {
-                    primaryResource = res;
-                    primaryResourceType = res_type;
-                }
-            }
+    GLboolean needsUpdate = GL_FALSE;
+    for (GLuint i = 0; i < entry->match_count; i++) {
+        MGLSamplerUniformMatch *match = &entry->matches[i];
+        SpirvResource *res = match->resource;
+        GLuint slot = res->binding + (GLuint)match->array_element;
+        if (match->array_element == 0 &&
+            (res->sampler_unit != unit || !res->sampler_unit_explicit)) needsUpdate = GL_TRUE;
+        if (slot < TEXTURE_UNITS) {
+            GLboolean shared = mglMetalSamplerSlotSharedAcrossResources(program, slot);
+            if (program->sampler_units_by_stage[match->stage][slot] != unit ||
+                !program->sampler_units_explicit_by_stage[match->stage][slot] ||
+                (!shared && (program->sampler_units[slot] != unit ||
+                             !program->sampler_units_explicit[slot]))) needsUpdate = GL_TRUE;
         }
     }
+    if (!needsUpdate) return GL_TRUE;
+    mglFlushPendingDraws(ctx);
 
-    if (!matched) {
-        return GL_FALSE;
-    }
-
-    if (unit < 0 || unit >= TEXTURE_UNITS) {
-        ERROR_RETURN_VALUE(GL_INVALID_VALUE, GL_TRUE);
-    }
-
-    GLuint matchedResourceCount = 0u;
-    for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++) {
-        for (size_t rt = 0; rt < sizeof(sampler_resource_types) / sizeof(sampler_resource_types[0]); rt++) {
-            int res_type = sampler_resource_types[rt];
-            SpirvResourceList *resources = mglUniformSafeResourceList(program, stage, res_type, __FUNCTION__);
-            if (!resources) {
-                continue;
+    for (GLuint i = 0; i < entry->match_count; i++) {
+        MGLSamplerUniformMatch *match = &entry->matches[i];
+        SpirvResource *res = match->resource;
+        GLuint slot = res->binding + (GLuint)match->array_element;
+        if (match->array_element == 0) {
+            res->sampler_unit = unit;
+            res->sampler_unit_explicit = GL_TRUE;
+        }
+        if (slot < TEXTURE_UNITS) {
+            if (!mglMetalSamplerSlotSharedAcrossResources(program, slot)) {
+                program->sampler_units[slot] = unit;
+                program->sampler_units_explicit[slot] = GL_TRUE;
             }
-
-            for (GLuint i = 0; i < resources->count; i++) {
-                SpirvResource *res = &resources->list[i];
-                if (!mglSamplerResourceMatchesUniformWrite(res,
-                                                           res_type,
-                                                           location,
-                                                           primaryResource,
-                                                           primaryResourceType)) {
-                    continue;
-                }
-
-                matchedResourceCount++;
-                if (res->sampler_unit != unit || !res->sampler_unit_explicit) {
-                    needs_update = GL_TRUE;
-                } else if (res->binding < TEXTURE_UNITS) {
-                    GLboolean shared_slot =
-                        mglMetalSamplerSlotSharedAcrossResources(program, res->binding);
-                    if (program->sampler_units_by_stage[stage][res->binding] != unit ||
-                        !program->sampler_units_explicit_by_stage[stage][res->binding] ||
-                        (!shared_slot &&
-                         (program->sampler_units[res->binding] != unit ||
-                          !program->sampler_units_explicit[res->binding]))) {
-                        needs_update = GL_TRUE;
-                    }
-                }
-            }
+            program->sampler_units_by_stage[match->stage][slot] = unit;
+            program->sampler_units_explicit_by_stage[match->stage][slot] = GL_TRUE;
         }
     }
-
-    if (needs_update) {
-        mglFlushPendingDraws(ctx);
+    memset(program->sampler_texture_target_masks_valid, 0,
+           sizeof(program->sampler_texture_target_masks_valid));
+    if (mglTraceLogIsEnabled()) {
+        MGLSamplerUniformMatch *first = &entry->matches[0];
+        mglTraceLogExternal("SAMPLER_UNIFORM_SET program=%u location=%d unit=%d firstStage=%d firstBinding=%u firstName=%s resources=%u",
+            program->name, location, unit, first->stage, first->resource->binding,
+            mglSafeCStringForLog(first->resource->name), entry->match_count);
     }
-
-    GLboolean changed = GL_FALSE;
-    GLboolean explicit_changed = GL_FALSE;
-    GLuint updatedResourceCount = 0u;
-
-    for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++) {
-        for (size_t rt = 0; rt < sizeof(sampler_resource_types) / sizeof(sampler_resource_types[0]); rt++) {
-            int res_type = sampler_resource_types[rt];
-            SpirvResourceList *resources = mglUniformSafeResourceList(program, stage, res_type, __FUNCTION__);
-            if (!resources) {
-                continue;
-            }
-
-            for (GLuint i = 0; i < resources->count; i++) {
-                SpirvResource *res = &resources->list[i];
-                if (!mglSamplerResourceMatchesUniformWrite(res,
-                                                           res_type,
-                                                           location,
-                                                           primaryResource,
-                                                           primaryResourceType)) {
-                    continue;
-                }
-
-                updatedResourceCount++;
-                GLint array_element = location - res->uniform_location;
-                if (array_element < 0) {
-                    array_element = 0;
-                }
-                GLuint metal_slot = res->binding + (GLuint)array_element;
-                if (array_element == 0 && res->sampler_unit != unit) {
-                    changed = GL_TRUE;
-                    res->sampler_unit = unit;
-                }
-                if (array_element == 0 && !res->sampler_unit_explicit) {
-                    explicit_changed = GL_TRUE;
-                    res->sampler_unit_explicit = GL_TRUE;
-                }
-
-                if (metal_slot < TEXTURE_UNITS) {
-                    GLboolean shared_slot =
-                        mglMetalSamplerSlotSharedAcrossResources(program, metal_slot);
-                    if (!shared_slot && program->sampler_units[metal_slot] != unit) {
-                        changed = GL_TRUE;
-                        program->sampler_units[metal_slot] = unit;
-                    }
-                    if (!shared_slot && !program->sampler_units_explicit[metal_slot]) {
-                        explicit_changed = GL_TRUE;
-                        program->sampler_units_explicit[metal_slot] = GL_TRUE;
-                    }
-                    if (program->sampler_units_by_stage[stage][metal_slot] != unit) {
-                        changed = GL_TRUE;
-                        program->sampler_units_by_stage[stage][metal_slot] = unit;
-                    }
-                    if (!program->sampler_units_explicit_by_stage[stage][metal_slot]) {
-                        explicit_changed = GL_TRUE;
-                        program->sampler_units_explicit_by_stage[stage][metal_slot] = GL_TRUE;
-                    }
-                }
-            }
-        }
-    }
-
-    if (changed || explicit_changed) {
-        static unsigned long long s_sampler_uniform_update_count = 0;
-        unsigned long long hit = ++s_sampler_uniform_update_count;
-        mglTraceLogExternal("SAMPLER_UNIFORM_SET program=%u location=%d unit=%d firstStage=%d firstBinding=%u firstName=%s resources=%u/%u changed=%d explicitChanged=%d hit=%llu",
-                            (unsigned)program->name,
-                            (int)location,
-                            (int)unit,
-                            firstMatchedStage,
-                            (unsigned)firstMatchedBinding,
-                            mglSafeCStringForLog(firstMatchedName),
-                            (unsigned)updatedResourceCount,
-                            (unsigned)matchedResourceCount,
-                            changed ? 1 : 0,
-                            explicit_changed ? 1 : 0,
-                            hit);
-        ctx->state.dirty_bits |= DIRTY_TEX_BINDING | DIRTY_SAMPLER;
-    }
+    ctx->state.dirty_bits |= DIRTY_TEX_BINDING | DIRTY_SAMPLER;
     return GL_TRUE;
 }
 
@@ -1950,8 +1703,8 @@ GLuint  mglGetUniformBlockIndex(GLMContext ctx, GLuint program, const GLchar *un
         }
     }
 
-    fprintf(stderr, "MGL WARNING: uniform block '%s' binding not found, returning GL_INVALID_INDEX\n",
-            mglSafeCStringForLog(uniformBlockName));
+    mglTraceLogExternal("UNIFORM_BLOCK_NOT_ACTIVE name=%s",
+                        mglSafeCStringForLog(uniformBlockName));
     return (GLuint)-1;
 }
 
@@ -2174,6 +1927,8 @@ void mglUniformBlockBinding(GLMContext ctx, GLuint program, GLuint uniformBlockI
         }
     }
 
+    memset(ptr->draw_buffer_slot_masks_valid, 0,
+           sizeof(ptr->draw_buffer_slot_masks_valid));
     ctx->state.dirty_bits |= DIRTY_BUFFER_BASE_STATE | DIRTY_PROGRAM;
 }
 
@@ -2220,7 +1975,13 @@ static GLboolean mglUniformBufferDataWouldChange(Buffer *buf, GLsizeiptr size, c
     return memcmp((const void *)(uintptr_t)buf->data.buffer_data, data, (size_t)size) != 0;
 }
 
-static bool checkUniformUploadParams(GLMContext ctx, GLint location, const void *ptr, GLsizei count, size_t element_size, GLsizeiptr *size_out)
+static bool checkUniformUploadParamsWithReadability(GLMContext ctx,
+                                                    GLint location,
+                                                    const void *ptr,
+                                                    GLsizei count,
+                                                    size_t element_size,
+                                                    GLsizeiptr *size_out,
+                                                    bool knownReadable)
 {
     if (!checkUniformParams(ctx, location)) {
         return false;
@@ -2246,7 +2007,7 @@ static bool checkUniformUploadParams(GLMContext ctx, GLint location, const void 
         return false;
     }
 
-    if (total > 0 && !mglPointerRangeIsReadable(ptr, total)) {
+    if (total > 0 && !knownReadable && !mglPointerRangeIsReadable(ptr, total)) {
         fprintf(stderr,
                 "MGL WARNING: dropping uniform update location=%d count=%d bytes=%zu unreadable value=%p\n",
                 location,
@@ -2262,6 +2023,13 @@ static bool checkUniformUploadParams(GLMContext ctx, GLint location, const void 
         *size_out = (GLsizeiptr)total;
     }
     return true;
+}
+
+static bool checkUniformUploadParams(GLMContext ctx, GLint location, const void *ptr,
+                                     GLsizei count, size_t element_size, GLsizeiptr *size_out)
+{
+    return checkUniformUploadParamsWithReadability(ctx, location, ptr, count,
+                                                   element_size, size_out, false);
 }
 
 static SpirvResource *mglFindPlainUniformResource(Program *program, GLint location)
@@ -2306,7 +2074,8 @@ static void mglUploadPlainUniformMat3fv(GLMContext ctx,
                                         GLboolean transpose,
                                         const GLfloat *value);
 
-void mglUniform(GLMContext ctx, GLint location, void *ptr, GLsizeiptr size)
+static void mglUniformCore(GLMContext ctx, GLint location, void *ptr,
+                           GLsizeiptr size, bool knownReadable)
 {
     ctx = mglUniformResolveContext(ctx, __FUNCTION__);
     if (!ctx) {
@@ -2319,7 +2088,7 @@ void mglUniform(GLMContext ctx, GLint location, void *ptr, GLsizeiptr size)
         mglUniformSetError(ctx, GL_INVALID_VALUE);
         return;
     }
-    if (size > 0 && !mglPointerRangeIsReadable(ptr, (size_t)size)) {
+    if (size > 0 && !knownReadable && !mglPointerRangeIsReadable(ptr, (size_t)size)) {
         fprintf(stderr,
                 "MGL WARNING: dropping uniform update location=%d bytes=%lld unreadable value=%p\n",
                 location,
@@ -2336,92 +2105,47 @@ void mglUniform(GLMContext ctx, GLint location, void *ptr, GLsizeiptr size)
     }
 
     BufferBaseTarget *uniformSlot = &program->plain_uniform_buffers[location];
-    BufferBaseTarget *globalSlot =
-        &ctx->state.buffer_base[_UNIFORM_CONSTANT].buffers[location];
     Buffer *buf = uniformSlot->buf;
 
-    /* Minecraft frequently uploads unchanged projection/fog/color values.
-     * Avoid work only when both stores already contain the requested bytes. */
-    bool programDataChanged =
-        (buf == NULL) || mglUniformBufferDataWouldChange(buf, size, ptr);
-    bool globalDataChanged =
-        (globalSlot->buf == NULL) ||
-        mglUniformBufferDataWouldChange(globalSlot->buf, size, ptr);
-    if (!programDataChanged && !globalDataChanged) {
+    /* Uniform values belong to this linked Program. Uploading the same value
+     * remains a no-op even if another program uses the same numeric location. */
+    if (buf && !mglUniformBufferDataWouldChange(buf, size, ptr)) {
         return;
     }
 
-    /*
-     * Deferred batches replay against live Program-owned uniform storage
-     * (the state snapshot only captures buffer binding pointers, not
-     * contents), and delta replay skips rebinding uniform buffers when
-     * consecutive batch keys match.  Both mechanisms are only correct if
-     * all pending draws are replayed BEFORE this mutation lands:
-     * otherwise a draw recorded before the glUniform* call replays with
-     * the new bytes (GL ordering violation), and a same-key draw recorded
-     * after it keeps the encoder bound to the previous MTLBuffer.  Flush
-     * unconditionally whenever the bytes actually change — this also
-     * resets the replay delta chain.  Identical uploads still return
-     * early above, preserving the hot-path optimization.
-     */
-    mglFlushPendingDraws(ctx);
+    /* Versioned replay owns immutable uniform bytes. Legacy replay still
+     * needs to execute old draws before changing Program-owned storage. */
+    if (!mglUniformVersionsEnabled()) mglFlushPendingDraws(ctx);
 
-    bool bindingLayoutChanged =
-        (buf == NULL || uniformSlot->size != size ||
-         globalSlot->buf == NULL || globalSlot->size != size);
+    bool bindingLayoutChanged = (buf == NULL || uniformSlot->size != size);
 
-    if (programDataChanged) {
-        if(buf == NULL)
-        {
-            GLuint internalName = MGL_INTERNAL_UNIFORM_BUFFER_NAME_BASE |
-                                  (((GLuint)program->name & 0x0fffu) << 12) |
-                                  (GLuint)location;
-            uniformSlot->buf = newBuffer(ctx, GL_UNIFORM_BUFFER, internalName);
-            buf = uniformSlot->buf;
-            if (buf) {
-                buf->plain_uniform_snapshot_private = mglPackedUniformReuseEnabled();
-                insertHashElement(&ctx->state.buffer_table, internalName, buf);
-            }
-        }
-
-        if (!buf) {
-            mglUniformSetError(ctx, GL_OUT_OF_MEMORY);
-            return;
-        }
-
-        if (mglPackedUniformReuseEnabled() && program->plain_uniform_generation != UINT64_MAX)
-            program->plain_uniform_generation++;
-        initBufferData(ctx, buf, size, ptr, true);
-        uniformSlot->buffer = buf->name;
-        uniformSlot->offset = 0;
-        uniformSlot->size = size;
-    }
-
-    /*
-     * Minecraft's shader layer can reuse the same logical plain uniform values
-     * across generated program variants. Keep the legacy global slot as a
-     * fallback for programs that have not received an explicit upload yet, while
-     * still preferring the per-program storage above when it exists.
-     */
-    if (!globalSlot->buf) {
-        GLuint globalName = MGL_INTERNAL_UNIFORM_BUFFER_NAME_BASE |
-                            0x00fff000u |
-                            (GLuint)location;
-        globalSlot->buf = newBuffer(ctx, GL_UNIFORM_BUFFER, globalName);
-        if (globalSlot->buf) {
-            globalSlot->buf->plain_uniform_snapshot_private = mglPackedUniformReuseEnabled();
-            insertHashElement(&ctx->state.buffer_table, globalName, globalSlot->buf);
+    if (buf == NULL) {
+        GLuint internalName = MGL_INTERNAL_UNIFORM_BUFFER_NAME_BASE |
+                              (((GLuint)program->name & 0x0fffu) << 12) |
+                              (GLuint)location;
+        uniformSlot->buf = newBuffer(ctx, GL_UNIFORM_BUFFER, internalName);
+        buf = uniformSlot->buf;
+        if (buf) {
+            buf->plain_uniform_snapshot_private = mglPackedUniformReuseEnabled();
+            insertHashElement(&ctx->state.buffer_table, internalName, buf);
         }
     }
-    if (globalSlot->buf) {
-        if (globalDataChanged) {
-            if (mglPackedUniformReuseEnabled() && ctx->plain_uniform_fallback_generation != UINT64_MAX)
-                ctx->plain_uniform_fallback_generation++;
-            initBufferData(ctx, globalSlot->buf, size, ptr, true);
-        }
-        globalSlot->buffer = globalSlot->buf->name;
-        globalSlot->offset = 0;
-        globalSlot->size = size;
+    if (!buf) {
+        mglUniformSetError(ctx, GL_OUT_OF_MEMORY);
+        return;
+    }
+
+    kern_return_t uploadResult = initBufferData(ctx, buf, size, ptr, true);
+    if (uploadResult != KERN_SUCCESS) {
+        return;
+    }
+    uniformSlot->buffer = buf->name;
+    uniformSlot->offset = 0;
+    uniformSlot->size = size;
+
+    mglInvalidateProgramPlainUniformVersion(ctx, program);
+    if (program->plain_uniform_generation != UINT64_MAX) {
+        program->plain_uniform_generation++;
     }
 
     ctx->state.dirty_bits |= bindingLayoutChanged
@@ -2429,23 +2153,30 @@ void mglUniform(GLMContext ctx, GLint location, void *ptr, GLsizeiptr size)
         : DIRTY_BUFFER;
 }
 
+void mglUniform(GLMContext ctx, GLint location, void *ptr, GLsizeiptr size)
+{
+    mglUniformCore(ctx, location, ptr, size, false);
+}
+
 static void mglUniformDoubleVectorAsFloat(GLMContext ctx,
                                           GLint location,
                                           const GLdouble *value,
                                           GLsizei count,
-                                          size_t components)
+                                          size_t components,
+                                          bool knownReadable)
 {
     GLsizeiptr sourceBytes = 0;
     size_t scalarCount;
     GLfloat stackValues[16];
     GLfloat *converted = stackValues;
 
-    if (!checkUniformUploadParams(ctx,
-                                  location,
-                                  value,
-                                  count,
-                                  components * sizeof(GLdouble),
-                                  &sourceBytes)) {
+    if (!checkUniformUploadParamsWithReadability(ctx,
+                                                location,
+                                                value,
+                                                count,
+                                                components * sizeof(GLdouble),
+                                                &sourceBytes,
+                                                knownReadable)) {
         return;
     }
 
@@ -2474,7 +2205,8 @@ static void mglUniformDoubleVectorAsFloat(GLMContext ctx,
     }
 
     (void)sourceBytes;
-    mglUniform(ctx, location, converted, (GLsizeiptr)(scalarCount * sizeof(GLfloat)));
+    mglUniformCore(ctx, location, converted,
+                   (GLsizeiptr)(scalarCount * sizeof(GLfloat)), true);
 
     if (converted != stackValues) {
         free(converted);
@@ -2483,17 +2215,17 @@ static void mglUniformDoubleVectorAsFloat(GLMContext ctx,
 
 void mglUniform1d(GLMContext ctx, GLint location, GLdouble x)
 {
-    mglUniformDoubleVectorAsFloat(ctx, location, &x, 1, 1);
+    mglUniformDoubleVectorAsFloat(ctx, location, &x, 1, 1, true);
 }
 
 void mglUniform1dv(GLMContext ctx, GLint location, GLsizei count, const GLdouble *value)
 {
-    mglUniformDoubleVectorAsFloat(ctx, location, value, count, 1);
+    mglUniformDoubleVectorAsFloat(ctx, location, value, count, 1, false);
 }
 
 void mglUniform1f(GLMContext ctx, GLint location, GLfloat v0)
 {
-    mglUniform(ctx, location, &v0, sizeof(GLfloat));
+    mglUniformCore(ctx, location, &v0, sizeof(GLfloat), true);
 }
 
 void mglUniform1fv(GLMContext ctx, GLint location, GLsizei count, const GLfloat *value)
@@ -2507,7 +2239,7 @@ void mglUniform1i(GLMContext ctx, GLint location, GLint v0)
         return;
     }
 
-    mglUniform(ctx, location, &v0, sizeof(GLint));
+    mglUniformCore(ctx, location, &v0, sizeof(GLint), true);
 }
 
 void mglUniform1iv(GLMContext ctx, GLint location, GLsizei count, const GLint *value)
@@ -2526,7 +2258,7 @@ void mglUniform1ui(GLMContext ctx, GLint location, GLuint v0)
         return;
     }
 
-    mglUniform(ctx, location, &v0, sizeof(GLuint));
+    mglUniformCore(ctx, location, &v0, sizeof(GLuint), true);
 }
 
 void mglUniform1uiv(GLMContext ctx, GLint location, GLsizei count, const GLuint *value)
@@ -2544,19 +2276,19 @@ void mglUniform2d(GLMContext ctx, GLint location, volatile GLdouble x, volatile 
 {
     GLdouble data[] = {x, y};
     
-    mglUniformDoubleVectorAsFloat(ctx, location, data, 1, 2);
+    mglUniformDoubleVectorAsFloat(ctx, location, data, 1, 2, true);
 }
 
 void mglUniform2dv(GLMContext ctx, GLint location, GLsizei count, const GLdouble *value)
 {
-    mglUniformDoubleVectorAsFloat(ctx, location, value, count, 2);
+    mglUniformDoubleVectorAsFloat(ctx, location, value, count, 2, false);
 }
 
 void mglUniform2f(GLMContext ctx, GLint location, GLfloat v0, GLfloat v1)
 {
     GLfloat data[] = {v0, v1};
     
-    mglUniform(ctx, location, data, 2 * sizeof(GLfloat));
+    mglUniformCore(ctx, location, data, 2 * sizeof(GLfloat), true);
 }
 
 void mglUniform2fv(GLMContext ctx, GLint location, GLsizei count, const GLfloat *value)
@@ -2568,7 +2300,7 @@ void mglUniform2i(GLMContext ctx, GLint location, GLint v0, GLint v1)
 {
     GLint data[] = {v0, v1};
     
-    mglUniform(ctx, location, data, 2 * sizeof(GLint));
+    mglUniformCore(ctx, location, data, 2 * sizeof(GLint), true);
 }
 
 void mglUniform2iv(GLMContext ctx, GLint location, GLsizei count, const GLint *value)
@@ -2580,7 +2312,7 @@ void mglUniform2ui(GLMContext ctx, GLint location, GLuint v0, GLuint v1)
 {
     GLuint data[] = {v0, v1};
     
-    mglUniform(ctx, location, data, 2 * sizeof(GLuint));
+    mglUniformCore(ctx, location, data, 2 * sizeof(GLuint), true);
 }
 
 void mglUniform2uiv(GLMContext ctx, GLint location, GLsizei count, const GLuint *value)
@@ -2592,19 +2324,19 @@ void mglUniform3d(GLMContext ctx, GLint location, GLdouble x, GLdouble y, GLdoub
 {
     GLdouble data[] = {x, y, z};
     
-    mglUniformDoubleVectorAsFloat(ctx, location, data, 1, 3);
+    mglUniformDoubleVectorAsFloat(ctx, location, data, 1, 3, true);
 }
 
 void mglUniform3dv(GLMContext ctx, GLint location, GLsizei count, const GLdouble *value)
 {
-    mglUniformDoubleVectorAsFloat(ctx, location, value, count, 3);
+    mglUniformDoubleVectorAsFloat(ctx, location, value, count, 3, false);
 }
 
 void mglUniform3f(GLMContext ctx, GLint location, GLfloat v0, GLfloat v1, GLfloat v2)
 {
     GLfloat data[] = {v0, v1, v2};
     
-    mglUniform(ctx, location, data, 3 * sizeof(GLfloat));
+    mglUniformCore(ctx, location, data, 3 * sizeof(GLfloat), true);
 }
 
 void mglUniform3fv(GLMContext ctx, GLint location, GLsizei count, const GLfloat *value)
@@ -2616,7 +2348,7 @@ void mglUniform3i(GLMContext ctx, GLint location, GLint v0, GLint v1, GLint v2)
 {
     GLint data[] = {v0, v1, v2};
     
-    mglUniform(ctx, location, data, 3 * sizeof(GLint));
+    mglUniformCore(ctx, location, data, 3 * sizeof(GLint), true);
 }
 
 void mglUniform3iv(GLMContext ctx, GLint location, GLsizei count, const GLint *value)
@@ -2628,7 +2360,7 @@ void mglUniform3ui(GLMContext ctx, GLint location, GLuint v0, GLuint v1, GLuint 
 {
     GLuint data[] = {v0, v1, v2};
     
-    mglUniform(ctx, location, (void *)data, 3 * sizeof(GLuint));
+    mglUniformCore(ctx, location, (void *)data, 3 * sizeof(GLuint), true);
 }
 
 void mglUniform3uiv(GLMContext ctx, GLint location, GLsizei count, const GLuint *value)
@@ -2640,19 +2372,19 @@ void mglUniform4d(GLMContext ctx, GLint location, GLdouble x, GLdouble y, GLdoub
 {
     GLdouble data[] = {x, y, z, w};
     
-    mglUniformDoubleVectorAsFloat(ctx, location, data, 1, 4);
+    mglUniformDoubleVectorAsFloat(ctx, location, data, 1, 4, true);
 }
 
 void mglUniform4dv(GLMContext ctx, GLint location, GLsizei count, const GLdouble *value)
 {
-    mglUniformDoubleVectorAsFloat(ctx, location, value, count, 4);
+    mglUniformDoubleVectorAsFloat(ctx, location, value, count, 4, false);
 }
 
 void mglUniform4f(GLMContext ctx, GLint location, GLfloat v0, GLfloat v1, GLfloat v2, GLfloat v3)
 {
     GLfloat data[] = {v0, v1, v2, v3};
     
-    mglUniform(ctx, location, (void *)data, 4 * sizeof(GLfloat));
+    mglUniformCore(ctx, location, (void *)data, 4 * sizeof(GLfloat), true);
 }
 
 void mglUniform4fv(GLMContext ctx, GLint location, GLsizei count, const GLfloat *value)
@@ -2664,7 +2396,7 @@ void mglUniform4i(GLMContext ctx, GLint location, GLint v0, GLint v1, GLint v2, 
 {
     GLint data[] = {v0, v1, v2, v3};
     
-    mglUniform(ctx, location, data, 4 * sizeof(GLint));
+    mglUniformCore(ctx, location, data, 4 * sizeof(GLint), true);
 }
 
 void mglUniform4iv(GLMContext ctx, GLint location, GLsizei count, const GLint *value)
@@ -2676,7 +2408,7 @@ void mglUniform4ui(GLMContext ctx, GLint location, GLuint v0, GLuint v1, GLuint 
 {
     GLuint data[] = {v0, v1, v2, v3};
     
-    mglUniform(ctx, location, data, 4 * sizeof(GLuint));
+    mglUniformCore(ctx, location, data, 4 * sizeof(GLuint), true);
 }
 
 void mglUniform4uiv(GLMContext ctx, GLint location, GLsizei count, const GLuint *value)

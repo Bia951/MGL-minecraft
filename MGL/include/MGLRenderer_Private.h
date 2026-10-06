@@ -22,8 +22,10 @@
 #define MGLRenderer_Private_h
 
 #import "MGLRenderer.h"
+#import "mgl_gpu_profile.h"
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#include <stdatomic.h>
 #import <AppKit/AppKit.h>
 #import <QuartzCore/QuartzCore.h>   // CAMetalLayer
 #import <simd/simd.h>               // vector_float4, vector_uint2, etc.
@@ -170,10 +172,42 @@ static inline void mglMetalUnlock(os_unfair_lock *lock) {
 #define MGL_STATE(context)  (_activeState ? _activeState : &(context)->state)
 
 @class MGLResolvedTextureBindings;
+@interface MGLPackedUniformArenaLease : NSObject {
+@public
+    atomic_bool available;
+}
+@property(nonatomic, strong) id<MTLBuffer> buffer;
+@property(nonatomic) NSUInteger capacity;
+@property(nonatomic) BOOL pooled;
+@end
+
+@interface MGLPackedUniformArenaLeaseGroup : NSObject {
+@public
+    NSMutableArray<MGLPackedUniformArenaLease *> *entries;
+    atomic_bool returned;
+}
+- (void)addLease:(MGLPackedUniformArenaLease *)lease;
+- (void)returnLeases;
+@end
+
+#define MGL_PLAIN_UNIFORM_ARENA_CACHE_CAPACITY 1024u
+typedef struct MGLPlainUniformArenaCacheEntry_t {
+    const Buffer *source_buffer;
+    NSUInteger source_offset;
+    NSUInteger source_size;
+    NSUInteger packed_size;
+    __unsafe_unretained id<MTLBuffer> arena_buffer;
+    NSUInteger arena_offset;
+    NSUInteger arena_capacity;
+    BOOL valid;
+} MGLPlainUniformArenaCacheEntry;
 
 @interface MGLRenderer () {
     NSView *_view;
     CAMetalLayer *_layer;
+    int _swapInterval;
+    /* Default-on scheduling optimization, latched at renderer initialization. */
+    BOOL _deferDrawableAcquireEnabled;
     id<CAMetalDrawable> _drawable;
     GLMContext  ctx;    // context macros need this exact name
     GLMState *_activeState;  // NULL = use live ctx->state (normal path)
@@ -206,7 +240,22 @@ static inline void mglMetalUnlock(os_unfair_lock *lock) {
     MTLPixelFormat _pipelineDepthFormat;
     MTLPixelFormat _pipelineStencilFormat;
     GLuint _pipelineProgramName;
-    NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *_pipelineStateCache;
+    NSMutableDictionary<NSData *, id<MTLRenderPipelineState>> *_pipelineStateCache;
+    NSCache *_earlyPipelineStateCache;
+    BOOL _earlyPipelineCacheEnabled;
+    BOOL _earlyPipelineCacheVerify;
+    uint64_t _earlyPipelineCacheHits;
+    uint64_t _earlyPipelineCacheChecks;
+    NSCache<NSData *, id<MTLFunction>> *_sampleFlipFunctionCache;
+    NSCache<NSData *, NSArray<id<MTLTexture>> *> *_sampleFlipTextureViewCache;
+    uint64_t _pipelineSampleFlipMask;
+    uint64_t _pipelineSampleFlipProgramInstance;
+    uint64_t _pipelineSampleFlipProgramGeneration;
+    MTLRenderPipelineDescriptor *_scratchPipelineDescriptor;
+    MTLVertexDescriptor *_scratchVertexDescriptor;
+    uint32_t _vertexDescriptorAttributeMask;
+    uint32_t _vertexDescriptorLayoutMask;
+    BOOL _earlySamplePreflightEnabled;
     /* Gated by MGL_DS_CACHE (default ON; =0 disables).  Maps cache key →
      * id<MTLDepthStencilState> with simple LRU eviction at 64 entries. */
     NSMutableDictionary *_depthStencilStateCache;
@@ -254,9 +303,11 @@ static inline void mglMetalUnlock(os_unfair_lock *lock) {
     NSMutableArray<id<MTLBuffer>> *_argumentBufferRetiredFallbackStorage;
     /* Packed loose-uniform structs share one suballocated arena per Metal
      * command buffer instead of allocating one MTLBuffer per draw. */
-    id<MTLCommandBuffer> _packedUniformArenaCommandBuffer;
-    id<MTLBuffer> _packedUniformArenaBuffer;
-    NSMutableArray<id<MTLBuffer>> *_packedUniformRetiredArenas;
+    __weak id<MTLCommandBuffer> _packedUniformArenaCommandBuffer;
+    MGLPackedUniformArenaLeaseGroup *_packedUniformArenaLeaseGroup;
+    MGLPackedUniformArenaLease *_packedUniformArenaLease;
+    NSMutableArray<MGLPackedUniformArenaLease *> *_packedUniformArenaPool;
+    NSUInteger _packedUniformArenaPoolCapacity;
     NSUInteger _packedUniformArenaCapacity;
     NSUInteger _packedUniformArenaOffset;
     /* Immutable content/range dedup scoped strictly to the current command
@@ -265,6 +316,7 @@ static inline void mglMetalUnlock(os_unfair_lock *lock) {
     NSMutableDictionary<NSArray *, NSArray *> *_packedUniformRangeCache;
     NSMutableDictionary<NSArray *, id> *_packedUniformCPUSnapshots;
     NSUInteger _packedUniformCPUSnapshotBytes;
+    MGLPlainUniformArenaCacheEntry _plainUniformArenaCache[MGL_PLAIN_UNIFORM_ARENA_CACHE_CAPACITY];
     /* glVertexAttrib* current values are expanded into a repeated Metal
      * vertex stream.  Cache the immutable stream per attribute and rebuild it
      * only when the encoded value or stride actually changes. */
@@ -279,13 +331,22 @@ static inline void mglMetalUnlock(os_unfair_lock *lock) {
     GLuint _tcsOutVertices;             /* TCS output vertices per patch */
     id<MTLTexture> _fallbackSintTextureBuffer;
     NSMutableDictionary<NSNumber *, id<MTLTexture>> *_fallbackSampledTextureCache;
-    NSMutableDictionary<NSString *, id<MTLBuffer>> *_doubleVertexAttribBufferCache;
+    NSCache<NSString *, id<MTLBuffer>> *_doubleVertexAttribBufferCache;
     id<MTLSamplerState> _fallbackSamplerState;
     MGLFragmentTextureTraceBinding _fragmentTextureTraceBindings[TEXTURE_UNITS];
     NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *_scaledBlitPipelineCache;
+    NSCache<NSData *, id<MTLRenderPipelineState>> *_sampledCopyMRTPipelineCache;
     id<MTLSamplerState> _scaledBlitNearestSampler;
     id<MTLSamplerState> _scaledBlitLinearSampler;
     NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *_scaledDepthBlitPipelineCache;
+    id<MTLComputePipelineState> _nativeTexelExpandPipeline;
+    id<MTLComputePipelineState> _depthReadCopyPipeline;
+    id<MTLComputePipelineState> _depthReadArrayCopyPipeline;
+    id<MTLComputePipelineState> _copyImageRowFlipPipeline;
+    id<MTLComputePipelineState> _sampledCopyComputePipeline;
+    id<MTLBuffer> _copyImageRowFlipSourceBuffer;
+    id<MTLBuffer> _copyImageRowFlipDestinationBuffer;
+    MGLPlainUniformVersion *_replayUniformVersions[_MAX_SHADER_TYPES];
     NSMutableDictionary<NSNumber *, id<MTLComputePipelineState>> *_msaaIntegerResolvePipelineCache;
     NSMutableDictionary<NSString *, id<MTLRenderPipelineState>> *_clearRectPipelineCache;
     id<MTLDepthStencilState> _clearRectDepthState;
@@ -323,6 +384,8 @@ static inline void mglMetalUnlock(os_unfair_lock *lock) {
     NSCache<NSString *, NSNumber *> *_mslTextureTypeCache;
     /* One-draw texture/sampler plan; unsupported workers use legacy binding. */
     BOOL _resolvedTexturePlanEnabled;
+    NSMapTable<id<MTLResource>, NSNumber *> *_resolvedResourceUsageByEncoder;
+    id<MTLRenderCommandEncoder> _resolvedResourceEncoder;
     BOOL _resolvedTextureBindingsPreparing;
     MGLResolvedTextureBindings *_resolvedTextureBindings;
     id<MTLCommandBuffer> _resolvedTextureCommandBuffer;

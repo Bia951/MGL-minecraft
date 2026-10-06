@@ -2357,6 +2357,9 @@ void mglCopyImageSubData(GLMContext ctx, GLuint srcName, GLenum srcTarget, GLint
 		return;
 	}
 
+	/* Copy must follow pending source writes and precede destination reads. */
+	mglFlushPendingDraws(ctx);
+
 	// Use Metal blit to copy texture regions
 	ctx->mtl_funcs.mtlCopyImageSubData(ctx, srcTex, srcLevel, srcX, srcY, srcZ,
 	                                    dstTex, dstLevel, dstX, dstY, dstZ,
@@ -5908,6 +5911,8 @@ void mglShaderStorageBlockBinding(GLMContext ctx, GLuint program, GLuint storage
 		}
 	}
 
+	memset(pptr->draw_buffer_slot_masks_valid, 0,
+	       sizeof(pptr->draw_buffer_slot_masks_valid));
 	ctx->state.dirty_bits |= DIRTY_BUFFER_BASE_STATE | DIRTY_PROGRAM;
 }
 
@@ -6154,92 +6159,101 @@ void mglValidateProgramPipeline(GLMContext ctx, GLuint pipeline)
 
 void mglVertexAttrib1d(GLMContext ctx, GLuint index, GLdouble x)
 {
-	(void)ctx;
+	mglSetCurrentVertexAttribDouble(ctx, index, x, 0.0, 0.0, 1.0);
 }
 
 void mglVertexAttrib1dv(GLMContext ctx, GLuint index, const GLdouble *v)
 {
-	(void)ctx;
+	ERROR_CHECK_RETURN(v, GL_INVALID_VALUE);
+	mglSetCurrentVertexAttribDouble(ctx, index, v[0], 0.0, 0.0, 1.0);
 }
 
 void mglVertexAttrib1f(GLMContext ctx, GLuint index, GLfloat x)
 {
-	(void)ctx;
+	mglSetCurrentVertexAttribFloat(ctx, index, x, 0.0f, 0.0f, 1.0f);
 }
 
 void mglVertexAttrib1fv(GLMContext ctx, GLuint index, const GLfloat *v)
 {
-	(void)ctx;
+	ERROR_CHECK_RETURN(v, GL_INVALID_VALUE);
+	mglSetCurrentVertexAttribFloat(ctx, index, v[0], 0.0f, 0.0f, 1.0f);
 }
 
 void mglVertexAttrib1s(GLMContext ctx, GLuint index, GLshort x)
 {
-	(void)ctx;
+	mglSetCurrentVertexAttribFloat(ctx, index, (GLfloat)x, 0.0f, 0.0f, 1.0f);
 }
 
 void mglVertexAttrib1sv(GLMContext ctx, GLuint index, const GLshort *v)
 {
-	(void)ctx;
+	ERROR_CHECK_RETURN(v, GL_INVALID_VALUE);
+	mglSetCurrentVertexAttribFloat(ctx, index, (GLfloat)v[0], 0.0f, 0.0f, 1.0f);
 }
 
 void mglVertexAttrib2d(GLMContext ctx, GLuint index, GLdouble x, GLdouble y)
 {
-	(void)ctx;
+	mglSetCurrentVertexAttribDouble(ctx, index, x, y, 0.0, 1.0);
 }
 
 void mglVertexAttrib2dv(GLMContext ctx, GLuint index, const GLdouble *v)
 {
-	(void)ctx;
+	ERROR_CHECK_RETURN(v, GL_INVALID_VALUE);
+	mglSetCurrentVertexAttribDouble(ctx, index, v[0], v[1], 0.0, 1.0);
 }
 
 void mglVertexAttrib2f(GLMContext ctx, GLuint index, GLfloat x, GLfloat y)
 {
-	(void)ctx;
+	mglSetCurrentVertexAttribFloat(ctx, index, x, y, 0.0f, 1.0f);
 }
 
 void mglVertexAttrib2fv(GLMContext ctx, GLuint index, const GLfloat *v)
 {
-	(void)ctx;
+	ERROR_CHECK_RETURN(v, GL_INVALID_VALUE);
+	mglSetCurrentVertexAttribFloat(ctx, index, v[0], v[1], 0.0f, 1.0f);
 }
 
 void mglVertexAttrib2s(GLMContext ctx, GLuint index, GLshort x, GLshort y)
 {
-	(void)ctx;
+	mglSetCurrentVertexAttribFloat(ctx, index, (GLfloat)x, (GLfloat)y, 0.0f, 1.0f);
 }
 
 void mglVertexAttrib2sv(GLMContext ctx, GLuint index, const GLshort *v)
 {
-	(void)ctx;
+	ERROR_CHECK_RETURN(v, GL_INVALID_VALUE);
+	mglSetCurrentVertexAttribFloat(ctx, index, (GLfloat)v[0], (GLfloat)v[1], 0.0f, 1.0f);
 }
 
 void mglVertexAttrib3d(GLMContext ctx, GLuint index, GLdouble x, GLdouble y, GLdouble z)
 {
-	(void)ctx;
+	mglSetCurrentVertexAttribDouble(ctx, index, x, y, z, 1.0);
 }
 
 void mglVertexAttrib3dv(GLMContext ctx, GLuint index, const GLdouble *v)
 {
-	(void)ctx;
+	ERROR_CHECK_RETURN(v, GL_INVALID_VALUE);
+	mglSetCurrentVertexAttribDouble(ctx, index, v[0], v[1], v[2], 1.0);
 }
 
 void mglVertexAttrib3f(GLMContext ctx, GLuint index, GLfloat x, GLfloat y, GLfloat z)
 {
-	(void)ctx;
+	mglSetCurrentVertexAttribFloat(ctx, index, x, y, z, 1.0f);
 }
 
 void mglVertexAttrib3fv(GLMContext ctx, GLuint index, const GLfloat *v)
 {
-	(void)ctx;
+	ERROR_CHECK_RETURN(v, GL_INVALID_VALUE);
+	mglSetCurrentVertexAttribFloat(ctx, index, v[0], v[1], v[2], 1.0f);
 }
 
 void mglVertexAttrib3s(GLMContext ctx, GLuint index, GLshort x, GLshort y, GLshort z)
 {
-	(void)ctx;
+	mglSetCurrentVertexAttribFloat(ctx, index, (GLfloat)x, (GLfloat)y, (GLfloat)z, 1.0f);
 }
 
 void mglVertexAttrib3sv(GLMContext ctx, GLuint index, const GLshort *v)
 {
-	(void)ctx;
+	ERROR_CHECK_RETURN(v, GL_INVALID_VALUE);
+	mglSetCurrentVertexAttribFloat(ctx, index, (GLfloat)v[0], (GLfloat)v[1], (GLfloat)v[2], 1.0f);
 }
 
 void mglVertexAttrib4Nbv(GLMContext ctx, GLuint index, const GLbyte *v)
@@ -6312,12 +6326,15 @@ void mglVertexAttrib4iv(GLMContext ctx, GLuint index, const GLint *v)
 
 void mglVertexAttrib4s(GLMContext ctx, GLuint index, GLshort x, GLshort y, GLshort z, GLshort w)
 {
-	(void)ctx;
+	mglSetCurrentVertexAttribFloat(ctx, index,
+								   (GLfloat)x, (GLfloat)y, (GLfloat)z, (GLfloat)w);
 }
 
 void mglVertexAttrib4sv(GLMContext ctx, GLuint index, const GLshort *v)
 {
-	(void)ctx;
+	ERROR_CHECK_RETURN(v, GL_INVALID_VALUE);
+	mglSetCurrentVertexAttribFloat(ctx, index,
+								   (GLfloat)v[0], (GLfloat)v[1], (GLfloat)v[2], (GLfloat)v[3]);
 }
 
 void mglVertexAttrib4ubv(GLMContext ctx, GLuint index, const GLubyte *v)

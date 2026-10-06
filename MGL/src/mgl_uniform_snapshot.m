@@ -1,5 +1,4 @@
 #import "mgl_uniform_snapshot.h"
-#include "mgl_safety.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -50,13 +49,31 @@ static BOOL eligible(Buffer *buffer)
     if (!self) return nil;
     if (!bytes || bytes.length > 256u * 1024u || !buffers || !context || !resource ||
         !resource->ubo_members || resource->ubo_member_count > 4096u || !step) return nil;
-    _sources = calloc(MAX_BINDABLE_BUFFERS, sizeof(*_sources));
-    if (!_sources) return nil;
+    /* Count distinct locations first so small snapshots don't reserve the
+     * full GL location space on every capture. */
     BOOL seen[MAX_BINDABLE_BUFFERS] = {0};
-    NSMutableArray<NSData *> *sourceBytes = [NSMutableArray new];
-    _retainedBytes = bytes.length;
+    NSUInteger sourceCapacity = 0;
     const uint64_t start = (uint64_t)element * step;
     const uint64_t end = start + step;
+    for (GLuint m = 0; m < resource->ubo_member_count; m++) {
+        const SpirvUBOMember *member = &resource->ubo_members[m];
+        if (member->location_offset < 0 || (uint64_t)member->location_offset < start ||
+            (uint64_t)member->location_offset >= end) continue;
+        const int64_t first = (int64_t)base + member->location_offset;
+        const int64_t count = member->size > 1 ? member->size : 1;
+        if (count > MAX_BINDABLE_BUFFERS) return nil;
+        for (int64_t ai = 0; ai < count; ai++) {
+            int64_t location = first + ai;
+            if (location < 0 || location >= MAX_BINDABLE_BUFFERS || seen[location]) continue;
+            seen[location] = YES;
+            sourceCapacity++;
+        }
+    }
+    _sources = sourceCapacity ? calloc(sourceCapacity, sizeof(*_sources)) : NULL;
+    if (sourceCapacity && !_sources) return nil;
+    memset(seen, 0, sizeof(seen));
+    NSMutableArray<NSData *> *sourceBytes = [NSMutableArray new];
+    _retainedBytes = bytes.length;
     for (GLuint m = 0; m < resource->ubo_member_count; m++) {
         const SpirvUBOMember *member = &resource->ubo_members[m];
         if (member->location_offset < 0 || (uint64_t)member->location_offset < start ||
@@ -77,10 +94,9 @@ static BOOL eligible(Buffer *buffer)
             source->fallback = usedFallback;
             source->address = buffer ? buffer->data.buffer_data : 0;
             source->size = buffer ? buffer->size : 0;
-            // Probe only on capture. Hits validate the live private allocation
-            // identity/address/size before comparing; no per-hit VM syscalls.
-            if (source->address && source->size &&
-                !mglPointerRangeIsReadable((void *)(uintptr_t)source->address, (size_t)source->size)) return nil;
+            /* The private flag is only set for MGL-owned uniform allocations
+             * and immutable clones. Their backing memory is known readable;
+             * avoid a duplicate VM probe after source resolution. */
             NSData *data = source->address && source->size
                 ? [NSData dataWithBytes:(const void *)(uintptr_t)source->address length:(NSUInteger)source->size]
                 : [NSData data];
@@ -89,11 +105,6 @@ static BOOL eligible(Buffer *buffer)
             [sourceBytes addObject:data];
         }
     }
-    // Do not reserve MAX_BINDABLE_BUFFERS records for every small snapshot.
-    if (_sourceCount) {
-        void *smaller = realloc(_sources, _sourceCount * sizeof(*_sources));
-        if (smaller) _sources = smaller;
-    } else { free(_sources); _sources = NULL; }
     _sourceBytes = [sourceBytes copy];
     _bytes = [bytes copy]; // Mutable callers cannot overwrite old versions.
     return self;

@@ -38,7 +38,7 @@
             return false;
         }
 
-        id<MTLBlitCommandEncoder> blitEncoder = [_currentCommandBuffer blitCommandEncoder];
+        id<MTLBlitCommandEncoder> blitEncoder = mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
         if (!blitEncoder) {
             NSLog(@"MGL ERROR: failed to create ordered upload blit encoder for %s",
                   reason ? reason : "texture_upload");
@@ -87,7 +87,7 @@
         uploadCB.label = @"MGL.texture_upload";
     }
 
-    id<MTLBlitCommandEncoder> blitEncoder = [uploadCB blitCommandEncoder];
+    id<MTLBlitCommandEncoder> blitEncoder = mglProfileBlit(uploadCB, __func__, __LINE__);
     if (!blitEncoder) {
         NSLog(@"MGL ERROR: failed to create dedicated upload blit encoder for %s",
               reason ? reason : "texture_upload");
@@ -490,6 +490,13 @@
                       (unsigned long long)hit);
     }
 
+    if (uploadedAny && mglMetalPixelFormatHasDepth(texture.pixelFormat)) {
+        /* CPU uploads replace depth values too; invalidate any float-sampling
+         * cache even when the texture has never been a framebuffer attachment. */
+        tex->mtl_render_target_write_version++;
+        tex->mtl_render_yflip_authority = (tex->mtl_render_target_write_version << 1) | 1u;
+    }
+
     if (uploadedAny && !failedAny) {
         tex->dirty_bits &= ~DIRTY_TEXTURE_DATA;
         [self recordGPUSuccess];
@@ -515,7 +522,7 @@
                           ctx->state.default_clear_color[2],
                           ctx->state.default_clear_color[3]);
 
-    id<MTLRenderCommandEncoder> clearEncoder = [_currentCommandBuffer renderCommandEncoderWithDescriptor:clearPass];
+    id<MTLRenderCommandEncoder> clearEncoder = mglProfileRender(_currentCommandBuffer, clearPass, __func__, __LINE__, ctx ? ctx->state.program_name : 0, ctx && ctx->state.framebuffer ? ctx->state.framebuffer->name : 0);
     if (clearEncoder) {
         [clearEncoder endEncoding];
         ctx->state.default_fbo_clear_bitmask &= ~GL_COLOR_BUFFER_BIT;
@@ -549,7 +556,7 @@
                           attachment->clear_color[2],
                           attachment->clear_color[3]);
 
-    id<MTLRenderCommandEncoder> clearEncoder = [_currentCommandBuffer renderCommandEncoderWithDescriptor:clearPass];
+    id<MTLRenderCommandEncoder> clearEncoder = mglProfileRender(_currentCommandBuffer, clearPass, __func__, __LINE__, ctx ? ctx->state.program_name : 0, ctx && ctx->state.framebuffer ? ctx->state.framebuffer->name : 0);
     if (clearEncoder) {
         [clearEncoder endEncoding];
         attachment->clear_bitmask &= ~GL_COLOR_BUFFER_BIT;
@@ -691,7 +698,7 @@
 
     id<MTLBuffer> readBuffer = [_device newBufferWithLength:stagingSize
                                                     options:MTLResourceStorageModeShared];
-    id<MTLBlitCommandEncoder> blitEncoder = readBuffer ? [_currentCommandBuffer blitCommandEncoder] : nil;
+    id<MTLBlitCommandEncoder> blitEncoder = readBuffer ? mglProfileBlit(_currentCommandBuffer, __func__, __LINE__) : nil;
     if (!readBuffer || !blitEncoder) {
         NSLog(@"MGL WARNING: readPixels failed to create readback resources for %s",
               reason ? reason : "unknown");
@@ -910,7 +917,7 @@ mglMetalCopyTextureBytesToBGRA8((const uint8_t *)readBuffer.contents,
 
     id<MTLBuffer> readBuffer = [_device newBufferWithLength:stagingSize
                                                     options:MTLResourceStorageModeShared];
-    id<MTLBlitCommandEncoder> blitEncoder = readBuffer ? [_currentCommandBuffer blitCommandEncoder] : nil;
+    id<MTLBlitCommandEncoder> blitEncoder = readBuffer ? mglProfileBlit(_currentCommandBuffer, __func__, __LINE__) : nil;
     if (!readBuffer || !blitEncoder) {
         NSLog(@"MGL WARNING: readPixels failed to create depth readback resources for %s",
               reason ? reason : "unknown");
@@ -1216,7 +1223,7 @@ mglMetalCopyTextureBytesToBGRA8((const uint8_t *)readBuffer.contents,
 
     id<MTLBuffer> readBuffer = [_device newBufferWithLength:stagingSize
                                                     options:MTLResourceStorageModeShared];
-    id<MTLBlitCommandEncoder> blit = readBuffer ? [_currentCommandBuffer blitCommandEncoder] : nil;
+    id<MTLBlitCommandEncoder> blit = readBuffer ? mglProfileBlit(_currentCommandBuffer, __func__, __LINE__) : nil;
     if (!readBuffer || !blit) {
         mglDispatchError(ctx, __FUNCTION__, GL_OUT_OF_MEMORY);
         return NO;
@@ -1401,7 +1408,7 @@ mglMetalCopyTextureBytesToBGRA8((const uint8_t *)readBuffer.contents,
     clearPass.depthAttachment.storeAction = MTLStoreActionStore;
     clearPass.depthAttachment.clearDepth = attachment->clear_color[0];
 
-    id<MTLRenderCommandEncoder> clearEncoder = [_currentCommandBuffer renderCommandEncoderWithDescriptor:clearPass];
+    id<MTLRenderCommandEncoder> clearEncoder = mglProfileRender(_currentCommandBuffer, clearPass, __func__, __LINE__, ctx ? ctx->state.program_name : 0, ctx && ctx->state.framebuffer ? ctx->state.framebuffer->name : 0);
     if (clearEncoder) {
         [clearEncoder endEncoding];
         attachment->clear_bitmask &= ~GL_DEPTH_BUFFER_BIT;
@@ -1424,7 +1431,7 @@ mglMetalCopyTextureBytesToBGRA8((const uint8_t *)readBuffer.contents,
     clearPass.depthAttachment.storeAction = MTLStoreActionStore;
     clearPass.depthAttachment.clearDepth = ctx->state.var.depth_clear_value;
 
-    id<MTLRenderCommandEncoder> clearEncoder = [_currentCommandBuffer renderCommandEncoderWithDescriptor:clearPass];
+    id<MTLRenderCommandEncoder> clearEncoder = mglProfileRender(_currentCommandBuffer, clearPass, __func__, __LINE__, ctx ? ctx->state.program_name : 0, ctx && ctx->state.framebuffer ? ctx->state.framebuffer->name : 0);
     if (clearEncoder) {
         [clearEncoder endEncoding];
         ctx->state.default_fbo_clear_bitmask &= ~GL_DEPTH_BUFFER_BIT;
@@ -1712,7 +1719,12 @@ mglMetalCopyTextureBytesToBGRA8((const uint8_t *)readBuffer.contents,
 
     if (mgl_drawbuffer == _FRONT)
     {
-        if (!_drawable) {
+        if (_deferDrawableAcquireEnabled) {
+            if (![self ensureDrawableAvailableLocked:"readPixels.defaultFramebuffer"]) {
+                mglDispatchError(glm_ctx, __FUNCTION__, GL_INVALID_OPERATION);
+                return;
+            }
+        } else if (!_drawable) {
             [self mglSyncLayerDrawableSizeFromView:"readPixels.default"];
             _drawable = [_layer nextDrawable];
         }
@@ -1954,7 +1966,7 @@ mglMetalCopyTextureBytesToBGRA8((const uint8_t *)readBuffer.contents,
             return;
         }
 
-        id<MTLBlitCommandEncoder> blitEncoder = [blitCB blitCommandEncoder];
+        id<MTLBlitCommandEncoder> blitEncoder = mglProfileBlit(blitCB, __func__, __LINE__);
         if (!blitEncoder) {
             NSLog(@"MGL ERROR: mtlGetTexImage failed to create blit encoder for texture %u", tex->name);
             mglDispatchError(glm_ctx, __FUNCTION__, GL_INVALID_OPERATION);
@@ -2144,7 +2156,7 @@ mglMetalCopyTextureBytesToBGRA8((const uint8_t *)readBuffer.contents,
 
     // start blit encoder
     id<MTLBlitCommandEncoder> blitCommandEncoder;
-    blitCommandEncoder = [_currentCommandBuffer blitCommandEncoder];
+    blitCommandEncoder = mglProfileBlit(_currentCommandBuffer, __func__, __LINE__);
     if (!blitCommandEncoder) {
         NSLog(@"MGL ERROR: Failed to create blit encoder for mipmap generation");
         return;
@@ -2265,7 +2277,7 @@ mglMetalCopyTextureBytesToBGRA8((const uint8_t *)readBuffer.contents,
         return false;
     }
 
-    return [self copyTextureUploadWithDedicatedCommandBuffer:buffer
+    bool uploaded = [self copyTextureUploadWithDedicatedCommandBuffer:buffer
                                                 sourceOffset:sourceOffset
                                            sourceBytesPerRow:sourceBytesPerRow
                                          sourceBytesPerImage:copyBytesPerImage
@@ -2275,6 +2287,12 @@ mglMetalCopyTextureBytesToBGRA8((const uint8_t *)readBuffer.contents,
                                              destinationLevel:level
                                             destinationOrigin:destinationOrigin
                                                        reason:reason ? reason : "texture_sub_upload"];
+    if (uploaded && mglMetalPixelFormatHasDepth(texture.pixelFormat)) {
+        BOOL bottomOrigin = !tex->is_render_target || mglRTWriteAuthorityIsCurrentAndUsesOriginal(tex);
+        mglMarkTextureLevelMetalFilled(tex, (GLuint)level, 0);
+        tex->mtl_render_yflip_authority = (tex->mtl_render_target_write_version << 1) | (bottomOrigin ? 1u : 0u);
+    }
+    return uploaded;
 }
 
 -(void)mtlTexSubImage:(GLMContext)glm_ctx tex:(Texture *)tex buf:(Buffer *)buf src_offset:(size_t)src_offset src_pitch:(size_t)src_pitch src_image_size:(size_t)src_image_size src_size:(size_t)src_size slice:(GLuint)slice level:(GLuint)level width:(size_t)width height:(size_t)height depth:(size_t)depth xoffset:(size_t)xoffset yoffset:(size_t)yoffset zoffset:(size_t)zoffset

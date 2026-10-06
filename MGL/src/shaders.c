@@ -18,6 +18,7 @@
  *
  */
 
+#include "mgl_trace_log.h"
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
@@ -1128,17 +1129,8 @@ static int mglIsLooseUniformLine(const char *line_start, const char *line_end,
     /* Skip preprocessor / comments */
     if (p >= line_end || *p == '#' || *p == '/' || *p == '\n') return 0;
 
-    /* Skip optional layout(...) qualifier */
-    if (strncmp(p, "layout", 6) == 0) {
-        const char *paren = strchr(p, '(');
-        if (paren && paren < line_end) {
-            const char *close = strchr(paren, ')');
-            if (close && close < line_end) {
-                p = close + 1;
-                while (p < line_end && (*p == ' ' || *p == '\t')) p++;
-            }
-        }
-    }
+    /* Explicit locations/bindings must retain their GLSL identity. */
+    if (strncmp(p, "layout", 6) == 0) return 0;
 
     /* Must start with "uniform" */
     if (strncmp(p, "uniform", 7) != 0) return 0;
@@ -1246,7 +1238,7 @@ static void mglAggregateLooseUniforms(char *src, size_t src_capacity, GLuint sha
                         shader_type == GL_TESS_CONTROL_SHADER ? "tc" : "te";
 
     /* Collect loose uniform declarations */
-    struct { char type[32]; char name[128]; size_t line_off; size_t line_len; } unis[128];
+    struct { char type[32]; char name[128]; char array[128]; size_t line_off; size_t line_len; } unis[128];
     int uni_count = 0;
 
     const char *src_end = src + strlen(src);
@@ -1261,6 +1253,16 @@ static void mglAggregateLooseUniforms(char *src, size_t src_capacity, GLuint sha
                                    type_buf, sizeof(type_buf),
                                    name_buf, sizeof(name_buf)) &&
             !mglLooseUniformHasLocalDeclaration(src, type_buf, name_buf)) {
+            const char *name_start = strstr(line_start, name_buf);
+            const char *suffix = name_start + strlen(name_buf);
+            const char *semi = memchr(suffix, ';', (size_t)(line_end - suffix));
+            size_t suffix_len = semi ? (size_t)(semi - suffix) : 0;
+            if (suffix_len >= sizeof(unis[uni_count].array)) {
+                line_start = line_end + 1;
+                continue;
+            }
+            memcpy(unis[uni_count].array, suffix, suffix_len);
+            unis[uni_count].array[suffix_len] = '\0';
             unis[uni_count].line_off = (size_t)(line_start - src);
             unis[uni_count].line_len = line_len;
             strncpy(unis[uni_count].type, type_buf, sizeof(unis[uni_count].type) - 1);
@@ -1278,7 +1280,7 @@ static void mglAggregateLooseUniforms(char *src, size_t src_capacity, GLuint sha
 
     /* Build the struct definition, uniform declaration, and #define macros */
     /* Estimate: 60 bytes per uniform for struct member + #define macro */
-    size_t inject_size = 256 + (size_t)uni_count * 128;
+    size_t inject_size = 256 + (size_t)uni_count * 512;
     char *inject = (char *)malloc(inject_size);
     if (!inject) return;
 
@@ -1287,7 +1289,7 @@ static void mglAggregateLooseUniforms(char *src, size_t src_capacity, GLuint sha
                     "struct _MGLLooseUniforms_%s {\n", stage);
     for (int i = 0; i < uni_count; i++) {
         off += snprintf(inject + off, inject_size - off,
-                        "    %s %s;\n", unis[i].type, unis[i].name);
+                        "    %s %s%s;\n", unis[i].type, unis[i].name, unis[i].array);
     }
     off += snprintf(inject + off, inject_size - off,
                     "};\n"
@@ -1339,8 +1341,10 @@ static void mglAggregateLooseUniforms(char *src, size_t src_capacity, GLuint sha
         memset(ls, ' ', le - ls);
     }
 
-    fprintf(stderr, "MGL AGGREGATE: packed %d loose uniforms into _MGLLooseUniforms struct\n",
-            uni_count);
+    if (mglTraceEnvFlagEnabled("MGL_DEBUG_RESOURCE_ABI")) {
+        fprintf(stderr, "MGL AGGREGATE: packed %d loose uniforms into _MGLLooseUniforms struct\n",
+                uni_count);
+    }
 }
 
 static const glslang_resource_t *mgl_glslang_resource(GLMContext ctx)

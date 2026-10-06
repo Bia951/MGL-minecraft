@@ -8,6 +8,7 @@
  * See mgl_uniform_reflection.h for details.
  */
 
+#include "mgl_trace_log.h"
 #include "mgl_uniform_reflection.h"
 
 #include <stdio.h>
@@ -655,6 +656,58 @@ char *mglGLSLAccessPathForUBOMember(const char *glsl_src,
 
 /* ---- Group A.2: SPIRV-Cross Type/Location/Size Query Helpers ---- */
 
+GLuint mglGLImageTypeFromSPVCType(spvc_compiler compiler, spvc_type type)
+{
+    if (!type) return 0;
+    spvc_basetype base = spvc_type_get_basetype(type);
+    if (base == SPVC_BASETYPE_SAMPLER) return GL_SAMPLER_2D;
+    if (base != SPVC_BASETYPE_IMAGE && base != SPVC_BASETYPE_SAMPLED_IMAGE) return 0;
+    spvc_type scalar = spvc_compiler_get_type_handle(compiler, spvc_type_get_image_sampled_type(type));
+    spvc_basetype scalarBase = scalar ? spvc_type_get_basetype(scalar) : SPVC_BASETYPE_FP32;
+    unsigned kind = scalarBase == SPVC_BASETYPE_INT32 ? 1u :
+                    scalarBase == SPVC_BASETYPE_UINT32 ? 2u : 0u;
+    bool arrayed = spvc_type_get_image_arrayed(type);
+    bool storage = spvc_type_get_image_is_storage(type);
+    bool depth = spvc_type_get_image_is_depth(type);
+    SpvDim dim = spvc_type_get_image_dimension(type);
+    if (dim == SpvDim2D && spvc_type_get_image_multisampled(type)) {
+        const GLuint samplerMS[2][3] = {
+            {GL_SAMPLER_2D_MULTISAMPLE, GL_INT_SAMPLER_2D_MULTISAMPLE, GL_UNSIGNED_INT_SAMPLER_2D_MULTISAMPLE},
+            {GL_SAMPLER_2D_MULTISAMPLE_ARRAY, GL_INT_SAMPLER_2D_MULTISAMPLE_ARRAY, GL_UNSIGNED_INT_SAMPLER_2D_MULTISAMPLE_ARRAY}};
+        const GLuint imageMS[2][3] = {
+            {GL_IMAGE_2D_MULTISAMPLE, GL_INT_IMAGE_2D_MULTISAMPLE, GL_UNSIGNED_INT_IMAGE_2D_MULTISAMPLE},
+            {GL_IMAGE_2D_MULTISAMPLE_ARRAY, GL_INT_IMAGE_2D_MULTISAMPLE_ARRAY, GL_UNSIGNED_INT_IMAGE_2D_MULTISAMPLE_ARRAY}};
+        return storage ? imageMS[arrayed][kind] : samplerMS[arrayed][kind];
+    }
+#define MGL_IMAGE_TYPES(D, A) {GL_##D, GL_INT_##D, GL_UNSIGNED_INT_##D}, {GL_##A, GL_INT_##A, GL_UNSIGNED_INT_##A}
+    static const GLuint samplers[][2][3] = {
+        {MGL_IMAGE_TYPES(SAMPLER_1D, SAMPLER_1D_ARRAY)},
+        {MGL_IMAGE_TYPES(SAMPLER_2D, SAMPLER_2D_ARRAY)},
+        {MGL_IMAGE_TYPES(SAMPLER_3D, SAMPLER_3D)},
+        {MGL_IMAGE_TYPES(SAMPLER_CUBE, SAMPLER_CUBE_MAP_ARRAY)},
+        {MGL_IMAGE_TYPES(SAMPLER_2D_RECT, SAMPLER_2D_RECT)},
+        {MGL_IMAGE_TYPES(SAMPLER_BUFFER, SAMPLER_BUFFER)}};
+    static const GLuint images[][2][3] = {
+        {MGL_IMAGE_TYPES(IMAGE_1D, IMAGE_1D_ARRAY)},
+        {MGL_IMAGE_TYPES(IMAGE_2D, IMAGE_2D_ARRAY)},
+        {MGL_IMAGE_TYPES(IMAGE_3D, IMAGE_3D)},
+        {MGL_IMAGE_TYPES(IMAGE_CUBE, IMAGE_CUBE_MAP_ARRAY)},
+        {MGL_IMAGE_TYPES(IMAGE_2D_RECT, IMAGE_2D_RECT)},
+        {MGL_IMAGE_TYPES(IMAGE_BUFFER, IMAGE_BUFFER)}};
+#undef MGL_IMAGE_TYPES
+    if (!storage && depth && kind == 0u) {
+        switch (dim) {
+            case SpvDim1D: return arrayed ? GL_SAMPLER_1D_ARRAY_SHADOW : GL_SAMPLER_1D_SHADOW;
+            case SpvDim2D: return arrayed ? GL_SAMPLER_2D_ARRAY_SHADOW : GL_SAMPLER_2D_SHADOW;
+            case SpvDimCube: return arrayed ? GL_SAMPLER_CUBE_MAP_ARRAY_SHADOW : GL_SAMPLER_CUBE_SHADOW;
+            case SpvDimRect: return GL_SAMPLER_2D_RECT_SHADOW;
+            default: return 0;
+        }
+    }
+    if ((unsigned)dim >= sizeof(samplers)/sizeof(samplers[0])) return 0;
+    return storage ? images[dim][arrayed][kind] : samplers[dim][arrayed][kind];
+}
+
 GLuint mglGLTypeFromSPVCType(spvc_type type)
 {
     if (!type) {
@@ -959,169 +1012,79 @@ char *mglAppendArrayZeroSuffix(const char *name, unsigned num_dims)
  * - Array: alignment = element alignment
  * - Struct: max of member alignments
  */
+static GLuint mglMetalScalarSize(spvc_type type)
+{
+    /* SPIRV-Cross emits boolean struct members as short/shortN. */
+    if (spvc_type_get_basetype(type) == SPVC_BASETYPE_BOOLEAN) return 2;
+    unsigned bits = spvc_type_get_bit_width(type);
+    return bits ? bits / 8u : 4u;
+}
+
+/* UniformConstant structs use native MSL layout. Buffer blocks with explicit
+ * SPIR-V offsets retain those offsets, including packed vectors emitted by
+ * SPIRV-Cross. A vec3 occupies a padded vector, also inside a matrix or array. */
 GLuint mglMetalTypeAlignmentFromSPVC(spvc_compiler compiler, spvc_type type)
 {
-    if (!type) {
-        return 16;
-    }
-
-    spvc_basetype base = spvc_type_get_basetype(type);
-    unsigned bit_width = spvc_type_get_bit_width(type);
-    unsigned vec_size = spvc_type_get_vector_size(type);
-    unsigned columns = spvc_type_get_columns(type);
-    unsigned array_dims = spvc_type_get_num_array_dimensions(type);
-
-    /* For arrays, alignment = element alignment (resolve to base type) */
-    if (array_dims > 0) {
-        spvc_type_id elem_type_id = spvc_type_get_base_type_id(type);
-        spvc_type elem_type = elem_type_id
-            ? spvc_compiler_get_type_handle(compiler, elem_type_id) : NULL;
-        return mglMetalTypeAlignmentFromSPVC(compiler, elem_type);
-    }
-
-    /* For structs, alignment = max of member alignments */
-    if (base == SPVC_BASETYPE_STRUCT) {
-        unsigned member_count = spvc_type_get_num_member_types(type);
-        GLuint max_align = 4;
-        for (unsigned i = 0; i < member_count; i++) {
-            spvc_type_id mt_id = spvc_type_get_member_type(type, i);
-            spvc_type mt = spvc_compiler_get_type_handle(compiler, mt_id);
-            GLuint align = mglMetalTypeAlignmentFromSPVC(compiler, mt);
-            if (align > max_align) {
-                max_align = align;
-            }
+    if (!type) return 0;
+    if (spvc_type_get_basetype(type) == SPVC_BASETYPE_STRUCT) {
+        GLuint alignment = 1;
+        for (unsigned i = 0; i < spvc_type_get_num_member_types(type); i++) {
+            spvc_type member = spvc_compiler_get_type_handle(
+                compiler, spvc_type_get_member_type(type, i));
+            GLuint member_alignment = mglMetalTypeAlignmentFromSPVC(compiler, member);
+            if (member_alignment > alignment) alignment = member_alignment;
         }
-        return max_align;
+        return alignment;
     }
-
-    /* For matrices, alignment = column vector alignment */
-    if (columns > 1) {
-        /* Matrix: columns of vectors. Alignment = vector alignment. */
-        if (vec_size == 2) return 8;
-        return 16; /* vec3 and vec4 both align to 16 */
-    }
-
-    /* Scalar and vector types */
-    GLuint base_align = (bit_width == 64) ? 8 : 4;
-
-    if (vec_size == 1) {
-        return base_align; /* scalar */
-    } else if (vec_size == 2) {
-        return 8; /* 2-component vector */
-    } else {
-        return 16; /* 3 and 4-component vectors align to 16 */
-    }
+    unsigned width = spvc_type_get_vector_size(type);
+    return mglMetalScalarSize(type) * (width == 3 ? 4 : (width ? width : 1));
 }
 
-/* Compute MSL struct member offset by iterating over preceding members.
- * Used for plain struct uniforms (UniformConstant storage class) which
- * don't have Offset decorations in SPIR-V.  The offset follows C struct
- * layout rules: each member is placed at the next offset aligned to its
- * type alignment. */
-GLuint mglComputeMSLStructMemberOffset(spvc_compiler compiler,
-                                               spvc_type struct_type,
-                                               unsigned member_index)
+static GLuint mglMetalTypeSizeFromSPVC(spvc_compiler compiler, spvc_type type)
 {
-    if (!struct_type || member_index == 0) {
-        return 0;
+    if (!type) return 0;
+    GLuint size;
+    if (spvc_type_get_basetype(type) == SPVC_BASETYPE_STRUCT) {
+        size = mglComputeMSLStructSize(compiler, type);
+    } else {
+        unsigned columns = spvc_type_get_columns(type);
+        size = mglMetalTypeAlignmentFromSPVC(compiler, type) * (columns ? columns : 1);
     }
-
-    GLuint running = 0;
-    unsigned member_count = spvc_type_get_num_member_types(struct_type);
-
-    for (unsigned i = 0; i < member_index && i < member_count; i++) {
-        spvc_type_id mt_id = spvc_type_get_member_type(struct_type, i);
-        spvc_type mt = spvc_compiler_get_type_handle(compiler, mt_id);
-        if (!mt) {
-            continue;
-        }
-
-        GLuint align = mglMetalTypeAlignmentFromSPVC(compiler, mt);
-        if (align == 0) align = 4;
-
-        /* Align running to member alignment */
-        running = (running + align - 1) & ~(align - 1);
-
-        /* Get member size */
-        size_t member_size = 0;
-        if (spvc_compiler_get_declared_struct_member_size(
-                compiler, struct_type, i, &member_size) != SPVC_SUCCESS || member_size == 0) {
-            /* Fallback: estimate from type */
-            unsigned bit_width = spvc_type_get_bit_width(mt);
-            unsigned vec_size = spvc_type_get_vector_size(mt);
-            unsigned columns = spvc_type_get_columns(mt);
-            unsigned array_dims = spvc_type_get_num_array_dimensions(mt);
-            GLuint elem_size = (bit_width == 64) ? 8 : 4;
-            if (vec_size > 1) elem_size *= vec_size;
-            if (columns > 1) elem_size *= columns;
-            GLuint array_size = 1;
-            if (array_dims > 0) {
-                for (unsigned d = 0; d < array_dims; d++) {
-                    array_size *= (GLuint)spvc_type_get_array_dimension(mt, d);
-                }
-            }
-            member_size = elem_size * array_size;
-        }
-
-        running += (GLuint)member_size;
+    for (unsigned d = 0; d < spvc_type_get_num_array_dimensions(type); d++) {
+        GLuint count = (GLuint)spvc_type_get_array_dimension(type, d);
+        if (!count || size > UINT32_MAX / count) return 0;
+        size *= count;
     }
-
-    /* Align to this member's alignment */
-    spvc_type_id mt_id = spvc_type_get_member_type(struct_type, member_index);
-    spvc_type mt = spvc_compiler_get_type_handle(compiler, mt_id);
-    GLuint align = mt ? mglMetalTypeAlignmentFromSPVC(compiler, mt) : 16;
-    if (align == 0) align = 4;
-    running = (running + align - 1) & ~(align - 1);
-
-    return running;
+    return size;
 }
 
-/* Compute the total MSL struct size using Metal/C alignment rules.
- * The struct size = (offset after last member) padded to struct alignment. */
+GLuint mglComputeMSLStructMemberOffset(spvc_compiler compiler,
+                                      spvc_type struct_type, unsigned member_index)
+{
+    GLuint offset = 0;
+    for (unsigned i = 0; i <= member_index; i++) {
+        spvc_type member = spvc_compiler_get_type_handle(
+            compiler, spvc_type_get_member_type(struct_type, i));
+        GLuint alignment = mglMetalTypeAlignmentFromSPVC(compiler, member);
+        if (!alignment) return 0;
+        offset = (offset + alignment - 1) & ~(alignment - 1);
+        if (i == member_index) return offset;
+        offset += mglMetalTypeSizeFromSPVC(compiler, member);
+    }
+    return offset;
+}
+
 GLuint mglComputeMSLStructSize(spvc_compiler compiler, spvc_type struct_type)
 {
     if (!struct_type) return 0;
-    unsigned member_count = spvc_type_get_num_member_types(struct_type);
-    if (member_count == 0) return 0;
-
-    GLuint running = 0;
-    GLuint max_align = 4;
-
-    for (unsigned i = 0; i < member_count; i++) {
-        spvc_type_id mt_id = spvc_type_get_member_type(struct_type, i);
-        spvc_type mt = spvc_compiler_get_type_handle(compiler, mt_id);
-        if (!mt) continue;
-
-        GLuint align = mglMetalTypeAlignmentFromSPVC(compiler, mt);
-        if (align == 0) align = 4;
-        if (align > max_align) max_align = align;
-
-        running = (running + align - 1) & ~(align - 1);
-
-        size_t member_size = 0;
-        if (spvc_compiler_get_declared_struct_member_size(
-                compiler, struct_type, i, &member_size) != SPVC_SUCCESS || member_size == 0) {
-            unsigned bit_width = spvc_type_get_bit_width(mt);
-            unsigned vec_size = spvc_type_get_vector_size(mt);
-            unsigned columns = spvc_type_get_columns(mt);
-            unsigned array_dims = spvc_type_get_num_array_dimensions(mt);
-            GLuint elem_size = (bit_width == 64) ? 8 : 4;
-            if (vec_size > 1) elem_size *= vec_size;
-            if (columns > 1) elem_size *= columns;
-            GLuint array_size = 1;
-            if (array_dims > 0) {
-                for (unsigned d = 0; d < array_dims; d++) {
-                    array_size *= (GLuint)spvc_type_get_array_dimension(mt, d);
-                }
-            }
-            member_size = elem_size * array_size;
-        }
-        running += (GLuint)member_size;
-    }
-
-    /* Pad struct size to max member alignment */
-    running = (running + max_align - 1) & ~(max_align - 1);
-    return running;
+    unsigned count = spvc_type_get_num_member_types(struct_type);
+    if (!count) return 0;
+    spvc_type last = spvc_compiler_get_type_handle(
+        compiler, spvc_type_get_member_type(struct_type, count - 1));
+    GLuint size = mglComputeMSLStructMemberOffset(compiler, struct_type, count - 1) +
+                  mglMetalTypeSizeFromSPVC(compiler, last);
+    GLuint alignment = mglMetalTypeAlignmentFromSPVC(compiler, struct_type);
+    return (size + alignment - 1) & ~(alignment - 1);
 }
 
 GLboolean mglSpvcStructMemberOffset(spvc_compiler compiler,
@@ -1138,7 +1101,7 @@ GLboolean mglSpvcStructMemberOffset(spvc_compiler compiler,
     }
     value = spvc_compiler_get_member_decoration(
         compiler, struct_type_id, member_index, SpvDecorationOffset);
-    if (value > 0) {
+    if (spvc_compiler_has_member_decoration(compiler, struct_type_id, member_index, SpvDecorationOffset)) {
         *out = value;
         return GL_TRUE;
     }
@@ -1159,8 +1122,15 @@ GLint mglSpvcStructMemberMatrixStride(spvc_compiler compiler,
             compiler, struct_type, member_index, &value) == SPVC_SUCCESS) {
         return (GLint)value;
     }
-    return (GLint)spvc_compiler_get_member_decoration(
-        compiler, struct_type_id, member_index, SpvDecorationMatrixStride);
+    if (spvc_compiler_has_member_decoration(compiler, struct_type_id, member_index,
+                                           SpvDecorationMatrixStride)) {
+        return (GLint)spvc_compiler_get_member_decoration(
+            compiler, struct_type_id, member_index, SpvDecorationMatrixStride);
+    }
+    spvc_type member = spvc_compiler_get_type_handle(
+        compiler, spvc_type_get_member_type(struct_type, member_index));
+    return member && spvc_type_get_columns(member) > 1
+        ? (GLint)mglMetalTypeAlignmentFromSPVC(compiler, member) : 0;
 }
 
 GLint mglSpvcStructMemberArrayStride(spvc_compiler compiler,
@@ -1173,8 +1143,17 @@ GLint mglSpvcStructMemberArrayStride(spvc_compiler compiler,
             compiler, struct_type, member_index, &value) == SPVC_SUCCESS) {
         return (GLint)value;
     }
-    return (GLint)spvc_compiler_get_member_decoration(
-        compiler, struct_type_id, member_index, SpvDecorationArrayStride);
+    if (spvc_compiler_has_member_decoration(compiler, struct_type_id, member_index,
+                                           SpvDecorationArrayStride)) {
+        return (GLint)spvc_compiler_get_member_decoration(
+            compiler, struct_type_id, member_index, SpvDecorationArrayStride);
+    }
+    spvc_type member = spvc_compiler_get_type_handle(
+        compiler, spvc_type_get_member_type(struct_type, member_index));
+    unsigned dims = member ? spvc_type_get_num_array_dimensions(member) : 0;
+    if (!dims) return 0;
+    GLuint count = (GLuint)spvc_type_get_array_dimension(member, dims - 1);
+    return count ? (GLint)(mglMetalTypeSizeFromSPVC(compiler, member) / count) : 0;
 }
 
 GLint mglGLTypeLocationCount(GLuint gl_type, GLint array_size)
@@ -1822,7 +1801,7 @@ GLboolean mglReflectUBOStructMember(Program *program,
                                                location_offset,
                                                top_level_array_size,
                                                top_level_array_stride);
-    if (ok && getenv("MGL_DEBUG_UBO_REFLECT")) {
+    if (ok && mglTraceEnvFlagEnabled("MGL_DEBUG_UBO_REFLECT")) {
         fprintf(stderr,
                 "MGL UBO MEMBER program=%u stage=%d ubo=%s member=%u finalName=%s queryName=%s offset=%u\n",
                 program ? program->name : 0,
@@ -2334,16 +2313,6 @@ bool mglIsSamplerResourceType(int res_type)
            res_type == SPVC_RESOURCE_TYPE_STORAGE_IMAGE;
 }
 
-bool mglUniformNameLooksSamplerLike(const char *name)
-{
-    if (!name || !*name) {
-        return false;
-    }
-
-    return strstr(name, "Sampler") != NULL ||
-           strcmp(name, "CloudFaces") == 0;
-}
-
 bool mglUniformConstantBaseTypeIsSamplerLike(spvc_basetype basetype)
 {
     return basetype == SPVC_BASETYPE_IMAGE ||
@@ -2364,9 +2333,7 @@ bool mglProgramResourceLooksSamplerLike(const SpirvResource *res, int res_type)
         case SPVC_RESOURCE_TYPE_STORAGE_IMAGE:
             return true;
         case SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT:
-            return res->image_dim != 0u ||
-                   res->uniform_location >= MGL_SYNTHETIC_SAMPLER_LOCATION_BASE ||
-                   mglUniformNameLooksSamplerLike(res->name);
+            return res->is_opaque_uniform == GL_TRUE;
         default:
             return false;
     }
@@ -2496,6 +2463,57 @@ GLint mglFirstFreePlainUniformLocation(const bool used[MAX_BINDABLE_BUFFERS])
     return -1;
 }
 
+/* Resolve one program-wide location for a plain uniform name.  SPIR-V
+ * Location decorations on default-block uniforms can differ by stage even
+ * when the GLSL uniform is shared.  A source-level layout(location) is the
+ * authoritative choice; otherwise retain the first reflected location in
+ * shader-stage order. */
+static GLint mglCanonicalPlainUniformLocation(Program *program,
+                                               const char *name,
+                                               GLboolean *explicit_out)
+{
+    if (explicit_out) {
+        *explicit_out = GL_FALSE;
+    }
+    if (!program || !name || !name[0]) {
+        return -1;
+    }
+
+    GLint explicit_location = -1;
+    GLint reflected_location = -1;
+    for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++) {
+        SpirvResourceList *resources =
+            &program->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT];
+        const char *source = program->shader_slots[stage]
+            ? program->shader_slots[stage]->src
+            : NULL;
+        for (GLuint i = 0; resources->list && i < resources->count; i++) {
+            SpirvResource *res = &resources->list[i];
+            if (mglProgramResourceLooksSamplerLike(res, SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT) ||
+                !res->name || strcmp(res->name, name) != 0) {
+                continue;
+            }
+
+            GLint declared_location = mglFindExplicitUniformLocation(source, res->name);
+            if (explicit_location < 0 && declared_location >= 0) {
+                explicit_location = declared_location;
+            }
+            if (reflected_location < 0 && res->location != 0xffffffffu &&
+                res->location < 1024u) {
+                reflected_location = (GLint)res->location;
+            }
+        }
+    }
+
+    if (explicit_location >= 0) {
+        if (explicit_out) {
+            *explicit_out = GL_TRUE;
+        }
+        return explicit_location;
+    }
+    return reflected_location;
+}
+
 static bool mglIsSynthesizedLooseUniformStruct(const SpirvResource *res)
 {
     return res && res->name &&
@@ -2507,8 +2525,11 @@ static bool mglIsSynthesizedLooseUniformStruct(const SpirvResource *res)
 static const char *mglLooseUniformLeafName(const SpirvUBOMember *member)
 {
     const char *name = member->query_name ? member->query_name : member->name;
-    const char *dot = name ? strrchr(name, '.') : NULL;
-    return dot ? dot + 1 : name;
+    if (name && strncmp(name, "_mgl_loose_", 11) == 0) {
+        const char *dot = strchr(name, '.');
+        return dot ? dot + 1 : name;
+    }
+    return name;
 }
 
 static void mglUnifySynthesizedLooseUniformLocations(Program *program)
@@ -2556,22 +2577,36 @@ static void mglUnifySynthesizedLooseUniformLocations(Program *program)
     }
     if (!found || count == 0) return;
 
-    GLint total = 0;
-    for (size_t i = 0; i < count; i++) {
-        offsets[i] = total;
-        total += sizes[i];
-    }
-    if (total > MAX_BINDABLE_BUFFERS) return;
-
-    GLint base = -1;
-    for (GLint candidate = 0; candidate <= MAX_BINDABLE_BUFFERS - total; candidate++) {
-        bool freeRange = true;
-        for (GLint loc = candidate; loc < candidate + total; loc++) {
-            if (occupied[loc]) { freeRange = false; break; }
+    /* The synthesized parent has no public GL identity. Its leaf locations
+     * belong to the linked program namespace, including uniforms that stayed
+     * independent in another stage. Keep those existing locations and allocate
+     * contiguous spans for each remaining array. */
+    for (size_t index = 0; index < count; index++) {
+        offsets[index] = -1;
+        for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++) {
+            SpirvResourceList *resources =
+                &program->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT];
+            for (GLuint i = 0; resources->list && i < resources->count; i++) {
+                SpirvResource *res = &resources->list[i];
+                if (mglIsSynthesizedLooseUniformStruct(res) || !res->name ||
+                    mglProgramResourceLooksSamplerLike(res, SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT))
+                    continue;
+                if (strcmp(res->name, names[index]) == 0) offsets[index] = res->uniform_location;
+            }
         }
-        if (freeRange) { base = candidate; break; }
+        if (offsets[index] >= 0) continue;
+        for (GLint candidate = 0; candidate <= MAX_BINDABLE_BUFFERS - sizes[index]; candidate++) {
+            bool freeRange = true;
+            for (GLint loc = candidate; loc < candidate + sizes[index]; loc++) {
+                if (occupied[loc]) { freeRange = false; break; }
+            }
+            if (!freeRange) continue;
+            offsets[index] = candidate;
+            for (GLint loc = candidate; loc < candidate + sizes[index]; loc++) occupied[loc] = true;
+            break;
+        }
+        if (offsets[index] < 0) return;
     }
-    if (base < 0) return;
 
     for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++) {
         SpirvResourceList *resources =
@@ -2579,7 +2614,7 @@ static void mglUnifySynthesizedLooseUniformLocations(Program *program)
         for (GLuint i = 0; resources->list && i < resources->count; i++) {
             SpirvResource *res = &resources->list[i];
             if (!mglIsSynthesizedLooseUniformStruct(res)) continue;
-            res->uniform_location = base;
+            res->uniform_location = 0;
             for (GLuint m = 0; m < res->ubo_member_count; m++) {
                 SpirvUBOMember *member = &res->ubo_members[m];
                 const char *name = mglLooseUniformLeafName(member);
@@ -2593,8 +2628,10 @@ static void mglUnifySynthesizedLooseUniformLocations(Program *program)
             }
         }
     }
-    fprintf(stderr, "MGL LOOSE UNIFORMS: program=%u base=%d members=%zu slots=%d\n",
-            program->name, base, count, total);
+    if (mglTraceEnvFlagEnabled("MGL_DEBUG_UNIFORM_ABI")) {
+        fprintf(stderr, "MGL LOOSE UNIFORMS: program=%u members=%zu\n",
+                program->name, count);
+    }
 }
 
 void mglAssignPlainUniformLocations(Program *program)
@@ -2616,6 +2653,45 @@ void mglAssignPlainUniformLocations(Program *program)
      * assigns a free location). */
     const char *used_by[MAX_BINDABLE_BUFFERS] = {NULL};
 
+    /* Reserve source-declared locations before automatic reflected locations
+     * are considered.  This also makes an explicit location in one stage
+     * canonical for same-name resources in every linked stage. */
+    for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++) {
+        SpirvResourceList *resources =
+            &program->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT];
+        for (GLuint i = 0; resources->list && i < resources->count; i++) {
+            SpirvResource *res = &resources->list[i];
+            if (mglProgramResourceLooksSamplerLike(res, SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT) ||
+                !res->name) {
+                continue;
+            }
+            GLboolean is_explicit = GL_FALSE;
+            GLint canonical = mglCanonicalPlainUniformLocation(program, res->name,
+                                                                &is_explicit);
+            if (!is_explicit || canonical < 0 || canonical >= MAX_BINDABLE_BUFFERS) {
+                continue;
+            }
+
+            used[canonical] = true;
+            used_by[canonical] = res->name;
+            for (int shared_stage = _VERTEX_SHADER;
+                 shared_stage < _MAX_SHADER_TYPES; shared_stage++) {
+                SpirvResourceList *shared_resources =
+                    &program->spirv_resources_list[shared_stage][SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT];
+                for (GLuint shared_i = 0;
+                     shared_resources->list && shared_i < shared_resources->count;
+                     shared_i++) {
+                    SpirvResource *shared = &shared_resources->list[shared_i];
+                    if (!mglProgramResourceLooksSamplerLike(
+                            shared, SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT) &&
+                        shared->name && strcmp(shared->name, res->name) == 0) {
+                        shared->uniform_location = canonical;
+                    }
+                }
+            }
+        }
+    }
+
     for (int stage = _VERTEX_SHADER; stage < _MAX_SHADER_TYPES; stage++) {
         SpirvResourceList *resources =
             &program->spirv_resources_list[stage][SPVC_RESOURCE_TYPE_UNIFORM_CONSTANT];
@@ -2625,10 +2701,19 @@ void mglAssignPlainUniformLocations(Program *program)
                 continue;
             }
 
-            if (res->location != 0xffffffffu &&
-                       res->location < 1024u &&
-                       res->location < MAX_BINDABLE_BUFFERS) {
-                GLint candidate = (GLint)res->location;
+            if (res->uniform_location >= 0) {
+                continue;
+            }
+
+            GLint canonical_location = mglCanonicalPlainUniformLocation(
+                program, res->name, NULL);
+            GLint candidate_location = canonical_location >= 0
+                ? canonical_location
+                : (res->location != 0xffffffffu && res->location < 1024u
+                    ? (GLint)res->location : -1);
+
+            if (candidate_location >= 0 && candidate_location < MAX_BINDABLE_BUFFERS) {
+                GLint candidate = candidate_location;
                 bool sameName = used_by[candidate] && res->name &&
                                 strcmp(used_by[candidate], res->name) == 0;
                 if (!used[candidate] || sameName) {
@@ -2644,10 +2729,10 @@ void mglAssignPlainUniformLocations(Program *program)
                      * free slot instead of aliasing this one. */
                     res->uniform_location = -1;
                 }
-            } else if (res->location != 0xffffffffu && res->location < 1024u) {
+            } else if (candidate_location >= 0 && candidate_location < 1024u) {
                 /* location >= MAX_BINDABLE_BUFFERS: cannot index used[]; keep
                  * prior behavior of honoring it verbatim. */
-                res->uniform_location = (GLint)res->location;
+                res->uniform_location = candidate_location;
             } else if (res->uniform_location >= 0 &&
                        res->uniform_location < MAX_BINDABLE_BUFFERS) {
                 used[res->uniform_location] = true;
@@ -2678,8 +2763,12 @@ void mglAssignPlainUniformLocations(Program *program)
             }
 
             GLint preferred = -1;
-            if (res->location < MAX_BINDABLE_BUFFERS && !used[res->location]) {
-                preferred = (GLint)res->location;
+            GLint canonical_location = mglCanonicalPlainUniformLocation(
+                program, res->name, NULL);
+            GLuint reflected_location = canonical_location >= 0
+                ? (GLuint)canonical_location : res->location;
+            if (reflected_location < MAX_BINDABLE_BUFFERS && !used[reflected_location]) {
+                preferred = (GLint)reflected_location;
             } else if (res->gl_binding < MAX_BINDABLE_BUFFERS && !used[res->gl_binding]) {
                 preferred = (GLint)res->gl_binding;
             } else {
@@ -2697,13 +2786,15 @@ void mglAssignPlainUniformLocations(Program *program)
 
             res->uniform_location = preferred;
             used[preferred] = true;
-            fprintf(stderr,
-                    "MGL PLAIN UNIFORM FIX: program=%u stage=%d name=%s loc=%d metal=%u\n",
-                    program->name,
-                    stage,
-                    res->name ? res->name : "(null)",
-                    preferred,
-                    (unsigned)res->binding);
+            if (mglTraceEnvFlagEnabled("MGL_DEBUG_RESOURCE_ABI")) {
+                fprintf(stderr,
+                        "MGL PLAIN UNIFORM FIX: program=%u stage=%d name=%s loc=%d metal=%u\n",
+                        program->name,
+                        stage,
+                        res->name ? res->name : "(null)",
+                        preferred,
+                        (unsigned)res->binding);
+            }
         }
     }
     mglUnifySynthesizedLooseUniformLocations(program);
