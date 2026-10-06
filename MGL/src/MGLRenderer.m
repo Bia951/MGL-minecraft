@@ -11941,6 +11941,8 @@ void* CppCreateMGLRendererAndBindToContext (void *glm_ctx)
     /* Parallel workers do not own native resource transaction snapshots. */
     _nativeDepthSamplingEnabled = mglEnvFlagEnabled("MGL_NATIVE_DEPTH_SAMPLING") &&
         !mglEnvFlagEnabled("MGL_PARALLEL_ENCODE");
+    _resolvedTexturePlanEnabled = mglResourceBindingPlanEnabled() &&
+        !mglEnvFlagEnabled("MGL_PARALLEL_ENCODE");
     _packedUniformReuseEnabled = mglPackedUniformReuseEnabled();
     // Bounded per-Program MSL texture type lookup cache (always on; no env var).
     // Keys include a process-unique Program lifetime ID and link generation.

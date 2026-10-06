@@ -4898,7 +4898,13 @@ create_new_command_buffer:
         return false;
     }
 
-    if (draw_command) RETURN_FALSE_ON_FAILURE([self selectNativeDepthPipelineForDraw]);
+    if (draw_command) {
+        RETURN_FALSE_ON_FAILURE([self selectNativeDepthPipelineForDraw]); // Private PSO preflight, not resource replay.
+        if (_resolvedTexturePlanEnabled) {
+            RETURN_FALSE_ON_FAILURE([self prepareResolvedTextureBindingsForDraw]);
+            [self updateCurrentRenderEncoder];
+        }
+    }
     RETURN_FALSE_ON_FAILURE([self validateRenderPassAttachmentsAndPipelineFormatsLocked:traceProcess]);
 
     @try {

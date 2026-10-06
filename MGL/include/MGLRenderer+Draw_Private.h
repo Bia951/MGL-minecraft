@@ -211,6 +211,17 @@ bool mglResolvePassthroughPatchModeForContext(GLMContext drawCtx,
                                                      GLenum *mode,
                                                      const char *label);
 
+@interface MGLRenderer (Draw)
+- (bool)bindTexturesToCurrentRenderEncoder;
+@end
+
+@interface MGLRenderer (ResolvedTextures)
+- (void)discardResolvedTextureBindings;
+- (bool)prepareResolvedTextureBindingsForDraw;
+- (bool)replayResolvedTextureBindingsForDraw;
+- (bool)resolvedTextureBindingsMatchCurrentDraw;
+@end
+
 @interface MGLRenderer ()
 
 // === Draw batch scheduling and execution ===

@@ -2,6 +2,7 @@
 // Draw command encoding methods extracted from MGLRenderer.m
 
 #import "MGLRenderer_Private.h"
+#import "mgl_resolved_texture_bindings.h"
 #import "MGLRenderer+ArgumentBuffer_Private.h"
 #import "MGLRenderer+Draw_Private.h"
 #import "mgl_frame_activity.h"
@@ -4438,6 +4439,10 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
 
 - (void)setVertexTextureIfNeeded:(id<MTLTexture>)texture atIndex:(NSUInteger)index
 {
+    if (_resolvedTextureBindingsPreparing) {
+        [_resolvedTextureBindings recordTexture:texture vertex:YES slot:index];
+        return;
+    }
     if (!_currentRenderEncoder || index >= TEXTURE_UNITS) {
         return;
     }
@@ -4449,6 +4454,10 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
 
 - (void)setFragmentTextureIfNeeded:(id<MTLTexture>)texture atIndex:(NSUInteger)index
 {
+    if (_resolvedTextureBindingsPreparing) {
+        [_resolvedTextureBindings recordTexture:texture vertex:NO slot:index];
+        return;
+    }
     if (!_currentRenderEncoder || index >= TEXTURE_UNITS) {
         return;
     }
@@ -4460,6 +4469,10 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
 
 - (void)setVertexSamplerStateIfNeeded:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index
 {
+    if (_resolvedTextureBindingsPreparing) {
+        [_resolvedTextureBindings recordSampler:sampler vertex:YES slot:index];
+        return;
+    }
     if (!_currentRenderEncoder || index >= TEXTURE_UNITS) {
         return;
     }
@@ -4471,6 +4484,10 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
 
 - (void)setFragmentSamplerStateIfNeeded:(id<MTLSamplerState>)sampler atIndex:(NSUInteger)index
 {
+    if (_resolvedTextureBindingsPreparing) {
+        [_resolvedTextureBindings recordSampler:sampler vertex:NO slot:index];
+        return;
+    }
     if (!_currentRenderEncoder || index >= TEXTURE_UNITS) {
         return;
     }
@@ -4526,9 +4543,13 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
 - (bool)syncResourceBindingsForContext:(GLMContext)glm_ctx
 {
     GLMState *state = MGL_STATE(glm_ctx);
-    RETURN_FALSE_ON_FAILURE([self mapBuffersToMTL]);
-    RETURN_FALSE_ON_FAILURE([self updateDirtyBaseBufferList:&state->vertex_buffer_map_list]);
-    RETURN_FALSE_ON_FAILURE([self updateDirtyBaseBufferList:&state->fragment_buffer_map_list]);
+    BOOL preparedTextures = _resolvedTexturePlanEnabled && [self resolvedTextureBindingsMatchCurrentDraw];
+    if (!preparedTextures) {
+        if (_resolvedTextureBindings) [self discardResolvedTextureBindings];
+        RETURN_FALSE_ON_FAILURE([self mapBuffersToMTL]);
+        RETURN_FALSE_ON_FAILURE([self updateDirtyBaseBufferList:&state->vertex_buffer_map_list]);
+        RETURN_FALSE_ON_FAILURE([self updateDirtyBaseBufferList:&state->fragment_buffer_map_list]);
+    }
     RETURN_FALSE_ON_FAILURE([self bindVertexBuffersToCurrentRenderEncoder]);
     RETURN_FALSE_ON_FAILURE([self bindFragmentBuffersToCurrentRenderEncoder]);
     Program *vertexProgram = mglResolveProgramForStageFromState(glm_ctx, _VERTEX_SHADER);
@@ -4544,6 +4565,20 @@ static const NSUInteger kMaxFragmentSamplerSlots = 16;
                                                   renderEncoder:_currentRenderEncoder
                                                  computeEncoder:nil]);
     RETURN_FALSE_ON_FAILURE([self bindBufferSizeConstantsForRenderEncoder]);
+    if (preparedTextures) {
+        if ([self replayResolvedTextureBindingsForDraw]) return true;
+        /* Unexpected encoder/CB/program change during buffer binding: cancel
+         * all private texture choices, remap against the current CB and retry
+         * the unchanged legacy resolver. No draw has been issued. */
+        [self discardResolvedTextureBindings];
+        if (_nativeDepthReady) [self resetNativeDepthDraw];
+        RETURN_FALSE_ON_FAILURE([self restoreRenderEncoderAfterTextureUploadForDraw:"resolved-texture-replay-fallback"]);
+        if (_currentRenderEncoder && _pipelineState) {
+            [_currentRenderEncoder setRenderPipelineState:_pipelineState];
+            _lastPipelineState = _pipelineState;
+        }
+        return [self syncResourceBindingsForContext:glm_ctx];
+    }
     RETURN_FALSE_ON_FAILURE([self bindActiveTexturesToMTL]);
     RETURN_FALSE_ON_FAILURE([self restoreRenderEncoderAfterTextureUploadForDraw:"final-active-texture-bind"]);
     if (![self bindTexturesToCurrentRenderEncoder]) {

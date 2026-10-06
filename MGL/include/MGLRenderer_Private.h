@@ -169,6 +169,8 @@ static inline void mglMetalUnlock(os_unfair_lock *lock) {
  * it falls back to the live &ctx->state. */
 #define MGL_STATE(context)  (_activeState ? _activeState : &(context)->state)
 
+@class MGLResolvedTextureBindings;
+
 @interface MGLRenderer () {
     NSView *_view;
     CAMetalLayer *_layer;
@@ -319,6 +321,14 @@ static inline void mglMetalUnlock(os_unfair_lock *lock) {
      * wrapping an MTLTextureType.  Program instances have process-unique IDs,
      * so allocator address reuse cannot return another Program's value. */
     NSCache<NSString *, NSNumber *> *_mslTextureTypeCache;
+    /* One-draw texture/sampler plan; unsupported workers use legacy binding. */
+    BOOL _resolvedTexturePlanEnabled;
+    BOOL _resolvedTextureBindingsPreparing;
+    MGLResolvedTextureBindings *_resolvedTextureBindings;
+    id<MTLCommandBuffer> _resolvedTextureCommandBuffer;
+    id<MTLRenderCommandEncoder> _resolvedTextureEncoder;
+    uint64_t _resolvedTextureProgramInstances[2];
+    uint64_t _resolvedTextureLinkGenerations[2];
     /* Native depth is opt-in and disabled for parallel encode workers.
      * Masks index fragment sampled-resource reflection, not Metal slots. */
     BOOL _nativeDepthSamplingEnabled;
