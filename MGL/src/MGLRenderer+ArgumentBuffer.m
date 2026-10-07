@@ -381,9 +381,10 @@ static NSUInteger mglABSizeConstantCapacity(Program *program, int stage)
         MGLArgumentBindingTable *previousTable = previous ? previous[1] : nil;
         MGLArgumentBindingTable *table = previousTable ? nil : [MGLArgumentBindingTable new];
         NSUInteger entryIndex = 0u;
-        uint32_t sizes[4096] = {0};
         NSUInteger sizeCount = set == 1u && spirv->needs_buffer_size_buffer
             ? mglABSizeConstantCapacity(program, stage) : 0u;
+        uint32_t sizes[4096];
+        if (sizeCount) memset(sizes, 0, sizeCount * sizeof(sizes[0]));
         const int types[] = {SPVC_RESOURCE_TYPE_UNIFORM_BUFFER, SPVC_RESOURCE_TYPE_STORAGE_BUFFER};
         NSMutableSet<NSValue *> *processed = [NSMutableSet new];
         for (NSUInteger ti = 0; ti < 2; ti++) {

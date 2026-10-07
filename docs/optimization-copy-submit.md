@@ -41,6 +41,38 @@ The MSL checks include mixed color/depth flips and compile generated Metal.
 No game FPS or visual claim follows from these checks.
 
 
+## Follow-up CPU work (2026-10-07)
+
+Immutable Program uniform versions rebuild their Buffer wrappers and CPU backing
+on each changed generation. Struct snapshots must therefore match their exact
+resolved dependency bytes, size, backing presence and fallback choice, rather
+than treating a new wrapper/address as changed contents. Private/unmapped source
+eligibility and live allocation validation still apply. This preserves old packed
+bytes while allowing unrelated uniform updates to reuse unchanged structs.
+
+Resource-plan residency records use strong object-pointer keys and union usage
+bits without constructing a pointer wrapper and a two-element array for every
+repeat. Argument-buffer size constants only clear their active range; sets that
+do not use size constants avoid the previous unconditional 16 KiB clear.
+
+These remain opt-in changes. Fixed-scene application FPS comparisons are pending;
+renderer swap cadence alone cannot establish a Minecraft FPS improvement.
+
+### Reference implementations
+
+- [ANGLE Metal uniform handling](https://chromium.googlesource.com/angle/angle/+/09c7bd10a9c18c9190ebc201ccb1f55bf8539f10/src/libANGLE/renderer/metal/ProgramExecutableMtl.mm):
+  dirty uniform updates and pooled/suballocated streamed buffers. MGL can adopt
+  the lifecycle and update granularity without changing OpenGL semantics.
+- [Mesa Zink](https://docs.mesa3d.org/drivers/zink.html): Gallium/OpenGL to Vulkan;
+  its lazy descriptor strategy is a useful reference for reducing draw-time CPU
+  work. On Metal it needs a Vulkan implementation beneath it.
+- [MoltenVK argument-buffer configuration](https://github.com/KhronosGroup/MoltenVK/blob/main/Docs/MoltenVK_Configuration_Parameters.md#mvk_config_use_metal_argument_buffers):
+  Vulkan to Metal; argument buffers are a resource-limit/performance tradeoff,
+  so exact descriptor caching and in-flight lifetimes matter.
+- [Mesa KosmicKrisp](https://docs.mesa3d.org/drivers/kosmickrisp.html): Vulkan to
+  Metal 4 on Apple Silicon/macOS 26+, with explicit backend workarounds. This is
+  a separate Vulkan driver, not a direct OpenGL-to-Metal Gallium backend.
+
 ## Resource binding metadata (first CPU increment)
 
 `MGL_RESOURCE_BINDING_PLAN=1`, default off. On successful link, private per-resource metadata records the finalized MSL texture type/data kind and buffer/sampler presence decisions. Existing Metal slots and resource IDs remain in reflection. Draw-time type queries avoid NSString keys/NSCache lookups when metadata is valid. GL binding points and sampler units remain dynamic; glUniformBlockBinding/glUniform sampler updates are not cached as static state.

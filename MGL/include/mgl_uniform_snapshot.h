@@ -4,8 +4,9 @@
 #include "glm_context.h"
 
 /* Immutable CPU packed bytes plus an exact dependency witness. Only private,
- * unmapped CPU glUniform buffers qualify. No GL/Metal object is retained.
- * Stored pointer values are identities only, never dereferenced. */
+ * unmapped CPU glUniform buffers qualify. No GL/Metal object or source pointer
+ * is retained; each lookup resolves the live source and compares its exact
+ * bytes and backing-presence state. */
 @interface MGLPackedUniformSnapshot : NSObject
 @property(nonatomic, readonly) NSData *bytes;
 @property(nonatomic, readonly) NSUInteger retainedBytes;

@@ -6,10 +6,10 @@ extern Buffer *mglRendererGetValidatedBuffer(GLMContext, Buffer *, const char *,
 
 typedef struct {
     GLuint location;
-    uintptr_t identity;
-    vm_address_t address;
     GLsizeiptr size;
     BOOL fallback;
+    BOOL bufferPresent;
+    BOOL hasBacking;
 } MGLUniformSnapshotSource;
 
 static Buffer *resolveSource(GLMContext ctx, BufferBaseTarget *buffers,
@@ -90,15 +90,16 @@ static BOOL eligible(Buffer *buffer)
             if (!eligible(buffer)) return nil;
             MGLUniformSnapshotSource *source = &_sources[_sourceCount++];
             source->location = (GLuint)location;
-            source->identity = (uintptr_t)buffer;
             source->fallback = usedFallback;
-            source->address = buffer ? buffer->data.buffer_data : 0;
+            source->bufferPresent = (buffer != NULL);
+            source->hasBacking = buffer && buffer->data.buffer_data;
             source->size = buffer ? buffer->size : 0;
             /* The private flag is only set for MGL-owned uniform allocations
              * and immutable clones. Their backing memory is known readable;
              * avoid a duplicate VM probe after source resolution. */
-            NSData *data = source->address && source->size
-                ? [NSData dataWithBytes:(const void *)(uintptr_t)source->address length:(NSUInteger)source->size]
+            NSData *data = source->hasBacking && source->size
+                ? [NSData dataWithBytes:(const void *)(uintptr_t)buffer->data.buffer_data
+                                 length:(NSUInteger)source->size]
                 : [NSData data];
             _retainedBytes += data.length;
             if (_retainedBytes > 1024u * 1024u) return nil;
@@ -118,11 +119,14 @@ static BOOL eligible(Buffer *buffer)
         const MGLUniformSnapshotSource *source = &_sources[i];
         BOOL usedFallback;
         Buffer *buffer = resolveSource(context, buffers, fallback, source->location, &usedFallback);
-        if (!eligible(buffer) || (uintptr_t)buffer != source->identity || usedFallback != source->fallback ||
-            (buffer ? buffer->data.buffer_data : 0) != source->address ||
+        if (!eligible(buffer) || usedFallback != source->fallback ||
+            (buffer != NULL) != source->bufferPresent ||
+            (buffer && buffer->data.buffer_data != 0) != source->hasBacking ||
             (buffer ? buffer->size : 0) != source->size) return NO;
         NSData *data = _sourceBytes[i];
-        if (data.length && memcmp(data.bytes, (const void *)(uintptr_t)source->address, data.length)) return NO;
+        if (data.length && memcmp(data.bytes,
+                                  (const void *)(uintptr_t)buffer->data.buffer_data,
+                                  data.length)) return NO;
     }
     return YES;
 }

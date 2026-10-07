@@ -43,7 +43,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     ((uint8_t *)packed.mutableBytes)[0] = 99;
     CHECK(((const uint8_t *)snapshot.bytes.bytes)[0] == 7); // Never alias mutable packed output.
     ((uint8_t *)(uintptr_t)own[8].buf->data.buffer_data)[0] = 1;
-    CHECK(![snapshot matchesBuffers:own fallbackBuffers:fallback context:ctx]);
+    CHECK(![snapshot matchesBuffers:own fallbackBuffers:fallback context:ctx]); // Same wrapper, changed bytes.
     CHECK(((const uint8_t *)snapshot.bytes.bytes)[0] == 7); // Old version stays immutable.
     ((uint8_t *)(uintptr_t)own[8].buf->data.buffer_data)[0] = 0;
     CHECK([snapshot matchesBuffers:own fallbackBuffers:fallback context:ctx]);
@@ -55,7 +55,19 @@ int main(int argc, char **argv) { @autoreleasepool {
     own[11].buf = NULL;
     CHECK([snapshot matchesBuffers:own fallbackBuffers:fallback context:ctx]);
     Buffer *old = own[8].buf; own[8].buf = source(ctx, 7, 12);
-    CHECK(![snapshot matchesBuffers:own fallbackBuffers:fallback context:ctx]); // Equal bytes, different object.
+    CHECK([snapshot matchesBuffers:own fallbackBuffers:fallback context:ctx]); // Equal private contents, new wrapper.
+    own[8].buf = old;
+    Buffer *withoutBacking = source(ctx, 8, 12);
+    free((void *)(uintptr_t)withoutBacking->data.buffer_data);
+    withoutBacking->data.buffer_data = 0; withoutBacking->data.buffer_size = 0;
+    Buffer *zeroBytes = source(ctx, 9, 12);
+    own[8].buf = withoutBacking;
+    MGLPackedUniformSnapshot *missingBacking = [[MGLPackedUniformSnapshot alloc]
+        initWithBytes:packed resource:&r element:0 baseLocation:8 locationStep:4
+        buffers:own fallbackBuffers:fallback context:ctx];
+    CHECK(missingBacking && [missingBacking matchesBuffers:own fallbackBuffers:fallback context:ctx]);
+    own[8].buf = zeroBytes;
+    CHECK(![missingBacking matchesBuffers:own fallbackBuffers:fallback context:ctx]); // Missing backing differs from exact zero bytes.
     own[8].buf = old;
     old->mapped = GL_TRUE;
     CHECK(![snapshot matchesBuffers:own fallbackBuffers:fallback context:ctx]); old->mapped = GL_FALSE;
@@ -75,7 +87,7 @@ int main(int argc, char **argv) { @autoreleasepool {
     own[8].buf = NULL; deleteHashElement(&ctx->state.buffer_table, old->name);
     free((void *)(uintptr_t)old->data.buffer_data); free(old);
     CHECK(![snapshot matchesBuffers:own fallbackBuffers:fallback context:ctx]); // No dereference/retention of old GL pointer.
-    printf("PASS immutable bytes, exact dependency guards, arrays, fallback updates, alias/mapping exclusion, deletion\n");
+    printf("PASS immutable bytes, content-based dependency guards, backing state, arrays, fallback updates, alias/mapping exclusion, deletion\n");
     return 0;
 } }
 '''
