@@ -1227,20 +1227,20 @@ bool mglIsIdentityPackedFormat(GLenum internalformat, GLenum format, GLenum type
     /* R11F_G11F_B10F: GL_UNSIGNED_INT_10F_11F_11F_REV has the same
      * LSB-first bit layout as Metal's RG11B10Float CPU storage. */
     if (internalformat == GL_R11F_G11F_B10F &&
-        (format == GL_RGB || format == GL_BGR) &&
+        format == GL_RGB &&
         type == GL_UNSIGNED_INT_10F_11F_11F_REV) {
         return true;
     }
     /* RGB10_A2 / RGB10_A2UI: GL_UNSIGNED_INT_2_10_10_10_REV has the same
      * LSB-first bit layout as Metal's RGB10A2 CPU storage. */
     if ((internalformat == GL_RGB10_A2 || internalformat == GL_RGB10_A2UI) &&
-        (format == GL_RGBA || format == GL_BGRA) &&
+        format == GL_RGBA &&
         type == GL_UNSIGNED_INT_2_10_10_10_REV) {
         return true;
     }
     /* RGB9_E5: GL_UNSIGNED_INT_5_9_9_9_REV has the same bit layout. */
     if (internalformat == GL_RGB9_E5 &&
-        (format == GL_RGB || format == GL_BGR) &&
+        format == GL_RGB &&
         type == GL_UNSIGNED_INT_5_9_9_9_REV) {
         return true;
     }

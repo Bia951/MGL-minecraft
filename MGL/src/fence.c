@@ -421,10 +421,11 @@ void mglMemoryBarrier(GLMContext ctx, GLbitfield barriers)
 void mglMemoryBarrierByRegion(GLMContext ctx, GLbitfield barriers)
 {
 
-    if (barriers & ~(GL_ATOMIC_COUNTER_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT | GL_UNIFORM_BARRIER_BIT))
+    if (barriers != GL_ALL_BARRIER_BITS &&
+        (barriers & ~(GL_ATOMIC_COUNTER_BARRIER_BIT | GL_FRAMEBUFFER_BARRIER_BIT | GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT | GL_UNIFORM_BARRIER_BIT)))
     {
-        // extra bits...
         ERROR_RETURN(GL_INVALID_VALUE);
+        return;
     }
 
     mglMemoryBarrier(ctx, barriers);
