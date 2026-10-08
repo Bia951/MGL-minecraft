@@ -466,3 +466,17 @@ test-mapped-vertex: $(build_dir)/libmgl.dylib $(build_dir)/libglfw.dylib
 .PHONY: default help test dbg lib clean insall-pkgdeps test-make bench bench-system test-regression
 
 -include $(deps)
+
+# Focused headless regressions for reviewed upstream API fixes.
+upstream_api_tests := upstream_query_api_test upstream_state_api_test upstream_texture_api_test upstream_misc_api_test
+upstream_api_exes := $(addprefix $(build_dir)/,$(upstream_api_tests))
+
+test-upstream-api: $(upstream_api_exes)
+	@set -e; for test in $(upstream_api_exes); do DYLD_LIBRARY_PATH=$(build_dir) $$test; done
+
+$(upstream_api_exes): $(build_dir)/%: test_regression/%.c $(mgl_lib)
+	$(APPLE_CLANG) -Wall -O2 -arch $(shell uname -m) -DMGL_GL_CORE \
+		-isysroot $(SDK_ROOT) -IMGL/include -IMGL/include/GL \
+		$< -L$(build_dir) -lmgl -framework Foundation -framework Metal -framework Cocoa -o $@
+
+.PHONY: test-upstream-api
