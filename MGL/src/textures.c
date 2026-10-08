@@ -867,7 +867,7 @@ void mglBindImageTexture(GLMContext ctx, GLuint unit, GLuint texture, GLint leve
         return;
     }
 
-    ptr = getTex(ctx, texture, 0);
+    ptr = findTexture(ctx, texture);
 
     if (!ptr) {
         fprintf(stderr, "MGL Error: mglBindImageTexture: texture %d not found\n", texture);
@@ -881,7 +881,7 @@ void mglBindImageTexture(GLMContext ctx, GLuint unit, GLuint texture, GLint leve
         return;
     }
 
-    if (!layered && mglTextureTargetUsesImageLayerParameter(ptr->target) && layer < 0) {
+    if (layer < 0) {
         fprintf(stderr, "MGL Error: mglBindImageTexture: layer < 0 (%d)\n", layer);
         ERROR_RETURN(GL_INVALID_VALUE);
         return;
@@ -1147,44 +1147,28 @@ void mglBindImageTextures(GLMContext ctx, GLuint first, GLsizei count, const GLu
         ERROR_RETURN(GL_INVALID_VALUE);
         return;
     }
-    if (count == 0) {
-        return;
-    }
-    if (first >= TEXTURE_UNITS || (GLuint)count > TEXTURE_UNITS - first) {
-        ERROR_RETURN(GL_INVALID_VALUE);
+    if (first > STATE_VAR(max_image_units) || (GLuint)count > STATE_VAR(max_image_units) - first) {
+        ERROR_RETURN(GL_INVALID_OPERATION);
         return;
     }
 
-    for (GLsizei i = 0; i < count; i++) {
-        GLuint tex_name = textures ? textures[i] : 0u;
-        if (tex_name == 0u) {
-            continue;
-        }
-
-        Texture *tex = findTexture(ctx, tex_name);
-        if (!tex || tex->num_levels == 0 || !tex->faces[0].levels ||
-            !tex->faces[0].levels[0].complete) {
-            ERROR_RETURN(GL_INVALID_OPERATION);
-            return;
-        }
-    }
-
+    /* Multi-bind validates each entry independently; valid entries still apply. */
     for (GLsizei i = 0; i < count; i++) {
         GLuint tex_name = textures ? textures[i] : 0u;
         if (tex_name == 0u) {
             bzero(&ctx->state.image_units[first + i], sizeof(ImageUnit));
             continue;
         }
-
         Texture *tex = findTexture(ctx, tex_name);
-        mglBindImageTexture(ctx,
-                            first + i,
-                            tex_name,
-                            0,
-                            GL_FALSE,
-                            0,
-                            tex->access ? tex->access : GL_READ_ONLY,
-                            tex->internalformat);
+        if (!tex || (tex->target == GL_TEXTURE_BUFFER
+            ? (!tex->complete || !tex->texture_buffer)
+            : (tex->num_levels == 0 || !tex->faces[0].levels ||
+               !tex->faces[0].levels[0].complete))) {
+            ERROR_RETURN(GL_INVALID_OPERATION);
+            continue;
+        }
+        mglBindImageTexture(ctx, first + i, tex_name, 0, GL_TRUE, 0,
+                            GL_READ_WRITE, tex->internalformat);
     }
 
     ctx->state.dirty_bits |= DIRTY_IMAGE_UNIT_STATE;
@@ -5808,6 +5792,12 @@ void mglGetTextureSubImage(GLMContext ctx, GLuint texture, GLint level, GLint xo
         ERROR_RETURN(GL_INVALID_OPERATION);
         return;
     }
+    if (tex->target == GL_TEXTURE_BUFFER ||
+        tex->target == GL_TEXTURE_2D_MULTISAMPLE ||
+        tex->target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY) {
+        ERROR_RETURN(GL_INVALID_OPERATION);
+        return;
+    }
     if (level >= (GLint)tex->num_levels || !tex->faces[0].levels) {
         ERROR_RETURN(GL_INVALID_VALUE);
         return;
@@ -6082,6 +6072,47 @@ void mglTextureView(GLMContext ctx, GLuint texture, GLenum target, GLuint origte
     ERROR_RETURN(GL_INVALID_OPERATION);
 }
 
+static GLboolean mglTexBufferInternalFormatValid(GLenum internalformat)
+{
+    switch (internalformat) {
+        case GL_R8:
+        case GL_R16:
+        case GL_R16F:
+        case GL_R32F:
+        case GL_R8I:
+        case GL_R16I:
+        case GL_R32I:
+        case GL_R8UI:
+        case GL_R16UI:
+        case GL_R32UI:
+        case GL_RG8:
+        case GL_RG16:
+        case GL_RG16F:
+        case GL_RG32F:
+        case GL_RG8I:
+        case GL_RG16I:
+        case GL_RG32I:
+        case GL_RG8UI:
+        case GL_RG16UI:
+        case GL_RG32UI:
+        case GL_RGB32F:
+        case GL_RGB32I:
+        case GL_RGB32UI:
+        case GL_RGBA8:
+        case GL_RGBA16:
+        case GL_RGBA16F:
+        case GL_RGBA32F:
+        case GL_RGBA8I:
+        case GL_RGBA16I:
+        case GL_RGBA32I:
+        case GL_RGBA8UI:
+        case GL_RGBA16UI:
+        case GL_RGBA32UI:
+            return GL_TRUE;
+        default: return GL_FALSE;
+    }
+}
+
 static void mglTextureBufferRangeImpl(GLMContext ctx, GLuint texture, GLenum internalformat, GLuint buffer,
                                       GLintptr offset, GLsizeiptr size, bool whole_buffer);
 
@@ -6108,6 +6139,7 @@ static void mglTextureBufferRangeImpl(GLMContext ctx, GLuint texture, GLenum int
     tex = findTexture(ctx, texture);
     ERROR_CHECK_RETURN(tex, GL_INVALID_OPERATION);
     ERROR_CHECK_RETURN(tex->target == GL_TEXTURE_BUFFER, GL_INVALID_OPERATION);
+    ERROR_CHECK_RETURN(mglTexBufferInternalFormatValid(internalformat), GL_INVALID_ENUM);
 
     mglFlushPendingDraws(ctx);
 
@@ -6243,7 +6275,8 @@ void mglGetCompressedTextureImage(GLMContext ctx, GLuint texture, GLint level, G
         ERROR_RETURN(GL_INVALID_VALUE);
         return;
     }
-    if (!pixels && bufSize > 0) {
+    Buffer *pack_buffer = STATE(buffers[_PIXEL_PACK_BUFFER]);
+    if (!pack_buffer && !pixels && bufSize > 0) {
         ERROR_RETURN(GL_INVALID_OPERATION);
         return;
     }
@@ -6262,8 +6295,41 @@ void mglGetCompressedTextureImage(GLMContext ctx, GLuint texture, GLint level, G
         ERROR_RETURN(GL_INVALID_OPERATION);
         return;
     }
+    if (pack_buffer) {
+        uintptr_t offset = (uintptr_t)pixels;
+        GLboolean persistent_map =
+            (pack_buffer->storage_flags & GL_MAP_PERSISTENT_BIT) &&
+            (pack_buffer->access_flags & GL_MAP_PERSISTENT_BIT);
+        if ((pack_buffer->mapped && !persistent_map) || pack_buffer->size < 0 ||
+            offset > (uint64_t)pack_buffer->size ||
+            lvl->data_size > (uint64_t)pack_buffer->size - offset ||
+            (lvl->data_size && !pack_buffer->data.buffer_data)) {
+            ERROR_RETURN(GL_INVALID_OPERATION);
+            return;
+        }
+        if (lvl->data_size)
+            pixels = (void *)((uint8_t *)(uintptr_t)pack_buffer->data.buffer_data + offset);
+    }
     if (lvl->data && lvl->data_size > 0u) {
         memcpy(pixels, (const void *)(uintptr_t)lvl->data, lvl->data_size);
+        if (pack_buffer) {
+            GLintptr offset = (GLintptr)((uint8_t *)pixels -
+                (uint8_t *)(uintptr_t)pack_buffer->data.buffer_data);
+            GLintptr end = offset + (GLsizeiptr)lvl->data_size;
+            pack_buffer->data.dirty_bits |= DIRTY_BUFFER_DATA;
+            STATE(dirty_bits) |= DIRTY_BUFFER;
+            pack_buffer->ever_written = GL_TRUE;
+            pack_buffer->has_initialized_data = GL_TRUE;
+            if (pack_buffer->written_min < 0 || offset < pack_buffer->written_min)
+                pack_buffer->written_min = offset;
+            if (pack_buffer->written_max < 0 || end > pack_buffer->written_max)
+                pack_buffer->written_max = end;
+            pack_buffer->last_init_source = kInitReadPixels;
+            pack_buffer->last_write_offset = offset;
+            pack_buffer->last_write_size = (GLsizeiptr)lvl->data_size;
+            pack_buffer->last_write_src_ptr = (const void *)(uintptr_t)lvl->data;
+            pack_buffer->last_write_src_hash = 0;
+        }
     }
 }
 
@@ -6399,7 +6465,9 @@ static bool mglTextureParameterGetiv(GLMContext ctx, TextureParameter *tex_param
     {
         case GL_TEXTURE_BORDER_COLOR:
             for (int i = 0; i < 4; i++)
-                params[i] = (GLint)tex_params->border_color[i];
+                params[i] = tex_params->border_color[i] >= 1.0f ? INT_MAX :
+                            tex_params->border_color[i] <= -1.0f ? INT_MIN :
+                            (GLint)((double)tex_params->border_color[i] * INT_MAX);
             return true;
         case GL_TEXTURE_SWIZZLE_RGBA:
             params[0] = tex_params->swizzle_r;
@@ -6501,6 +6569,13 @@ static bool mglTextureParameterGetTarget(GLMContext ctx, Texture *tex, GLenum pn
 {
     if (!tex)
         return false;
+
+    if (pname == GL_IMAGE_FORMAT_COMPATIBILITY_TYPE) {
+        if (fparams) *fparams = (GLfloat)GL_IMAGE_FORMAT_COMPATIBILITY_BY_SIZE;
+        if (iparams) *iparams = GL_IMAGE_FORMAT_COMPATIBILITY_BY_SIZE;
+        if (uiparams) *uiparams = GL_IMAGE_FORMAT_COMPATIBILITY_BY_SIZE;
+        return true;
+    }
 
     /* Texture-level parameters that live on Texture, not TextureParameter. */
     if (pname == GL_TEXTURE_IMMUTABLE_FORMAT) {
@@ -6630,6 +6705,18 @@ void mglGetTextureParameteriv(GLMContext ctx, GLuint texture, GLenum pname, GLin
         ERROR_RETURN(GL_INVALID_ENUM);
 }
 
+static bool mglGetTexParameterITargetValid(GLenum target)
+{
+    switch (target) {
+        case GL_TEXTURE_1D: case GL_TEXTURE_2D: case GL_TEXTURE_3D:
+        case GL_TEXTURE_1D_ARRAY: case GL_TEXTURE_2D_ARRAY:
+        case GL_TEXTURE_RECTANGLE: case GL_TEXTURE_CUBE_MAP:
+        case GL_TEXTURE_CUBE_MAP_ARRAY: case GL_TEXTURE_2D_MULTISAMPLE:
+        case GL_TEXTURE_2D_MULTISAMPLE_ARRAY: return true;
+        default: return false;
+    }
+}
+
 void mglGetTexParameterIiv(GLMContext ctx, GLenum target, GLenum pname, GLint *params)
 {
     if (!params) {
@@ -6637,9 +6724,26 @@ void mglGetTexParameterIiv(GLMContext ctx, GLenum target, GLenum pname, GLint *p
         return;
     }
 
+    if (!mglGetTexParameterITargetValid(target)) {
+        ERROR_RETURN(GL_INVALID_ENUM);
+        return;
+    }
     Texture *tex = getTex(ctx, 0, target);
     if (!tex)
         return;
+
+    if (pname == GL_IMAGE_FORMAT_COMPATIBILITY_TYPE) {
+        *params = GL_IMAGE_FORMAT_COMPATIBILITY_BY_SIZE;
+        return;
+    }
+    if (pname == GL_TEXTURE_IMMUTABLE_FORMAT) {
+        *params = tex->immutable_storage ? GL_TRUE : GL_FALSE;
+        return;
+    }
+    if (pname == GL_TEXTURE_IMMUTABLE_LEVELS) {
+        *params = (GLint)(tex->immutable_storage ? tex->num_levels : 0u);
+        return;
+    }
 
     if (mglTextureParameterGetIiv(&tex->params, pname, params))
         return;
@@ -6655,9 +6759,26 @@ void mglGetTexParameterIuiv(GLMContext ctx, GLenum target, GLenum pname, GLuint 
         return;
     }
 
+    if (!mglGetTexParameterITargetValid(target)) {
+        ERROR_RETURN(GL_INVALID_ENUM);
+        return;
+    }
     Texture *tex = getTex(ctx, 0, target);
     if (!tex)
         return;
+
+    if (pname == GL_IMAGE_FORMAT_COMPATIBILITY_TYPE) {
+        *params = GL_IMAGE_FORMAT_COMPATIBILITY_BY_SIZE;
+        return;
+    }
+    if (pname == GL_TEXTURE_IMMUTABLE_FORMAT) {
+        *params = tex->immutable_storage ? GL_TRUE : GL_FALSE;
+        return;
+    }
+    if (pname == GL_TEXTURE_IMMUTABLE_LEVELS) {
+        *params = (GLuint)(tex->immutable_storage ? tex->num_levels : 0u);
+        return;
+    }
 
     if (mglTextureParameterGetIuiv(&tex->params, pname, params))
         return;

@@ -22,6 +22,7 @@
 #include "mgl_trace_log.h"
 #include "pixel_utils.h"
 #include <stdlib.h>
+#include <limits.h>
 #include <string.h>
 
 extern GLuint textureIndexFromTarget(GLMContext ctx, GLenum target);
@@ -67,8 +68,6 @@ static bool mglTextureParameterIsSamplerState(GLenum pname)
 {
     switch (pname)
     {
-        case GL_DEPTH_STENCIL_TEXTURE_MODE:
-        case GL_TEXTURE_BASE_LEVEL:
         case GL_TEXTURE_COMPARE_FUNC:
         case GL_TEXTURE_COMPARE_MODE:
         case GL_TEXTURE_LOD_BIAS:
@@ -76,12 +75,6 @@ static bool mglTextureParameterIsSamplerState(GLenum pname)
         case GL_TEXTURE_MAG_FILTER:
         case GL_TEXTURE_MIN_LOD:
         case GL_TEXTURE_MAX_LOD:
-        case GL_TEXTURE_MAX_LEVEL:
-        case GL_TEXTURE_SWIZZLE_R:
-        case GL_TEXTURE_SWIZZLE_G:
-        case GL_TEXTURE_SWIZZLE_B:
-        case GL_TEXTURE_SWIZZLE_A:
-        case GL_TEXTURE_SWIZZLE_RGBA:
         case GL_TEXTURE_WRAP_S:
         case GL_TEXTURE_WRAP_T:
         case GL_TEXTURE_WRAP_R:
@@ -113,9 +106,11 @@ static bool mglTextureParameterValidateNamedTarget(GLMContext ctx, Texture *tex,
 
     if (target == GL_TEXTURE_2D_MULTISAMPLE || target == GL_TEXTURE_2D_MULTISAMPLE_ARRAY)
     {
+        if ((pname == GL_TEXTURE_BASE_LEVEL || pname == GL_TEXTURE_MAX_LEVEL) && ivalue < 0)
+            return mglTextureParameterSetError(ctx, GL_INVALID_VALUE);
         if (mglTextureParameterIsSamplerState(pname))
         {
-            return mglTextureParameterSetError(ctx, GL_INVALID_OPERATION);
+            return mglTextureParameterSetError(ctx, GL_INVALID_ENUM);
         }
 
         if (pname == GL_TEXTURE_BASE_LEVEL && ivalue != 0)
@@ -514,7 +509,6 @@ static bool mglTexParameterTargetValid(GLenum target)
         case GL_TEXTURE_RECTANGLE:
         case GL_TEXTURE_CUBE_MAP:
         case GL_TEXTURE_CUBE_MAP_ARRAY:
-        case GL_TEXTURE_BUFFER:
         case GL_TEXTURE_2D_MULTISAMPLE:
         case GL_TEXTURE_2D_MULTISAMPLE_ARRAY:
             return true;
@@ -1042,6 +1036,8 @@ void mglTexParameterf(GLMContext ctx, GLenum target, GLenum pname, GLfloat param
     Texture *tex = mglCurrentTextureForParameter(ctx, target);
     if (!tex)
         return;
+    if (!mglTextureParameterValidateNamedTarget(ctx, tex, pname, (GLint)param))
+        return;
     mglFlushPendingDrawsForTextureParameterChange(ctx, tex);
 
     if (setParam(ctx, &tex->params, pname, 0, param))
@@ -1063,6 +1059,8 @@ void mglTexParameterfv(GLMContext ctx, GLenum target, GLenum pname, const GLfloa
 
     Texture *tex = mglCurrentTextureForParameter(ctx, target);
     if (!tex)
+        return;
+    if (!mglTextureParameterValidateNamedTarget(ctx, tex, pname, (GLint)params[0]))
         return;
     mglFlushPendingDrawsForTextureParameterChange(ctx, tex);
 
@@ -1090,6 +1088,8 @@ void mglTexParameteri(GLMContext ctx, GLenum target, GLenum pname, GLint param)
     Texture *tex = mglCurrentTextureForParameter(ctx, target);
     if (!tex)
         return;
+    if (!mglTextureParameterValidateNamedTarget(ctx, tex, pname, param))
+        return;
     mglFlushPendingDrawsForTextureParameterChange(ctx, tex);
 
     if (setParam(ctx, &tex->params, pname, param, fparam))
@@ -1113,6 +1113,8 @@ void mglTexParameteriv(GLMContext ctx, GLenum target, GLenum pname, const GLint 
 
     Texture *tex = mglCurrentTextureForParameter(ctx, target);
     if (!tex)
+        return;
+    if (!mglTextureParameterValidateNamedTarget(ctx, tex, pname, params[0]))
         return;
     mglFlushPendingDrawsForTextureParameterChange(ctx, tex);
 
@@ -1143,6 +1145,8 @@ void mglTexParameterIiv(GLMContext ctx, GLenum target, GLenum pname, const GLint
 
     Texture *tex = mglCurrentTextureForParameter(ctx, target);
     if (!tex)
+        return;
+    if (!mglTextureParameterValidateNamedTarget(ctx, tex, pname, params[0]))
         return;
     mglFlushPendingDrawsForTextureParameterChange(ctx, tex);
 
@@ -1181,6 +1185,8 @@ void mglTexParameterIuiv(GLMContext ctx, GLenum target, GLenum pname, const GLui
 
     Texture *tex = mglCurrentTextureForParameter(ctx, target);
     if (!tex)
+        return;
+    if (!mglTextureParameterValidateNamedTarget(ctx, tex, pname, (GLint)params[0]))
         return;
     mglFlushPendingDrawsForTextureParameterChange(ctx, tex);
 
@@ -1414,6 +1420,17 @@ void mglGetTexParameterfv(GLMContext ctx, GLenum target, GLenum pname, GLfloat *
     if (!tex)
         return;
 
+    if (pname == GL_TEXTURE_BORDER_COLOR) {
+        for (int i = 0; i < 4; ++i)
+            params[i] = tex->params.border_color[i];
+        return;
+    }
+
+    if (pname == GL_IMAGE_FORMAT_COMPATIBILITY_TYPE) {
+        *params = GL_IMAGE_FORMAT_COMPATIBILITY_BY_SIZE;
+        return;
+    }
+
     /* Texture-level parameters that live on Texture, not TextureParameter. */
     if (pname == GL_TEXTURE_IMMUTABLE_FORMAT) {
         *params = (GLfloat)(tex->immutable_storage ? GL_TRUE : GL_FALSE);
@@ -1447,6 +1464,19 @@ void mglGetTexParameteriv(GLMContext ctx, GLenum target, GLenum pname, GLint *pa
     Texture *tex = mglCurrentTextureForParameter(ctx, target);
     if (!tex)
         return;
+
+    if (pname == GL_TEXTURE_BORDER_COLOR) {
+        for (int i = 0; i < 4; ++i)
+            params[i] = tex->params.border_color[i] >= 1.0f ? INT_MAX :
+                        tex->params.border_color[i] <= -1.0f ? INT_MIN :
+                        (GLint)((double)tex->params.border_color[i] * INT_MAX);
+        return;
+    }
+
+    if (pname == GL_IMAGE_FORMAT_COMPATIBILITY_TYPE) {
+        *params = GL_IMAGE_FORMAT_COMPATIBILITY_BY_SIZE;
+        return;
+    }
 
     /* Texture-level parameters that live on Texture, not TextureParameter. */
     if (pname == GL_TEXTURE_IMMUTABLE_FORMAT) {
