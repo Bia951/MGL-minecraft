@@ -34,6 +34,99 @@
 #include <string.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
+
+
+// Optional public-swap cadence diagnostics. Swaps may run on different
+// context threads; keep each thread's reporting series independent.
+static _Thread_local GLFWbool _glfwFrameStatsChecked;
+static _Thread_local GLFWbool _glfwFrameStatsEnabled;
+static _Thread_local _GLFWwindow* _glfwFrameStatsWindow;
+static _Thread_local uint64_t _glfwFrameStatsLastReport;
+static _Thread_local uint64_t _glfwFrameStatsLastFrame;
+static _Thread_local uint64_t _glfwFrameStatsTotalFrames;
+static _Thread_local uint64_t _glfwFrameStatsStart;
+static _Thread_local uint64_t _glfwFrameStatsPrevious;
+// 0.25 ms buckets through 512 ms; the final bucket holds larger stalls.
+static _Thread_local uint64_t _glfwFrameStatsHistogram[2049];
+static _Thread_local double _glfwFrameStatsMaxMs;
+static _Thread_local uint64_t _glfwFrameStatsOver50;
+static _Thread_local uint64_t _glfwFrameStatsOver100;
+
+static void _glfwReportFrameStats(_GLFWwindow* window)
+{
+    uint64_t now;
+    uint64_t frequency;
+    uint64_t interval;
+    uint64_t total;
+    double elapsed;
+    double totalElapsed;
+    double frameMs;
+    unsigned bucket;
+
+    if (!_glfwFrameStatsChecked)
+    {
+        const char* value = getenv("MGL_GLFW_FRAME_STATS");
+        _glfwFrameStatsChecked = GLFW_TRUE;
+        _glfwFrameStatsEnabled = value && strcmp(value, "1") == 0;
+    }
+
+    if (!_glfwFrameStatsEnabled)
+        return;
+
+    now = _glfwPlatformGetTimerValue();
+    frequency = _glfwPlatformGetTimerFrequency();
+
+    if (_glfwFrameStatsWindow != window)
+    {
+        _glfwFrameStatsWindow = window;
+        _glfwFrameStatsStart = now;
+        _glfwFrameStatsLastReport = now;
+        _glfwFrameStatsLastFrame = 0;
+        _glfwFrameStatsTotalFrames = 0;
+        _glfwFrameStatsPrevious = now;
+        memset(_glfwFrameStatsHistogram, 0, sizeof(_glfwFrameStatsHistogram));
+        _glfwFrameStatsMaxMs = 0;
+        _glfwFrameStatsOver50 = _glfwFrameStatsOver100 = 0;
+        return; // The initial completed swap is the time origin.
+    }
+
+    frameMs = (double) (now - _glfwFrameStatsPrevious) * 1000.0 / (double) frequency;
+    _glfwFrameStatsPrevious = now;
+    bucket = frameMs >= 512.0 ? 2048u : (unsigned) (frameMs * 4.0);
+    _glfwFrameStatsHistogram[bucket]++;
+    if (frameMs > _glfwFrameStatsMaxMs) _glfwFrameStatsMaxMs = frameMs;
+    if (frameMs > 50.0) _glfwFrameStatsOver50++;
+    if (frameMs > 100.0) _glfwFrameStatsOver100++;
+    _glfwFrameStatsTotalFrames++;
+    interval = now - _glfwFrameStatsLastReport;
+    if (interval < frequency * 5)
+        return;
+
+    total = _glfwFrameStatsTotalFrames;
+    elapsed = (double) interval / (double) frequency;
+    totalElapsed = (double) (now - _glfwFrameStatsStart) / (double) frequency;
+    printf("[GLFW frame stats] window=%p frames=%llu elapsed=%.3f s fps=%.2f total=%llu total_elapsed=%.3f s max_ms=%.3f over50=%llu over100=%llu hist=",
+           (void*) window,
+           (unsigned long long) (total - _glfwFrameStatsLastFrame),
+           elapsed,
+           (double) (total - _glfwFrameStatsLastFrame) / elapsed,
+           (unsigned long long) total,
+           totalElapsed,
+           _glfwFrameStatsMaxMs,
+           (unsigned long long) _glfwFrameStatsOver50,
+           (unsigned long long) _glfwFrameStatsOver100);
+    for (unsigned i = 0; i < 2049u; i++)
+        if (_glfwFrameStatsHistogram[i])
+            printf("%u:%llu,", i, (unsigned long long) _glfwFrameStatsHistogram[i]);
+    putchar('\n');
+    fflush(stdout);
+    memset(_glfwFrameStatsHistogram, 0, sizeof(_glfwFrameStatsHistogram));
+    _glfwFrameStatsMaxMs = 0;
+    _glfwFrameStatsOver50 = _glfwFrameStatsOver100 = 0;
+    _glfwFrameStatsLastReport = now;
+    _glfwFrameStatsLastFrame = total;
+}
 
 
 //////////////////////////////////////////////////////////////////////////
@@ -685,6 +778,7 @@ GLFWAPI void glfwSwapBuffers(GLFWwindow* handle)
     }
 
     window->context.swapBuffers(window);
+    _glfwReportFrameStats(window);
 }
 
 GLFWAPI void glfwSwapInterval(int interval)
