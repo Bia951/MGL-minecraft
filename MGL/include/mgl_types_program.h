@@ -273,6 +273,7 @@ typedef struct Program_t {
     Shader *attached_shader_slots[_MAX_SHADER_TYPES][MAX_ATTACHED_SHADERS_PER_STAGE];
     GLuint attached_shader_counts[_MAX_SHADER_TYPES];
     GLbitfield attached_shader_mask;
+    GLbitfield linked_shader_mask; /* stages in the last successful executable */
     glslang_program_t *linked_glsl_program;
     Spirv spirv[_MAX_SHADER_TYPES];
     SpirvResourceList spirv_resources_list[_MAX_SHADER_TYPES][_MAX_SPIRV_RES];

@@ -1157,6 +1157,7 @@ void mglLinkProgram(GLMContext ctx, GLuint program)
      * `if (ptr->linked_glsl_program)` to check link status). */
     glslang_program_delete(glsl_program);
     /* linked_glsl_program is used as a linked-state marker only. */
+    pptr->linked_shader_mask = pptr->attached_shader_mask;
     pptr->linked_glsl_program = (glslang_program_t *)pptr;
     pptr->dirty_bits |= DIRTY_PROGRAM;
 
@@ -1626,25 +1627,14 @@ void mglGetProgramiv(GLMContext ctx, GLuint program, GLenum pname, GLint *params
             *params = mglActiveUniformBlockMaxNameLength(pptr);
             break;
         case GL_COMPUTE_WORK_GROUP_SIZE:
-            /*
-             * Per the spec, querying GL_COMPUTE_WORK_GROUP_SIZE on a program
-             * with no linked compute stage must return {0,0,0}; it does NOT
-             * generate an error.  GL_INVALID_OPERATION is raised when the
-             * program itself is not linked.
-             */
-            if (!pptr->linked_glsl_program) {
+            if (!pptr->linked_glsl_program ||
+                !(pptr->linked_shader_mask & (1u << _COMPUTE_SHADER))) {
                 ERROR_RETURN(GL_INVALID_OPERATION);
                 return;
             }
-            if (pptr->shader_slots[_COMPUTE_SHADER]) {
-                params[0] = pptr->local_workgroup_size.x;
-                params[1] = pptr->local_workgroup_size.y;
-                params[2] = pptr->local_workgroup_size.z;
-            } else {
-                params[0] = 0;
-                params[1] = 0;
-                params[2] = 0;
-            }
+            params[0] = pptr->local_workgroup_size.x;
+            params[1] = pptr->local_workgroup_size.y;
+            params[2] = pptr->local_workgroup_size.z;
             break;
         case GL_ACTIVE_ATOMIC_COUNTER_BUFFERS:
             *params = mglActiveAtomicCounterBufferCount(pptr);
@@ -1663,28 +1653,24 @@ void mglGetProgramiv(GLMContext ctx, GLuint program, GLenum pname, GLint *params
             }
             *params = 0;
             break;
-        case GL_TESS_CONTROL_OUTPUT_VERTICES:  /* 0x8E75 */
-            if (!pptr->linked_glsl_program) {
+        case GL_TESS_CONTROL_OUTPUT_VERTICES:
+            if (!pptr->linked_glsl_program ||
+                !(pptr->linked_shader_mask & (1u << _TESS_CONTROL_SHADER))) {
                 ERROR_RETURN(GL_INVALID_OPERATION);
                 return;
             }
-            *params = pptr->shader_slots[_TESS_CONTROL_SHADER]
-                ? (GLint)pptr->tess_control_output_vertices : 0;
+            *params = (GLint)pptr->tess_control_output_vertices;
             break;
-        case GL_TESS_GEN_MODE:             /* 0x8E76 */
-        case GL_TESS_GEN_SPACING:          /* 0x8E77 */
-        case GL_TESS_GEN_VERTEX_ORDER:     /* 0x8E78 */
-        case GL_TESS_GEN_POINT_MODE:       /* 0x8E79 */
-            /* TES execution-mode reflection.  Returns the layout(...) values
-             * captured from SPIR-V OpExecutionMode at link time.  0 when no
-             * TES is attached. */
-            if (!pptr->linked_glsl_program) {
+        case GL_TESS_GEN_MODE:
+        case GL_TESS_GEN_SPACING:
+        case GL_TESS_GEN_VERTEX_ORDER:
+        case GL_TESS_GEN_POINT_MODE:
+            if (!pptr->linked_glsl_program ||
+                !(pptr->linked_shader_mask & (1u << _TESS_EVALUATION_SHADER))) {
                 ERROR_RETURN(GL_INVALID_OPERATION);
                 return;
             }
-            if (!pptr->shader_slots[_TESS_EVALUATION_SHADER]) {
-                *params = 0;
-            } else if (pname == GL_TESS_GEN_MODE) {
+            if (pname == GL_TESS_GEN_MODE) {
                 *params = (GLint)pptr->tess_gen_mode;
             } else if (pname == GL_TESS_GEN_SPACING) {
                 *params = (GLint)pptr->tess_gen_spacing;

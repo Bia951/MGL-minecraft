@@ -214,6 +214,14 @@ static void mglBufferMarkAllocatedUninitialized(Buffer *ptr, MGLBufferInitSource
     ptr->mapped_ptr = NULL;
 }
 
+static GLenum mglBufferAccessEnumFromMapFlags(GLbitfield flags)
+{
+    if ((flags & (GL_MAP_READ_BIT | GL_MAP_WRITE_BIT)) ==
+        (GL_MAP_READ_BIT | GL_MAP_WRITE_BIT))
+        return GL_READ_WRITE;
+    return (flags & GL_MAP_READ_BIT) ? GL_READ_ONLY : GL_WRITE_ONLY;
+}
+
 static inline bool mglBufferMapAllowsWrite(const Buffer *ptr)
 {
     if (!ptr) {
@@ -882,7 +890,7 @@ void bufferStorage(GLMContext ctx, Buffer *ptr, GLenum target, GLuint index, GLs
     }
 
     ptr->mapped = GL_FALSE;
-    ptr->access = 0;
+    ptr->access = GL_READ_WRITE;
     ptr->access_flags = 0;
     ptr->mapped_offset = 0;
     ptr->mapped_length = 0;
@@ -1504,6 +1512,17 @@ void mglBindBufferBase(GLMContext ctx, GLenum target, GLuint index, GLuint buffe
 }
 
 
+static GLuint mglMaxIndexedBindings(GLMContext ctx, GLenum target)
+{
+    switch (target) {
+        case GL_UNIFORM_BUFFER: return ctx->state.var.max_uniform_buffer_bindings;
+        case GL_TRANSFORM_FEEDBACK_BUFFER: return ctx->state.var.max_transform_feedback_buffers;
+        case GL_SHADER_STORAGE_BUFFER: return ctx->state.var.max_shader_storage_buffer_bindings;
+        case GL_ATOMIC_COUNTER_BUFFER: return ctx->state.var.max_atomic_counter_buffer_bindings;
+        default: return 0u;
+    }
+}
+
 void mglBindBuffersBase(GLMContext ctx, GLenum target, GLuint first, GLsizei count, const GLuint *buffers)
 {
     if (count < 0)
@@ -1524,8 +1543,8 @@ void mglBindBuffersBase(GLMContext ctx, GLenum target, GLuint first, GLsizei cou
             return;
     }
 
-    if (first > MAX_BINDABLE_BUFFERS ||
-        (GLuint)count > MAX_BINDABLE_BUFFERS - first)
+    GLuint max_bind = mglMaxIndexedBindings(ctx, target);
+    if (first > max_bind || (GLuint)count > max_bind - first)
     {
         ERROR_RETURN(GL_INVALID_OPERATION);
         return;
@@ -2037,6 +2056,7 @@ void mglBufferSubData(GLMContext ctx, GLenum target, GLintptr offset, GLsizeiptr
     {
         fprintf(stderr, "MGL Error: mglBufferSubData: immutable storage without dynamic bit\n");
         ERROR_RETURN(GL_INVALID_OPERATION);
+        return;
     }
 
     mglFlushPendingDrawsForBufferRange(ctx, ptr, offset, size);
@@ -2576,7 +2596,9 @@ void *mglMapBuffer(GLMContext ctx, GLenum target, GLenum access)
 
     ptr->mapped = GL_TRUE;
     ptr->access = access;
-    ptr->access_flags = 0;
+    ptr->access_flags = access == GL_READ_ONLY ? GL_MAP_READ_BIT :
+        access == GL_WRITE_ONLY ? GL_MAP_WRITE_BIT :
+        GL_MAP_READ_BIT | GL_MAP_WRITE_BIT;
     ptr->mapped_offset = 0;
     ptr->mapped_length = ptr->size;
     if (ctx->mtl_funcs.mtlMapUnmapBuffer) {
@@ -2696,7 +2718,6 @@ GLboolean mglUnmapBuffer(GLMContext ctx, GLenum target)
         }
 
         ptr->mapped = GL_FALSE;
-        ptr->access = 0;
         ptr->access_flags = 0;
         ptr->mapped_offset = 0;
         ptr->mapped_length = 0;
@@ -2725,7 +2746,6 @@ GLboolean mglUnmapBuffer(GLMContext ctx, GLenum target)
     }
 
     ptr->mapped = GL_FALSE;
-    ptr->access = 0;
     ptr->access_flags = 0;
     ptr->mapped_offset = 0;
     ptr->mapped_length = 0;
@@ -2784,7 +2804,6 @@ GLboolean mglUnmapNamedBuffer(GLMContext ctx, GLuint buffer)
     }
 
     ptr->mapped = GL_FALSE;
-    ptr->access = 0;
     ptr->access_flags = 0;
     ptr->mapped_offset = 0;
     ptr->mapped_length = 0;
@@ -2922,7 +2941,7 @@ void *mglMapBufferRange(GLMContext ctx, GLenum target, GLintptr offset, GLsizeip
         }
     }
 
-    ptr->access = 0;
+    ptr->access = mglBufferAccessEnumFromMapFlags(access_flags);
     ptr->mapped_offset = offset;
     ptr->mapped_length = length;
 
@@ -3093,7 +3112,7 @@ void *mglMapNamedBufferRange(GLMContext ctx, GLuint buffer, GLintptr offset, GLs
         }
     }
 
-    ptr->access = 0;
+    ptr->access = mglBufferAccessEnumFromMapFlags(access);
     ptr->mapped_offset = offset;
     ptr->mapped_length = length;
 
@@ -3328,10 +3347,6 @@ void mglBindBuffersRange(GLMContext ctx, GLenum target, GLuint first, GLsizei co
         return;
     }
 
-    if (count == 0) {
-        return;
-    }
-
     switch(target)
     {
         case GL_UNIFORM_BUFFER:
@@ -3344,14 +3359,14 @@ void mglBindBuffersRange(GLMContext ctx, GLenum target, GLuint first, GLsizei co
             return;
     }
 
-    if (first > MAX_BINDABLE_BUFFERS ||
-        (GLuint)count > MAX_BINDABLE_BUFFERS - first)
+    GLuint max_bind = mglMaxIndexedBindings(ctx, target);
+    if (first > max_bind || (GLuint)count > max_bind - first)
     {
         ERROR_RETURN(GL_INVALID_OPERATION);
         return;
     }
 
-    if (buffers && (!offsets || !sizes))
+    if (count > 0 && buffers && (!offsets || !sizes))
     {
         ERROR_RETURN(GL_INVALID_VALUE);
         return;
